@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { getEventListeners } from "node:events"
 import { test } from "node:test"
-import { clip, eventKey, format, formAnswer, inboundText, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
+import { clip, eventKey, format, formAnswer, historyLines, inboundText, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
 const ok = { type: "session.execution.succeeded", data: { sessionID: "s1" } }
@@ -57,6 +57,42 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("新对话的想法"), { type: "text", text: "新对话的想法" })
   assert.deepEqual(parseCommand("目录2"), { type: "cd", arg: "2" })
   assert.deepEqual(parseCommand("目录结构怎么整理"), { type: "text", text: "目录结构怎么整理" })
+  assert.deepEqual(parseCommand("5 历史"), { type: "history", n: 5, count: 5 })
+  assert.deepEqual(parseCommand("5 历史 10"), { type: "history", n: 5, count: 10 })
+  assert.deepEqual(parseCommand("历史"), { type: "history", count: 5 })
+  assert.deepEqual(parseCommand("历史 30"), { type: "history", count: 20 })
+  assert.deepEqual(parseCommand("历史 0"), { type: "history", count: 1 })
+  assert.deepEqual(parseCommand("/history 3"), { type: "history", count: 3 })
+  assert.deepEqual(parseCommand("历史文件夹里有什么"), { type: "text", text: "历史文件夹里有什么" })
+  assert.deepEqual(parseCommand("5 历史记录在哪"), { type: "text", n: 5, text: "历史记录在哪" })
+})
+
+test("historyLines", () => {
+  const user = (text) => ({ type: "user", text })
+  const ai = (...parts) => ({ type: "assistant", content: parts })
+  const tool = (name) => ({ type: "tool", name })
+  const txt = (text) => ({ type: "text", text })
+  // Newest first, as the API returns with order=desc.
+  const msgs = [
+    ai(txt("改好了"), tool("read")),
+    ai(tool("shell"), { type: "reasoning", text: "想" }),
+    ai(tool("shell")),
+    user("改一下"),
+    { type: "idle" },
+    ai({ type: "reasoning", text: "只有思考" }),
+    ai(txt("你好")),
+    user(" "),
+    user("在吗"),
+  ]
+  assert.deepEqual(historyLines(msgs, 5, 10), [
+    "[5] 你：在吗",
+    "[5] AI：你好",
+    "[5] 你：改一下",
+    "[5] AI：改好了\n（调用了 shell ×2、read）",
+    "[5] 以上是最近 4 条（只找到这么多）",
+  ])
+  assert.deepEqual(historyLines(msgs, 5, 2), ["[5] 你：改一下", "[5] AI：改好了\n（调用了 shell ×2、read）", "[5] 以上是最近 2 条"])
+  assert.deepEqual(historyLines([], 5, 3), ["[5] 还没有消息"])
 })
 
 test("pickDir", () => {

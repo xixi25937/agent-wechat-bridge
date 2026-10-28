@@ -20,6 +20,7 @@ const HELP = [
   "直接发内容 → 发给最近推送的那个对话",
   "3 y / 3 n → 批准一次 / 拒绝 [3] 的权限请求",
   "3 → 再看一次 [3] 的最后回复",
+  "3 历史 10 → [3] 最近 10 条消息（默认 5，最多 20）",
   "列表 → 最近的对话和编号",
   "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
   "新对话 内容 → 在选中的文件夹里开新对话",
@@ -60,6 +61,31 @@ export function replyText(msgs, stopAtUser = true) {
   return ""
 }
 
+// One WeChat message per user / assistant message, oldest first, plus a closing line. `msgs` is newest first.
+// Tool calls of tool-only assistant messages are folded into the next assistant text of the same turn.
+export function historyLines(msgs, n, count) {
+  const items = []
+  let tools = new Map()
+  for (const m of [...(msgs ?? [])].reverse()) {
+    const parts = m.content ?? []
+    const text = parts.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim()
+    if (m.type === "user") {
+      tools = new Map()
+      const t = (typeof m.text === "string" ? m.text.trim() : "") || text
+      if (t) items.push(`[${n}] 你：${clip(t)}`)
+    } else if (m.type === "assistant") {
+      for (const c of parts) if (c.type === "tool") tools.set(c.name, (tools.get(c.name) ?? 0) + 1)
+      if (!text) continue
+      const used = [...tools].map(([k, v]) => (v > 1 ? `${k} ×${v}` : k)).join("、")
+      items.push(`[${n}] AI：${clip(text)}${used ? `\n（调用了 ${used}）` : ""}`)
+      tools = new Map()
+    }
+  }
+  const out = items.slice(-count)
+  if (!out.length) return [`[${n}] 还没有消息`]
+  return [...out, `[${n}] 以上是最近 ${out.length} 条${out.length < count ? "（只找到这么多）" : ""}`]
+}
+
 // Returns the push text, or null when this event should not notify.
 export function format(event, session, n, reply) {
   const d = event.data ?? {}
@@ -97,6 +123,9 @@ export function parseCommand(text) {
   if (m) return { type: "cd", arg: (m[1] ?? m[2]).trim() }
   m = t.match(/^(?:新对话|\/new)(?:[\s:：,，]+([\s\S]+))?$/i)
   if (m) return { type: "new", text: m[1]?.trim() ?? "" }
+  // Before the "3 内容" rule, so "3 历史" is never sent to the session as a prompt.
+  m = t.match(/^(?:(\d{1,4})\s*)?(?:历史|\/history)(?:\s*(\d{1,4}))?$/i)
+  if (m) return { type: "history", ...(m[1] && { n: Number(m[1]) }), count: Math.min(20, Math.max(1, Number(m[2] ?? 5))) }
   m = t.match(/^(\d{1,4})$/)
   if (m) return { type: "show", n: Number(m[1]) }
   m = t.match(/^(\d{1,4})[\s:：,，]+([\s\S]+)$/)
@@ -333,6 +362,11 @@ async function run(cmd) {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
     return `${head(n, session)}\n${clip(await lastReply(sessionID, false)) || "（还没有回复）"}`
   }
+  if (cmd.type === "history") {
+    // Tool-only assistant messages are skipped, so fetch extra.
+    const limit = Math.min(100, cmd.count * 4 + 10)
+    return historyLines((await oc(`/api/session/${sid(sessionID)}/message?limit=${limit}&order=desc`)).data, n, cmd.count)
+  }
   const t = cmd.text
   // Approvals need an explicit number, so a casual "好" never approves a request you didn't see.
   const decision = cmd.n == null ? null : YES.test(t) ? "once" : NO.test(t) ? "reject" : null
@@ -369,7 +403,11 @@ async function inbound(msg, floor) {
   g.handled.add(key)
   if (g.handled.size > 200) g.handled.delete(g.handled.values().next().value)
   const reply = await run(parseCommand(text)).catch((e) => `出错了：${short(e?.message, 150)}`)
-  await send(reply)
+  // run() returns a string, or an array sent one message at a time (spaced out so WeChat doesn't throttle).
+  for (const [i, r] of [reply].flat().entries()) {
+    if (i) await new Promise((resolve) => setTimeout(resolve, 300))
+    await send(r)
+  }
 }
 
 // Removes its abort listener when the timer fires; otherwise every sleep leaves one on the long-lived poller signal.
