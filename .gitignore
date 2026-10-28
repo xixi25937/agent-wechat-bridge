@@ -1,0 +1,8 @@
+node_modules/
+*.log
+*.tgz
+*.tmp
+opencode-wechat-notify.json
+account.json
+context_tokens.json
+sync_buf.txt
