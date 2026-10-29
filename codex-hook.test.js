@@ -3,7 +3,11 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, permissionSummary, remember, threadInfo } from "./codex-hook.js"
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
+import { readQuestion } from "./codex-question.js"
+import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, onQuestion, permissionSummary, remember, threadInfo } from "./codex-hook.js"
+import { fakeDesktop } from "./fake-desktop.js"
 import { answerCodex, base, readPending, short } from "./index.js"
 
 test("codexHead", () => {
@@ -137,4 +141,68 @@ test("readPending drops stale records", () => {
 
 test("threadInfo missing db", async () => {
   assert.equal(await threadInfo("x", path.join(os.tmpdir(), "no-such-codex.sqlite")), null)
+})
+
+const ASK = {
+  method: "item/tool/requestUserInput",
+  id: 7,
+  params: {
+    threadId: "t1",
+    questions: [
+      { id: "color", header: "颜色", question: "喜欢哪个颜色？", isOther: true, isSecret: false, options: [{ label: "红", description: "" }, { label: "蓝", description: "" }] },
+      { id: "num", header: "数字", question: "一个数字", isOther: true, isSecret: false, options: null },
+    ],
+  },
+}
+
+test("onQuestion: waits for the window's question, pushes it, leaves a record", { skip: process.platform !== "win32" }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-pending-"))
+  const sent = []
+  const m = { PENDING_DIR: dir, base, short, assign: async () => 5, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
+  const p = { session_id: "qt1", cwd: "C:\\a\\proj", tool_name: "request_user_input", tool_input: { questions: [] } }
+  const requests = []
+  const d = await fakeDesktop({ owns: true, requests })
+  // The hook runs before the window has the request.
+  setTimeout(() => requests.push(ASK), 60)
+  const opts = { pipe: d.pipe, tries: 50, gap: 20 }
+  assert.equal(await onQuestion(p, m, opts), "[5] ok")
+  assert.equal(sent.length, 1)
+  assert.match(sent[0], /^\[5\] Codex · proj \/ .+\n有问题问你：\n问题 1\/2：颜色：喜欢哪个颜色？（也可以直接写答案）\n  1\. 红\n  2\. 蓝\n问题 2\/2：数字：一个数字\n回复「5 答案」：一次回完就一行一个、按顺序（或「1\. 答案」），也可以一条一个\n（电脑上也可以直接答）$/)
+  assert.ok(!/忽略/.test(sent[0]), "a Codex question can't be ignored")
+  const rec = readQuestion(dir, "qt1")
+  assert.deepEqual([rec.n, rec.requestIds], [5, [7]])
+  // A second hook for the same pending request pushes nothing.
+  assert.equal(await onQuestion(p, m, { ...opts, tries: 3 }), "no question showed up")
+  assert.equal(sent.length, 1)
+  d.close()
+  // No poller: the push says so, and no record is kept for replies that can't arrive.
+  fs.rmSync(path.join(dir, "questions"), { recursive: true })
+  const d2 = await fakeDesktop({ owns: true, requests })
+  await onQuestion(p, { ...m, state: () => ({}) }, { pipe: d2.pipe, tries: 2, gap: 5 })
+  assert.match(sent[1], /微信回复收不到，请在电脑上回答/)
+  assert.equal(readQuestion(dir, "qt1"), null)
+  d2.close()
+  // A terminal (no window has the thread): nothing is pushed.
+  const none = await fakeDesktop({ owns: false, requests })
+  assert.equal(await onQuestion(p, m, { pipe: none.pipe, tries: 2, gap: 5 }), "not in a desktop window")
+  assert.equal(sent.length, 2)
+  none.close()
+  fs.rmSync(dir, { recursive: true })
+})
+
+test("PreToolUse entry point: other tools and bridge turns do nothing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-env-"))
+  const hook = path.join(path.dirname(fileURLToPath(import.meta.url)), "codex-hook.js")
+  const run = (payload) => spawnSync(process.execPath, [hook, "PreToolUse"], { input: JSON.stringify(payload), env: { ...process.env, WECHAT_NOTIFY_DIR: dir }, encoding: "utf-8", timeout: 20_000 })
+  fs.mkdirSync(path.join(dir, "codex-pending"), { recursive: true })
+  fs.writeFileSync(path.join(dir, "codex-pending", "bridge-b1.run"), "1")
+  for (const payload of [{ session_id: "x", tool_name: "Bash", tool_input: {} }, { session_id: "b1", tool_name: "request_user_input", tool_input: {} }]) {
+    const r = run(payload)
+    assert.equal(r.status, 0)
+    assert.equal(r.stdout, "")
+    assert.equal(r.stderr, "")
+  }
+  // Nothing was handed to a detached child.
+  assert.ok(!fs.existsSync(path.join(dir, "codex-hook.log")))
+  fs.rmSync(dir, { recursive: true })
 })

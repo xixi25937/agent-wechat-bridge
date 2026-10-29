@@ -7,6 +7,7 @@ import {
   BUSY, bridgeMarker, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
   desktopOwns, desktopSend,
 } from "./codex.js"
+import { desktopReply, readQuestion } from "./codex-question.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
@@ -617,7 +618,7 @@ async function probe(s, now) {
   for (const k of keys.filter((k) => k.startsWith(CODEX))) {
     const id = k.slice(CODEX.length)
     if (alive && !alive.has(id)) gone.add(k)
-    if (g.bridge?.running(id) || fs.existsSync(bridgeMarker(PENDING_DIR, id)) || pending.some((p) => p.threadId === id)) busy.add(k)
+    if (g.bridge?.running(id) || fs.existsSync(bridgeMarker(PENDING_DIR, id)) || pending.some((p) => p.threadId === id) || readQuestion(PENDING_DIR, id)) busy.add(k)
   }
   return { gone, busy }
 }
@@ -1326,7 +1327,10 @@ async function runCodex(cmd, threadId, n, tg) {
   if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count, tg)
   const t = cmd.text
   if (cmd.n != null && (YES.test(t) || NO.test(t))) return approveCodex(threadId, n, tg, YES.test(t))
-  const answered = bridge().reply(threadId, t, n, tg)
+  // A question: held by our own app-server, or shown in the desktop window (the hook left a record).
+  const answered =
+    bridge().reply(threadId, t, n, tg) ??
+    (await desktopReply(threadId, t, n, tg, { dir: PENDING_DIR }).catch((e) => `${tg} 回答没有送达：${short(e?.message, 150)}`))
   if (answered) return answered
   if (noMedia(t)) return noMedia(t)
   const { text, images, note } = takeMedia(t)

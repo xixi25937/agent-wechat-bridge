@@ -1,4 +1,4 @@
-// Codex hook: `node codex-hook.js Stop|PermissionRequest`, payload JSON on stdin (see README).
+// Codex hook: `node codex-hook.js Stop|PermissionRequest|PreToolUse`, payload JSON on stdin (see README).
 // Must never break Codex: every failure exits 0 with no decision and one stderr line.
 import { spawn } from "node:child_process"
 import crypto from "node:crypto"
@@ -8,6 +8,8 @@ import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { bridgeMarker, cleanDir, codexHead, desktopOwns } from "./codex.js"
+import { dropQuestion, noteQuestion, readQuestion, waitQuestion } from "./codex-question.js"
+import { formText, questionForm } from "./form.js"
 
 export { codexHead }
 
@@ -69,6 +71,8 @@ export function remember(s, key, cwd, thread) {
 }
 
 async function onStop(p, m) {
+  // The turn is over, so a question the window showed is answered or gone.
+  dropQuestion(m.PENDING_DIR, p.session_id)
   const thread = await threadInfo(p.session_id)
   if (isSubagent(thread)) return
   const key = `codex:${p.session_id}`
@@ -130,28 +134,61 @@ export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
   }
 }
 
+// PreToolUse for request_user_input fires just before the window gets the question, and Codex waits for the hook, so a
+// detached child waits for the question in the window's state and pushes what the window shows. Returns the log line.
+export async function onQuestion(p, m, opts) {
+  const id = p.session_id
+  const thread = await threadInfo(id)
+  if (isSubagent(thread)) return ""
+  const found = await waitQuestion(id, readQuestion(m.PENDING_DIR, id)?.requestIds, opts)
+  // null: no desktop window has the thread (a terminal: nothing reaches its question box from outside).
+  if (!found?.length) return found ? "no question showed up" : "not in a desktop window"
+  const key = `codex:${id}`
+  const n = await m.assign(key)
+  const listening = alive(m.state().pollerPid)
+  m.update((s) => remember(s, key, p.cwd, thread))
+  const tail = listening ? "（电脑上也可以直接答）" : "（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上回答）"
+  const sent = []
+  for (const req of found) {
+    const text = `${codexHead(n, p.cwd, thread, m)}\n${formText(questionForm(req.params?.questions), n, false)}\n${tail}`
+    sent.push(await m.send(text))
+    if (listening && sent.at(-1) !== "error") noteQuestion(m.PENDING_DIR, id, n, [req.id])
+  }
+  return `[${n}] ${sent.join(" ")}`
+}
+
+// Runs `node codex-hook.js <kind> <payload file>` detached, so the hook itself returns at once.
+async function detach(kind, raw) {
+  const { DIR } = await import("./index.js")
+  const file = path.join(os.tmpdir(), `codex-wechat-${kind}-${process.pid}-${Date.now()}.json`)
+  fs.writeFileSync(file, raw)
+  const errLog = fs.openSync(path.join(DIR, "codex-hook.log"), "a")
+  spawn(process.execPath, [fileURLToPath(import.meta.url), kind, file], { detached: true, stdio: ["ignore", "ignore", errLog], windowsHide: true }).unref()
+}
+
 async function main() {
   let out = ""
   try {
     const event = process.argv[2]
     let raw = ""
-    if (event === "stop-send") {
-      // Detached child of a Stop hook: the payload file is ours to read and delete.
+    if (event === "stop-send" || event === "question-send") {
+      // Detached child of a hook: the payload file is ours to read and delete.
       raw = fs.readFileSync(process.argv[3], "utf-8")
       fs.rmSync(process.argv[3], { force: true })
     } else for await (const c of process.stdin) raw += c
     const p = JSON.parse(raw || "{}")
     if (event === "stop-send") await onStop(p, await import("./index.js"))
+    else if (event === "question-send") console.error(`${new Date().toISOString()} Question ${await onQuestion(p, await import("./index.js"))}`)
     else if ((event || p.hook_event_name) === "Stop") {
       // A turn started from WeChat: the plugin pushes the reply itself. Checked here, before the turn ends.
       const { PENDING_DIR } = await import("./index.js")
       if (fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) return process.exit(0)
       // Codex waits for Stop hooks before ending the turn, so send from a detached process and return at once.
-      const file = path.join(os.tmpdir(), `codex-wechat-stop-${process.pid}-${Date.now()}.json`)
-      fs.writeFileSync(file, raw)
-      const { DIR } = await import("./index.js")
-      const errLog = fs.openSync(path.join(DIR, "codex-hook.log"), "a")
-      spawn(process.execPath, [fileURLToPath(import.meta.url), "stop-send", file], { detached: true, stdio: ["ignore", "ignore", errLog], windowsHide: true }).unref()
+      await detach("stop-send", raw)
+    } else if ((event || p.hook_event_name) === "PreToolUse") {
+      // A bridge turn's questions are pushed by the plugin itself.
+      const { PENDING_DIR } = await import("./index.js")
+      if (p.tool_name === "request_user_input" && !fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) await detach("question-send", raw)
     } else if ((event || p.hook_event_name) === "PermissionRequest") out = await onPermission(p, await import("./index.js"))
   } catch (e) {
     console.error("[codex-hook]", String(e?.message ?? e).slice(0, 200))
