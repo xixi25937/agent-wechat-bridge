@@ -17,7 +17,7 @@ const STATUS = { succeeded: "完成", failed: "出错", interrupted: "中断" }
 const HELP = [
   "用法：",
   "3 内容 → 发给 [3] 号对话（有待回答的问题时作为回答）",
-  "直接发内容 → 发给最近推送的那个对话",
+  "直接发内容 → 发给你上次用编号指定的对话（回复里会标明发给了几号）",
   "3 y / 3 n → 批准一次 / 拒绝 [3] 的权限请求",
   "3 → 再看一次 [3] 的最后回复",
   "3 历史 10 → [3] 最近 10 条消息（默认 5，最多 20）",
@@ -335,7 +335,7 @@ async function newSession(text) {
   const model = toArr(await oc(sessionsURL(1, dir)).catch(() => []))[0]?.model
   const session = (await oc("/api/session", { location: { directory: dir }, ...(model && { model }) })).data
   const n = numOf(session.id)
-  update((s) => (s.last = session.id))
+  update((s) => (s.last = s.target = session.id))
   if (text) await prompt(session.id, text)
   return `已在 ${base(dir)} 新建 [${n}]${text ? "，已发出" : "，接着直接发内容就行"}`
 }
@@ -355,8 +355,10 @@ async function run(cmd) {
   }
   if (cmd.type === "new") return newSession(cmd.text)
   if (cmd.type === "text" && !cmd.text) return HELP
-  const sessionID = cmd.n == null ? state().last : sessionOf(cmd.n)
+  // Unnumbered text goes to the session the user last picked, not the last push: other sessions push all the time.
+  const sessionID = cmd.n == null ? (state().target ?? state().last) : sessionOf(cmd.n)
   if (!sessionID) return cmd.n == null ? HELP : `没有 [${cmd.n}]，发「列表」查看`
+  if (cmd.n != null && state().target !== sessionID) update((s) => (s.target = sessionID))
   const n = numOf(sessionID)
   if (cmd.type === "show") {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
