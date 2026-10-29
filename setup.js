@@ -214,8 +214,16 @@ const FLAGS = ["--dry-run", "--opencode-only", "--codex-only"]
 const USAGE = `Usage: agent-wechat-bridge setup [--dry-run] [--opencode-only | --codex-only]
 
   --dry-run         print what would change, write nothing
-  --opencode-only   only add the plugin to ~/.config/opencode/opencode.json(c)
+  --opencode-only   only add the plugin to ~/.config/opencode/opencode.json(c), even if OpenCode is not detected
   --codex-only      only add the Codex hooks to ~/.codex/hooks.json`
+
+// OpenCode counts as installed when its config dir or desktop data dir exists, or `opencode` is on PATH.
+export function hasOpenCode(home, env = process.env, platform = process.platform) {
+  if (fs.existsSync(path.join(home, ".config", "opencode"))) return true
+  if (platform === "win32" && env.APPDATA && fs.existsSync(path.join(env.APPDATA, "ai.opencode.desktop"))) return true
+  const exts = platform === "win32" ? (env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""]
+  return (env.PATH ?? env.Path ?? "").split(path.delimiter).some((d) => d && exts.some((x) => fs.existsSync(path.join(d, `opencode${x}`))))
+}
 
 const stamp = () => new Date().toISOString().replace(/\D/g, "").slice(0, 14)
 
@@ -273,7 +281,9 @@ export function main(argv) {
     console.log("       (or: npm i -g cli-chat-bridge, then run: wechat-setup)")
   }
 
-  if (wantOpencode) {
+  if (wantOpencode && !args.includes("--opencode-only") && !hasOpenCode(home)) {
+    say("skip", "OpenCode not found; run setup again after installing it (or force with --opencode-only)")
+  } else if (wantOpencode) {
     const cfgDir = path.join(home, ".config", "opencode")
     const file = ["opencode.jsonc", "opencode.json"].map((f) => path.join(cfgDir, f)).find((f) => fs.existsSync(f)) ?? path.join(cfgDir, "opencode.json")
     const existed = fs.existsSync(file)

@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { addPlugin, mergeHooks, parseJsonc } from "./setup.js"
+import { addPlugin, hasOpenCode, mergeHooks, parseJsonc } from "./setup.js"
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DIR = path.join(path.parse(ROOT).root, "x", "agent-wechat-bridge")
@@ -121,8 +121,10 @@ test("setup.js end to end against a fake HOME", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "awb-setup-"))
   try {
     const env = (home) => {
-      const e = { ...process.env, HOME: home, USERPROFILE: home }
+      const e = { ...process.env, HOME: home, USERPROFILE: home, APPDATA: path.join(home, "AppData", "Roaming") }
       delete e.WECHAT_NOTIFY_DIR
+      for (const k of Object.keys(e)) if (k.toLowerCase() === "path") delete e[k]
+      e.PATH = path.join(tmp, "empty-bin")
       return e
     }
     const run = (home, ...args) => {
@@ -195,12 +197,58 @@ test("setup.js end to end against a fake HOME", () => {
     for (const f of [...pkg.files, "package.json"]) fs.copyFileSync(path.join(ROOT, f), path.join(npx, f))
     const home4 = path.join(tmp, "home4")
     fs.mkdirSync(path.join(home4, ".codex"), { recursive: true })
+    fs.mkdirSync(path.join(home4, ".config", "opencode"), { recursive: true })
     const res = spawnSync(process.execPath, [path.join(npx, "setup.js")], { env: env(home4), encoding: "utf8" })
     const kept = path.join(home4, ".cli-bridge", "agent-wechat-bridge")
     assert.equal(res.status, 0, res.stdout + res.stderr)
     assert.ok(fs.existsSync(path.join(kept, "index.js")) && fs.existsSync(path.join(kept, "package.json")))
     assert.deepEqual(parseJsonc(read(path.join(home4, ".config", "opencode", "opencode.json"))).plugins, [kept.replace(/\\/g, "/")])
     assert.ok(read(path.join(home4, ".codex", "hooks.json")).includes(JSON.stringify(path.join(kept, "codex-hook.js")).slice(1, -1)))
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("OpenCode detection: config dir, desktop data dir, PATH", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "awb-detect-"))
+  try {
+    const home = path.join(tmp, "home")
+    const bin = path.join(tmp, "bin")
+    fs.mkdirSync(home)
+    fs.mkdirSync(bin)
+    const env = { PATH: bin, APPDATA: path.join(tmp, "appdata"), PATHEXT: ".EXE;.CMD" }
+    assert.equal(hasOpenCode(home, env, "linux"), false)
+    fs.writeFileSync(path.join(bin, "opencode"), "")
+    assert.equal(hasOpenCode(home, env, "linux"), true, "on PATH")
+    assert.equal(hasOpenCode(home, env, "win32"), false, "win32 looks for opencode.exe/.cmd")
+    fs.writeFileSync(path.join(bin, "opencode.cmd"), "")
+    assert.equal(hasOpenCode(home, env, "win32"), true)
+    fs.rmSync(path.join(bin, "opencode"))
+    fs.rmSync(path.join(bin, "opencode.cmd"))
+    fs.mkdirSync(path.join(env.APPDATA, "ai.opencode.desktop"), { recursive: true })
+    assert.equal(hasOpenCode(home, env, "win32"), true, "desktop app data")
+    assert.equal(hasOpenCode(home, env, "linux"), false, "APPDATA only counts on Windows")
+    fs.mkdirSync(path.join(home, ".config", "opencode"), { recursive: true })
+    assert.equal(hasOpenCode(home, env, "linux"), true, "config dir")
+
+    // The command: nothing installed -> skipped; --opencode-only forces the step.
+    const h2 = path.join(tmp, "h2")
+    fs.mkdirSync(path.join(h2, ".codex"), { recursive: true })
+    const e = { ...process.env, HOME: h2, USERPROFILE: h2, APPDATA: path.join(tmp, "none") }
+    for (const k of Object.keys(e)) if (k.toLowerCase() === "path") delete e[k]
+    e.PATH = path.join(tmp, "empty-bin")
+    delete e.WECHAT_NOTIFY_DIR
+    const run = (...args) => {
+      const r = spawnSync(process.execPath, [path.join(ROOT, "setup.js"), ...args], { env: e, encoding: "utf8" })
+      return r.stdout + r.stderr
+    }
+    let out = run("--dry-run")
+    assert.match(out, /\[skip\] OpenCode not found/)
+    assert.doesNotMatch(out, /opencode\.json/)
+    assert.match(out, /would add Codex hooks/)
+    out = run("--dry-run", "--opencode-only")
+    assert.doesNotMatch(out, /OpenCode not found/)
+    assert.match(out, /would add .*opencode\.json/)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
