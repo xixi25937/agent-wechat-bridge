@@ -400,7 +400,8 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
     },
     async create(cwd, text, opts) {
       const s = await ensure()
-      const { thread } = await s.call("thread/start", { cwd })
+      // Without threadSource "user" the desktop app leaves the thread out of its sidebar (every listed thread has it).
+      const { thread } = await s.call("thread/start", { cwd, threadSource: "user" })
       await startTurn(s, thread.id, text, opts)
       return thread.id
     },
