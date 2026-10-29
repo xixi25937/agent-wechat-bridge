@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { addPlugin, hasOpenCode, mergeHooks, parseJsonc } from "./setup.js"
+import { addPlugin, autostartFile, hasOpenCode, mergeHooks, parseJsonc } from "./setup.js"
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DIR = path.join(path.parse(ROOT).root, "x", "agent-wechat-bridge")
@@ -249,6 +249,69 @@ test("OpenCode detection: config dir, desktop data dir, PATH", () => {
     out = run("--dry-run", "--opencode-only")
     assert.doesNotMatch(out, /OpenCode not found/)
     assert.match(out, /would add .*opencode\.json/)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("autostartFile: hidden Windows launcher, LaunchAgent, systemd unit", () => {
+  const daemon = "/x/agent wechat/daemon.js"
+  const w = autostartFile({ platform: "win32", home: "C:\\h", env: { APPDATA: "C:\\h\\AppData\\Roaming" }, node: "C:\\node\\node.exe", daemon: "C:\\i\\daemon.js" })
+  assert.equal(w.file, path.join("C:\\h\\AppData\\Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "agent-wechat-bridge.vbs"))
+  assert.match(w.text, /\.Run """C:\\node\\node\.exe"" ""C:\\i\\daemon\.js""", 0, False/)
+  const m = autostartFile({ platform: "darwin", home: "/Users/a", env: {}, node: "/usr/bin/node", daemon })
+  assert.equal(m.file, path.join("/Users/a", "Library", "LaunchAgents", "com.agent-wechat-bridge.daemon.plist"))
+  assert.ok(m.text.includes(`<string>${daemon}</string>`) && m.text.includes("<key>RunAtLoad</key><true/>"))
+  const l = autostartFile({ platform: "linux", home: "/home/a", env: {}, node: "/usr/bin/node", daemon })
+  assert.equal(l.file, path.join("/home/a", ".config", "systemd", "user", "agent-wechat-bridge.service"))
+  assert.match(l.text, /ExecStart="\/usr\/bin\/node" "\/x\/agent wechat\/daemon\.js"/)
+  assert.match(l.text, /WantedBy=default\.target/)
+})
+
+test("setup installs the daemon when OpenCode is missing, --daemon adds it otherwise, uninstall removes it", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "awb-daemon-"))
+  try {
+    const home = path.join(tmp, "home")
+    const appdata = path.join(home, "AppData", "Roaming")
+    fs.mkdirSync(path.join(home, ".codex"), { recursive: true })
+    fs.mkdirSync(path.join(home, ".cli-bridge"), { recursive: true })
+    const env = { ...process.env, HOME: home, USERPROFILE: home, APPDATA: appdata, XDG_CONFIG_HOME: path.join(home, ".config"), AGENT_WECHAT_BRIDGE_NO_START: "1" }
+    delete env.WECHAT_NOTIFY_DIR
+    for (const k of Object.keys(env)) if (k.toLowerCase() === "path") delete env[k]
+    env.PATH = path.join(tmp, "empty-bin")
+    const run = (...args) => {
+      const r = spawnSync(process.execPath, [path.join(ROOT, "setup.js"), "setup", ...args], { env, encoding: "utf8" })
+      return { code: r.status, out: r.stdout + r.stderr }
+    }
+    const entry = autostartFile({ home, env, daemon: path.join(ROOT, "daemon.js") }).file
+
+    let r = run("--dry-run")
+    assert.equal(r.code, 0, r.out)
+    assert.match(r.out, /\[skip\] OpenCode not found/)
+    assert.match(r.out, /would add the daemon autostart entry/)
+    assert.ok(!fs.existsSync(entry), "dry run writes nothing")
+
+    r = run()
+    assert.equal(r.code, 0, r.out)
+    assert.ok(fs.existsSync(entry), r.out)
+    assert.ok(fs.readFileSync(entry, "utf8").includes("daemon.js"))
+    assert.match(r.out, /receives WeChat messages for Codex/)
+    r = run()
+    assert.match(r.out, /\[ok\] daemon starts at login/)
+    assert.ok(!fs.existsSync(path.join(home, ".config", "opencode")), "no OpenCode config created without OpenCode")
+
+    r = run("--uninstall-daemon")
+    assert.equal(r.code, 0, r.out)
+    assert.ok(!fs.existsSync(entry))
+
+    // With OpenCode: no daemon unless asked.
+    fs.mkdirSync(path.join(home, ".config", "opencode"), { recursive: true })
+    r = run("--codex-only")
+    assert.ok(!fs.existsSync(entry), r.out)
+    assert.match(r.out, /add --daemon/)
+    r = run("--codex-only", "--daemon")
+    assert.ok(fs.existsSync(entry), r.out)
+    assert.equal(run("--daemon", "--no-daemon").code, 2)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }

@@ -1,7 +1,7 @@
 {
   "name": "agent-wechat-bridge",
-  "version": "0.1.0",
-  "description": "WeChat (iLink bot) bridge for coding agents: OpenCode V2 server plugin plus Codex hooks. Push replies, approve, and reply from WeChat.",
+  "version": "0.2.0",
+  "description": "WeChat (iLink bot) bridge for coding agents: OpenCode plugin, Codex hooks and a standalone daemon. Push replies, approve and reply from WeChat.",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -31,7 +31,17 @@
   "bin": {
     "agent-wechat-bridge": "setup.js"
   },
-  "files": ["index.js", "codex.js", "codex-question.js", "codex-hook.js", "form.js", "md.js", "poll-lock.js", "setup.js"],
+  "files": [
+    "index.js",
+    "codex.js",
+    "codex-question.js",
+    "codex-hook.js",
+    "form.js",
+    "md.js",
+    "poll-lock.js",
+    "setup.js",
+    "daemon.js"
+  ],
   "engines": {
     "node": ">=20.3"
   },

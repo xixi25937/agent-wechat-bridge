@@ -2,6 +2,7 @@
 // One-command setup: registers this folder as an OpenCode plugin and adds the three Codex hooks. Node stdlib only.
 //   npx agent-wechat-bridge setup [--dry-run] [--opencode-only | --codex-only]
 import assert from "node:assert/strict"
+import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -210,12 +211,114 @@ const dump = (json, text) =>
 
 // --- the command ---
 
-const FLAGS = ["--dry-run", "--opencode-only", "--codex-only"]
-const USAGE = `Usage: agent-wechat-bridge setup [--dry-run] [--opencode-only | --codex-only]
+const FLAGS = ["--dry-run", "--opencode-only", "--codex-only", "--daemon", "--no-daemon", "--uninstall-daemon"]
+const USAGE = `Usage: agent-wechat-bridge setup [--dry-run] [--opencode-only | --codex-only] [--daemon | --no-daemon]
+       agent-wechat-bridge setup --uninstall-daemon
+       agent-wechat-bridge daemon
 
-  --dry-run         print what would change, write nothing
-  --opencode-only   only add the plugin to ~/.config/opencode/opencode.json(c), even if OpenCode is not detected
-  --codex-only      only add the Codex hooks to ~/.codex/hooks.json`
+  --dry-run           print what would change, write nothing
+  --opencode-only     only add the plugin to ~/.config/opencode/opencode.json(c), even if OpenCode is not detected
+  --codex-only        only add the Codex hooks to ~/.codex/hooks.json
+  --daemon            also start the WeChat daemon at login (default when OpenCode is not installed)
+  --no-daemon         don't install the daemon even without OpenCode
+  --uninstall-daemon  remove the daemon's autostart entry and stop the running daemon
+  daemon              run the WeChat side in the foreground (what the autostart entry runs)`
+
+// The login-time entry that runs `node daemon.js`: a hidden .vbs in the Windows Startup folder, a LaunchAgent on
+// macOS, a systemd user unit elsewhere. No admin rights needed.
+export function autostartFile({ platform = process.platform, home = os.homedir(), env = process.env, node = process.execPath, daemon }) {
+  if (platform === "win32") {
+    const q = (s) => `""${s}""`
+    return {
+      file: path.join(env.APPDATA ?? path.join(home, "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup", `${NAME}.vbs`),
+      text: `' ${NAME}: WeChat daemon, started hidden at login. Remove with: npx ${NAME} setup --uninstall-daemon\r\nCreateObject("WScript.Shell").Run "${q(node)} ${q(daemon)}", 0, False\r\n`,
+    }
+  }
+  const x = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+  if (platform === "darwin") {
+    const log = path.join(home, ".cli-bridge", "daemon.log")
+    return {
+      file: path.join(home, "Library", "LaunchAgents", `com.${NAME}.daemon.plist`),
+      text: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.${NAME}.daemon</string>
+  <key>ProgramArguments</key><array><string>${x(node)}</string><string>${x(daemon)}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${x(log)}</string>
+  <key>StandardErrorPath</key><string>${x(log)}</string>
+</dict>
+</plist>
+`,
+    }
+  }
+  return {
+    file: path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "systemd", "user", `${NAME}.service`),
+    text: `[Unit]
+Description=${NAME}: WeChat daemon for OpenCode and Codex
+
+[Service]
+ExecStart="${node}" "${daemon}"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+`,
+  }
+}
+
+// After installing: run it now. Returns a note for the user.
+function startDaemon(platform, entry, node, daemon) {
+  if (platform === "darwin") {
+    const r = spawnSync("launchctl", ["load", "-w", entry], { encoding: "utf8" })
+    return r.status === 0 ? "started (launchctl)" : `start it with: launchctl load -w "${entry}"`
+  }
+  if (platform !== "win32") {
+    const r = spawnSync("systemctl", ["--user", "enable", "--now", `${NAME}.service`], { encoding: "utf8" })
+    if (r.status === 0) return "started (systemctl --user)"
+    return `systemd --user isn't available; start it yourself at login: "${node}" "${daemon}"`
+  }
+  spawn(node, [daemon], { detached: true, stdio: "ignore", windowsHide: true }).unref()
+  return "started"
+}
+
+function daemonRunning(bridge) {
+  try {
+    process.kill(Number(fs.readFileSync(path.join(bridge, "daemon.pid"), "utf8")), 0)
+    return true
+  } catch (e) {
+    return e.code === "EPERM"
+  }
+}
+
+function stopDaemon(bridge) {
+  const file = path.join(bridge, "daemon.pid")
+  try {
+    const pid = Number(fs.readFileSync(file, "utf8"))
+    if (pid) process.kill(pid)
+    fs.rmSync(file, { force: true })
+    return `stopped the running daemon (pid ${pid})`
+  } catch {
+    return "no running daemon found"
+  }
+}
+
+function uninstallDaemon(bridge, dry) {
+  const { file } = autostartFile({ daemon: "" })
+  if (!fs.existsSync(file)) console.log(`[ok] no daemon autostart entry (${file})`)
+  else if (dry) console.log(`[plan] would remove ${file}`)
+  else {
+    if (process.platform === "darwin") spawnSync("launchctl", ["unload", "-w", file])
+    else if (process.platform !== "win32") spawnSync("systemctl", ["--user", "disable", "--now", `${NAME}.service`])
+    fs.rmSync(file, { force: true })
+    console.log(`[done] removed ${file}`)
+  }
+  if (!dry) console.log(`[done] ${stopDaemon(bridge)}`)
+  return 0
+}
 
 // OpenCode counts as installed when its config dir or desktop data dir exists, or `opencode` is on PATH.
 export function hasOpenCode(home, env = process.env, platform = process.platform) {
@@ -230,8 +333,15 @@ const stamp = () => new Date().toISOString().replace(/\D/g, "").slice(0, 14)
 export function main(argv) {
   const args = argv.filter((a) => a !== "setup")
   if (args.includes("--help") || args.includes("-h")) return console.log(USAGE), 0
-  if (args.some((a) => !FLAGS.includes(a)) || (args.includes("--opencode-only") && args.includes("--codex-only"))) {
+  if (
+    args.some((a) => !FLAGS.includes(a)) ||
+    (args.includes("--opencode-only") && args.includes("--codex-only")) ||
+    (args.includes("--daemon") && args.includes("--no-daemon"))
+  ) {
     return console.error(USAGE), 2
+  }
+  if (args.includes("--uninstall-daemon")) {
+    return uninstallDaemon(process.env.WECHAT_NOTIFY_DIR || path.join(os.homedir(), ".cli-bridge"), args.includes("--dry-run"))
   }
   const dry = args.includes("--dry-run")
   const wantOpencode = !args.includes("--codex-only")
@@ -333,6 +443,29 @@ export function main(argv) {
     }
   }
 
+  // The OpenCode plugin receives WeChat messages while OpenCode runs. Without OpenCode (Codex only), or when asked,
+  // a login-time daemon does it instead; a lock in ~/.cli-bridge keeps it to one receiver when both run.
+  const noOpenCode = !args.includes("--opencode-only") && !hasOpenCode(home)
+  if (!args.includes("--no-daemon") && (args.includes("--daemon") || (noOpenCode && !args.includes("--opencode-only")))) {
+    const daemon = path.join(dir, "daemon.js")
+    const { file, text } = autostartFile({ daemon })
+    const existed = fs.existsSync(file)
+    if (existed && fs.readFileSync(file, "utf8") === text) say("ok", `daemon starts at login (${file})`)
+    else {
+      changed = true
+      if (dry) say("plan", `would ${existed ? "update" : "add"} the daemon autostart entry ${file}`)
+      else {
+        write(file, text, existed)
+        say("done", `daemon starts at login (${file})`)
+      }
+    }
+    // AGENT_WECHAT_BRIDGE_NO_START: tests install the entry without launching a real daemon.
+    if (!dry && !daemonRunning(bridge) && !process.env.AGENT_WECHAT_BRIDGE_NO_START) say("done", `daemon ${startDaemon(process.platform, file, process.execPath, daemon)}`)
+    if (noOpenCode) say("info", "OpenCode not found: the daemon receives WeChat messages for Codex")
+  } else if (!noOpenCode) {
+    say("info", "WeChat messages are received while OpenCode runs; add --daemon to also receive them when OpenCode is closed")
+  }
+
   if (!changed && !failed) console.log("Nothing to change.")
   else if (changed && !dry) {
     console.log("\nStill to do by hand:")
@@ -343,5 +476,6 @@ export function main(argv) {
 }
 
 if (process.argv[1] && norm(fs.realpathSync(process.argv[1])) === norm(fs.realpathSync(fileURLToPath(import.meta.url)))) {
-  process.exitCode = main(process.argv.slice(2))
+  if (process.argv[2] === "daemon") await import("./daemon.js")
+  else process.exitCode = main(process.argv.slice(2))
 }

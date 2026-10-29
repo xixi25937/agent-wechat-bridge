@@ -12,7 +12,7 @@ import { desktopReply, readQuestion } from "./codex-question.js"
 import * as asyncQuestion from "./codex-question.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
 import { md, numbered, ul } from "./md.js"
-import { pollLock } from "./poll-lock.js"
+import { pollLock, readLock } from "./poll-lock.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set([
@@ -42,7 +42,9 @@ export const PENDING_DIR = path.join(DIR, "codex-pending")
 const CODEX = "codex:"
 // A Codex approval record older than this no longer matches a 「N y」.
 const PENDING_TTL = 60 * 60_000
-const SERVICE_FILE = path.join(os.homedir(), ".local", "state", "opencode", "service.json")
+const SERVICE_FILE = process.env.OPENCODE_SERVICE_FILE || path.join(os.homedir(), ".local", "state", "opencode", "service.json")
+// What a reply says when an OpenCode conversation is addressed but no OpenCode service runs (Codex-only daemon).
+const OC_DOWN = "OpenCode 没在运行，打开 OpenCode 后再试"
 const STATUS = { succeeded: "完成", failed: "出错", interrupted: "中断" }
 const section = (title, items) => md(`【${title}】`, ul(items))
 // Short sections of one-line bullets: WeChat shows the text as Markdown (see md.js).
@@ -833,7 +835,7 @@ export function imagePaths(text, baseDir) {
 // Local OpenCode HTTP API, for what the plugin context doesn't expose in 2.0.32 (session list/active, forms, messages).
 async function oc(pathname, body, method = body ? "POST" : "GET") {
   const svc = readJson(SERVICE_FILE)
-  if (!svc?.url || !svc?.password) throw new Error("找不到 OpenCode 服务信息")
+  if (!svc?.url || !svc?.password) throw Object.assign(new Error(OC_DOWN), { down: true })
   const res = await fetch(new URL(pathname, svc.url.replace("0.0.0.0", "127.0.0.1")), {
     method,
     headers: {
@@ -842,6 +844,10 @@ async function oc(pathname, body, method = body ? "POST" : "GET") {
     },
     body: body && JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
+  }).catch((e) => {
+    // A stale service.json after OpenCode quit: connection refused, not an API error.
+    if (e?.name === "TimeoutError") throw e
+    throw Object.assign(new Error(OC_DOWN), { down: true })
   })
   if (!res.ok) {
     const t = await res.text()
@@ -952,7 +958,11 @@ async function listSessions(dir) {
     return listText((await codexThreads({ cwd: dir.slice(CODEX.length) })).map(codexLine), Infinity)
   }
   const [list, active, codex] = await Promise.all([
-    oc(sessionsURL(10, dir)),
+    // Without OpenCode (Codex-only daemon) the list is just the Codex threads.
+    oc(sessionsURL(10, dir)).catch((e) => {
+      if (!e.down || dir) throw e
+      return []
+    }),
     oc("/api/session/active").catch(() => ({ data: {} })),
     dir ? [] : codexThreads(),
   ])
@@ -1537,6 +1547,43 @@ function startPoller() {
 function stopLock(keep) {
   g.lock?.stop(keep)
   g.lock = null
+}
+
+// Standalone mode (daemon.js): the same WeChat poller and commands without OpenCode, so Codex-only users can reply too.
+// OpenCode conversations still work through its HTTP API whenever an OpenCode service runs; Codex pushes come from
+// codex-hook.js. The poll lock decides between this and an OpenCode plugin that may run at the same time.
+export function runDaemon({ log = (m) => console.log(`${new Date().toLocaleString()} ${m}`) } = {}) {
+  const keepAlive = setInterval(() => {}, 60_000) // the lock's timers are unref'd
+  // For `setup --uninstall-daemon` to find and stop us.
+  const pidFile = path.join(DIR, "daemon.pid")
+  fs.mkdirSync(DIR, { recursive: true })
+  fs.writeFileSync(pidFile, String(process.pid))
+  process.on("exit", () => {
+    try {
+      if (fs.readFileSync(pidFile, "utf8") === String(process.pid)) fs.rmSync(pidFile)
+    } catch {}
+  })
+  const quit = () => {
+    clearInterval(keepAlive)
+    stopLock()
+    stopPoller()
+    g.bridge?.stop()
+    g.bridge = null
+    process.exit(0)
+  }
+  // Ours before the lock starts, so it doesn't install its own signal handlers.
+  process.once("SIGINT", quit)
+  process.once("SIGTERM", quit)
+  stopLock(true)
+  stopPoller()
+  g.lock = pollLock(DIR, {
+    onHeld: () => (log("polling WeChat"), startPoller()),
+    onLost: () => (log("another process took over WeChat polling; standing by"), stopPoller()),
+  })
+  g.lock.gen = GEN
+  g.lock.start()
+  if (!g.lock.held()) log(`another process polls WeChat (pid ${readLock(DIR)?.pid}); standing by, retrying every 30 s`)
+  return quit
 }
 
 export default {
