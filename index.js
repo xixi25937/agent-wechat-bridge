@@ -2,6 +2,7 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set(["session.execution.succeeded", "session.execution.failed", "permission.asked", "form.created"])
@@ -24,7 +25,13 @@ const HELP = [
   "列表 → 最近的对话和编号",
   "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
   "新对话 内容 → 在选中的文件夹里开新对话",
+  "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
 ].join("\n")
+const IMG = /\.(png|jpe?g|gif|webp)$/i
+const MAX_IMAGES = 4
+const IMAGE_MAX_BYTES = 10 * 1024 * 1024
+const TOO_BIG = "太大（超过 10 MB）"
+const CDN = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 const short = (s, n = 80) => {
   const t = String(s ?? "").replace(/\s+/g, " ").trim()
@@ -134,6 +141,10 @@ export function parseCommand(text) {
   // Before the "3 内容" rule, so "3 历史" is never sent to the session as a prompt.
   m = t.match(/^(?:(\d{1,4})\s*)?(?:历史|\/history)(?:\s*(\d{1,4}))?$/i)
   if (m) return { type: "history", ...(m[1] && { n: Number(m[1]) }), count: Math.min(20, Math.max(1, Number(m[2] ?? 5))) }
+  // Needs an image extension, so "图 好看吗" stays a normal message.
+  m = t.match(/^(?:图|\/img)[\s:：]+(.+)$/i)
+  const img = m?.[1].trim().replace(/^[`"'“「]+|[`"'”」]+$/g, "")
+  if (img && IMG.test(img)) return { type: "image", path: img }
   m = t.match(/^(\d{1,4})$/)
   if (m) return { type: "show", n: Number(m[1]) }
   m = t.match(/^(\d{1,4})[\s:：,，]+([\s\S]+)$/)
@@ -242,40 +253,126 @@ async function ilink(endpoint, body, signal = AbortSignal.timeout(15000)) {
   return { ...json, http: res.status, ok: res.ok }
 }
 
-// Sends one text message. Never throws; returns a short status string without secrets.
-export async function send(text) {
+// Throws a status line (no secrets) unless the iLink call succeeded.
+function check(name, json) {
+  const ret = Number(json.ret ?? 0)
+  const errcode = Number(json.errcode ?? 0)
+  const status = `http=${json.http} ret=${ret} errcode=${errcode}`
+  if (json.ok && !ret && !errcode) return status
+  const hint = ret === -2 ? " (context_token 过期，先给机器人发一条消息)" : ""
+  throw new Error(`${name} failed: ${status} ${short(json.errmsg ?? "", 120)}${hint}`)
+}
+
+function recipient() {
   const account = readJson(path.join(DIR, "account.json"))
   const tokens = readJson(path.join(DIR, "context_tokens.json")) ?? {}
   const to = account?.userId
   const contextToken = state().contextToken ?? tokens[to] ?? Object.values(tokens).pop()
-  if (!to || !contextToken) {
-    warn(`credentials missing in ${DIR}`)
-    return "no-credentials"
-  }
+  if (!to || !contextToken) throw new Error(`credentials missing in ${DIR}`)
+  return { to, contextToken }
+}
+
+async function sendItems(items) {
+  const { to, contextToken } = recipient()
+  const json = await ilink("ilink/bot/sendmessage", {
+    msg: {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: `opencode-wechat-notify:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
+      message_type: 2, // bot
+      message_state: 2, // finished
+      item_list: items,
+      context_token: contextToken,
+    },
+  })
+  return check("sendmessage", json)
+}
+
+// Sends one text message. Never throws; returns a short status string without secrets.
+export async function send(text) {
   try {
-    const json = await ilink("ilink/bot/sendmessage", {
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: `opencode-wechat-notify:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
-        message_type: 2, // bot
-        message_state: 2, // finished
-        item_list: [{ type: 1, text_item: { text } }],
-        context_token: contextToken,
-      },
-    })
-    const ret = Number(json.ret ?? 0)
-    const errcode = Number(json.errcode ?? 0)
-    const status = `http=${json.http} ret=${ret} errcode=${errcode}`
-    if (!json.ok || ret !== 0 || errcode !== 0) {
-      const hint = ret === -2 ? " (context_token 过期，先给机器人发一条消息)" : ""
-      warn(`send failed: ${status} ${short(json.errmsg ?? "", 120)}${hint}`)
-    }
-    return status
+    return await sendItems([{ type: 1, text_item: { text } }])
   } catch (e) {
-    warn("send error:", e)
+    warn("send:", e)
     return "error"
   }
+}
+
+// null when `file` is a sendable image, else the reason.
+async function imageProblem(file) {
+  if (!IMG.test(file)) return "不是 png/jpg/gif/webp 图片"
+  const st = await fs.promises.stat(file).catch(() => null)
+  if (!st?.isFile()) return "文件不存在"
+  return st.size > IMAGE_MAX_BYTES ? TOO_BIG : null
+}
+
+// Upload: getuploadurl → POST the AES-128-ECB ciphertext to the CDN → send an image item with the CDN's download param.
+// Throws on failure; returns the status of each step (no secrets).
+export async function sendImage(file) {
+  const problem = await imageProblem(file)
+  if (problem) throw new Error(`${path.basename(file)} ${problem}`)
+  const { to } = recipient()
+  const buf = await fs.promises.readFile(file)
+  const key = crypto.randomBytes(16)
+  const cipher = crypto.createCipheriv("aes-128-ecb", key, null)
+  const data = Buffer.concat([cipher.update(buf), cipher.final()])
+  const filekey = crypto.randomBytes(16).toString("hex")
+  const r = await ilink("ilink/bot/getuploadurl", {
+    filekey,
+    media_type: 1, // image
+    to_user_id: to,
+    rawsize: buf.length,
+    rawfilemd5: crypto.createHash("md5").update(buf).digest("hex"),
+    filesize: data.length,
+    aeskey: key.toString("hex"),
+    no_need_thumb: true,
+  })
+  const steps = [`getuploadurl ${check("getuploadurl", r)}`]
+  if (!r.upload_param) throw new Error("getuploadurl returned no upload_param")
+  const q = `encrypted_query_param=${encodeURIComponent(r.upload_param)}&filekey=${filekey}`
+  // ponytail: no retry on CDN 5xx; add one if uploads flake.
+  const res = await fetch(`${CDN}/upload?${q}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: data,
+    signal: AbortSignal.timeout(60_000),
+  })
+  const param = res.headers.get("x-encrypted-param")
+  if (res.status !== 200 || !param)
+    throw new Error(`cdn upload failed: http=${res.status} ${short(res.headers.get("x-error-message") ?? "", 120)}`)
+  steps.push(`cdn http=${res.status}`)
+  const media = { encrypt_query_param: param, aes_key: Buffer.from(key.toString("hex")).toString("base64"), encrypt_type: 1 }
+  steps.push(`sendmessage ${await sendItems([{ type: 2, image_item: { media, mid_size: data.length } }])}`)
+  return steps.join(", ")
+}
+
+// Absolute path for a path or file:/// URL as written; null for other URLs, or a relative path without a base.
+function toPath(p, baseDir) {
+  if (/^file:/i.test(p)) {
+    try {
+      return fileURLToPath(p)
+    } catch {
+      return null
+    }
+  }
+  if (/^[a-z][\w+.-]+:/i.test(p)) return null
+  return path.isAbsolute(p) ? path.resolve(p) : baseDir ? path.resolve(baseDir, p) : null
+}
+
+// Image paths mentioned in a reply: `code spans`, markdown link targets, and bare words. Paths with spaces need
+// backticks or a markdown link.
+export function imagePaths(text, baseDir) {
+  const out = new Set()
+  const re = /`([^`\n]+)`|\]\(\s*<?([^)>\n]+?)>?\s*\)|([^\s`"'<>|*?()[\]，。；：！？、「」（）]+)/g
+  for (const m of String(text ?? "").matchAll(re)) {
+    let raw = (m[1] ?? m[2] ?? m[3]).trim().replace(/[.,;:!]+$/, "")
+    // "截图在C:\x.png": text glued before a drive letter or file: URL.
+    raw = raw.slice(Math.max(0, raw.search(/(?<![a-z])([a-z]:[\\/]|file:)/i)))
+    const p = IMG.test(raw) && toPath(raw, baseDir)
+    if (p) out.add(p)
+    if (out.size >= MAX_IMAGES) break
+  }
+  return [...out]
 }
 
 // Local OpenCode HTTP API, for what the plugin context doesn't expose in 2.0.32 (session list/active, forms, messages).
@@ -367,6 +464,12 @@ async function run(cmd) {
     return `已选中 ${base(dir)}\n${await listSessions(dir)}\n回复「编号 内容」继续旧对话，「新对话 内容」开新对话`
   }
   if (cmd.type === "new") return newSession(cmd.text)
+  if (cmd.type === "image") {
+    const file = toPath(cmd.path, state().dir)
+    if (!file) return /^[a-z][\w+.-]+:/i.test(cmd.path) && !/^file:/i.test(cmd.path) ? "只能发电脑上的文件" : "相对路径要先发「目录」选文件夹"
+    await sendImage(file)
+    return [] // the image itself is the confirmation
+  }
   if (cmd.type === "text" && !cmd.text) return HELP
   // Unnumbered text goes to the session the user last picked, not the last push: other sessions push all the time.
   const sessionID = cmd.n == null ? (state().target ?? state().last) : sessionOf(cmd.n)
@@ -496,8 +599,18 @@ export default {
       if (event.type === "session.execution.succeeded" && session?.parentID) return
       const reply =
         event.type === "session.execution.succeeded" ? await lastReply(sessionID).catch((e) => (warn(e), "")) : ""
-      const text = format(event, session, numOf(sessionID), reply)
-      if (text) await push(sessionID, text)
+      let text = format(event, session, numOf(sessionID), reply)
+      if (!text) return
+      const files = []
+      const big = []
+      for (const f of imagePaths(reply, session?.location?.directory ?? event.location?.directory)) {
+        const p = await imageProblem(f)
+        if (!p) files.push(f)
+        else if (p === TOO_BIG) big.push(path.basename(f))
+      }
+      if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
+      await push(sessionID, text)
+      for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
     }
     void (async () => {
       try {

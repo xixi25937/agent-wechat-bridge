@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { getEventListeners } from "node:events"
 import { test } from "node:test"
-import { clip, eventKey, format, formAnswer, historyLines, inboundText, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
+import { clip, eventKey, format, formAnswer, historyLines, imagePaths, inboundText, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
 const ok = { type: "session.execution.succeeded", data: { sessionID: "s1" } }
@@ -84,6 +84,31 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("列表里第二个是什么"), { type: "text", text: "列表里第二个是什么" })
   assert.deepEqual(parseCommand("3 y"), { type: "text", n: 3, text: "y" })
   assert.deepEqual(parseCommand("帮助 列表 看看日志"), { type: "text", text: "帮助 列表 看看日志" })
+})
+
+test("imagePaths", () => {
+  const dir = "C:\\proj"
+  assert.deepEqual(imagePaths("截图在 C:\\a\\b\\x.png。", dir), ["C:\\a\\b\\x.png"])
+  assert.deepEqual(imagePaths("C:/a/y.JPG, done", dir), ["C:\\a\\y.JPG"])
+  assert.deepEqual(imagePaths("截图在D:\\马原\\x.png", dir), ["D:\\马原\\x.png"])
+  assert.deepEqual(imagePaths("见 file:///C:/a%20b/z.webp", dir), ["C:\\a b\\z.webp"])
+  assert.deepEqual(imagePaths("![图](C:\\a\\m.gif) 和 [链接](<C:\\a b\\n.jpeg>)", dir), ["C:\\a\\m.gif", "C:\\a b\\n.jpeg"])
+  assert.deepEqual(imagePaths("文件 `C:\\My Pics\\q.png` 好了", dir), ["C:\\My Pics\\q.png"])
+  assert.deepEqual(imagePaths("生成了 out/chart.png 和 ./a.png", dir), ["C:\\proj\\out\\chart.png", "C:\\proj\\a.png"])
+  assert.deepEqual(imagePaths("out/chart.png"), [])
+  assert.deepEqual(imagePaths("https://x.com/a.png ![](http://x.com/b.png)", dir), [])
+  assert.deepEqual(imagePaths("C:\\a\\notes.txt C:\\a\\pic.png.bak C:\\a\\x.svg", dir), [])
+  assert.deepEqual(imagePaths("C:\\a\\x.png `C:\\a\\x.png` ![](C:/a/x.png)", dir), ["C:\\a\\x.png"])
+  assert.deepEqual(imagePaths("1.png 2.png 3.png 4.png 5.png", dir).length, 4)
+})
+
+test("parseCommand image", () => {
+  assert.deepEqual(parseCommand("图 C:\\a\\x.png"), { type: "image", path: "C:\\a\\x.png" })
+  assert.deepEqual(parseCommand("/img `out/a b.png`"), { type: "image", path: "out/a b.png" })
+  assert.deepEqual(parseCommand("图片好看吗"), { type: "text", text: "图片好看吗" })
+  assert.deepEqual(parseCommand("图片怎么发"), { type: "text", text: "图片怎么发" })
+  assert.deepEqual(parseCommand("图 好看吗"), { type: "text", text: "图 好看吗" })
+  assert.deepEqual(parseCommand("图 C:\\a\\notes.txt"), { type: "text", text: "图 C:\\a\\notes.txt" })
 })
 
 test("historyLines", () => {
