@@ -82,7 +82,14 @@ export const short = (s, n = 80) => {
 }
 export const base = (dir) => (dir ? dir.split(/[\\/]/).filter(Boolean).pop() : "") || "?"
 const toArr = (r) => (Array.isArray(r) ? r : (r?.data ?? []))
-const warn = (...a) => console.warn(TAG, ...a.map((x) => short(x?.message ?? x, 200)))
+// console.warn from a plugin never reaches opencode.log, so failures also go to a file the user can read.
+const warn = (...a) => {
+  const line = a.map((x) => short(x?.message ?? x, 200)).join(" ")
+  console.warn(TAG, line)
+  try {
+    fs.appendFileSync(path.join(DIR, "wechat-notify.log"), `${new Date().toLocaleString()} ${line}\n`)
+  } catch {}
+}
 
 export function clip(text, max = MAX_CHARS) {
   const t = String(text ?? "").trim()
