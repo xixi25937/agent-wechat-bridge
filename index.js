@@ -113,11 +113,19 @@ export function format(event, session, n, reply) {
   return null
 }
 
+const KEYWORDS = [
+  ["list", /^(列表|\/?list|\/ls)$/i],
+  ["help", /^(帮助|\/?help|\?|？)$/i],
+  ["dirs", /^(目录|文件夹|\/?dirs?)$/i],
+]
+const keyword = (w) => KEYWORDS.find(([, re]) => re.test(w) || re.test(w.replace(/[。.！!？?~～…]+$/, "")))?.[0]
+
 export function parseCommand(text) {
   const t = String(text ?? "").trim()
-  if (/^(列表|\/?list|\/ls)$/i.test(t)) return { type: "list" }
-  if (/^(帮助|\/?help|\?|？)$/i.test(t)) return { type: "help" }
-  if (/^(目录|文件夹|\/?dirs?)$/i.test(t)) return { type: "dirs" }
+  // "列表。", "10 帮助", "帮助 列表": only no-arg keywords (an optional session number is ignored) run as commands.
+  const words = t.replace(/^\d{1,4}[\s:：,，]+/, "").split(/[\s,，、]+/).filter(Boolean)
+  const kws = words.map(keyword)
+  if (words.length && kws.every(Boolean)) return kws.length === 1 ? { type: kws[0] } : { type: "multi", cmds: kws.map((type) => ({ type })) }
   // "目录2" or "目录 名字"; "目录结构怎么整理" stays a normal message.
   let m = t.match(/^(?:目录|文件夹|\/cd)(?:\s*(\d+)|\s+(.+))$/i)
   if (m) return { type: "cd", arg: (m[1] ?? m[2]).trim() }
@@ -341,6 +349,11 @@ async function newSession(text) {
 }
 
 async function run(cmd) {
+  if (cmd.type === "multi") {
+    const out = []
+    for (const c of cmd.cmds) out.push(await run(c))
+    return out.flat()
+  }
   if (cmd.type === "help") return HELP
   if (cmd.type === "list") return listSessions()
   if (cmd.type === "dirs") {
