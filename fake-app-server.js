@@ -18,9 +18,23 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return p.threadId === "busy" ? out({ id: m.id, error: { code: -32600, message: "thread busy already has a live local writer" } }) : ok({ thread: { id: p.threadId } })
     case "thread/start":
       return ok({ thread: { id: "new-thread" } })
+    case "model/list":
+      return ok({ data: [{ id: "m1", model: "m1", displayName: "M1", hidden: false, inputModalities: ["text", "image"] }], nextCursor: null })
+    case "thread/compact/start":
+      ok({})
+      return out({ method: "turn/completed", params: { threadId: p.threadId, turn: { id: "c1", status: "completed", items: [] } } })
+    case "turn/interrupt":
+      ok({})
+      return out({ method: "turn/completed", params: { threadId: p.threadId, turn: { id: p.turnId, status: "interrupted", items: [] } } })
     case "turn/start": {
       ok({ turn: { id: "turn1", status: "inProgress", items: [] } })
       const threadId = p.threadId
+      // "echo" replies with the input and model it got; "slow" runs until interrupted.
+      if (threadId === "slow") return
+      if (threadId === "echo") {
+        out({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: JSON.stringify({ input: p.input, model: p.model }) } } })
+        return out({ method: "turn/completed", params: { threadId, turn: { id: "turn1", status: "completed", items: [] } } })
+      }
       const q = await ask("item/tool/requestUserInput", { threadId, turnId: "turn1", itemId: "i1", questions: [{ id: "q", question: "选哪个？", options: [{ label: "A" }] }] })
       if (q.result?.answers?.q?.answers?.[0] !== "A") return
       const a = await ask("item/commandExecution/requestApproval", { threadId, turnId: "turn1", itemId: "i2", command: "git push", reason: "推送" })

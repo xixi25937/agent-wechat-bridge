@@ -12,7 +12,7 @@ export const PIPE = "\\\\.\\pipe\\codex-ipc"
 const IDLE_MS = 10 * 60_000
 export const BUSY = "该对话正在电脑上打开，请稍后或在电脑上操作"
 // The desktop drops messages whose version differs from its own table (app.asar of Codex desktop 26.1023).
-const VERSIONS = { initialize: 0, "thread-follower-start-turn": 2 }
+const VERSIONS = { initialize: 0, "thread-follower-start-turn": 2, "thread-follower-interrupt-turn": 4 }
 const PERMS = "item/permissions/requestApproval"
 const QUESTION = "item/tool/requestUserInput"
 const DESKTOP = {
@@ -157,9 +157,12 @@ export function decisionRequest(threadId, req, allow) {
   return [DESKTOP[req.method], { conversationId: threadId, requestId: req.id, ...answer }]
 }
 
-export const startTurnParams = (threadId, text) => ({
+// turn/start input: the text, then local image files (same shape the desktop sends for attached images).
+export const turnInput = (text, images = []) => [{ type: "text", text, text_elements: [] }, ...images.map((p) => ({ type: "localImage", path: p }))]
+
+export const startTurnParams = (threadId, text, { images, model } = {}) => ({
   conversationId: threadId,
-  turnStart: { request: { threadId, input: [{ type: "text", text, text_elements: [] }] }, context: {} },
+  turnStart: { request: { threadId, input: turnInput(text, images), ...(model && { model }) }, context: {} },
 })
 
 // Answers the desktop's pending approvals of a thread (allow: the oldest, deny: all). Returns how many, or null when
@@ -181,19 +184,32 @@ export async function desktopApprove(threadId, allow, pipe) {
   }
 }
 
-// Starts a turn in the desktop window; false when the desktop doesn't have the thread loaded.
-export async function desktopSend(threadId, text, pipe) {
+// Result of a request to the desktop window that has the thread loaded, or null when none has it.
+async function desktopCall(threadId, method, params, pipe) {
   const ipc = await ipcConnect(pipe)
-  if (!ipc) return false
+  if (!ipc) return null
   try {
-    if (!(await ownerOf(ipc, threadId))) return false
-    const r = await ipc.request("thread-follower-start-turn", startTurnParams(threadId, text), 30_000)
+    if (!(await ownerOf(ipc, threadId))) return null
+    const r = await ipc.request(method, params, 30_000)
     if (r.resultType !== "success") throw new Error(`电脑上的 Codex 拒绝了：${r.error}`)
-    return true
+    return r.result ?? {}
   } finally {
     ipc.close()
   }
 }
+
+// Starts a turn in the desktop window; false when the desktop doesn't have the thread loaded.
+export const desktopSend = async (threadId, text, pipe, opts) =>
+  (await desktopCall(threadId, "thread-follower-start-turn", startTurnParams(threadId, text, opts), pipe)) != null
+
+// Stops the window's running turn, like its stop button: the stopped turn id, "" when nothing ran, null when not loaded.
+export async function desktopInterrupt(threadId, pipe) {
+  const r = await desktopCall(threadId, "thread-follower-interrupt-turn", { conversationId: threadId, mode: "user-stop" }, pipe)
+  return r == null ? null : (r.interruptedTurnId ?? "")
+}
+
+export const desktopCompact = async (threadId, pipe) =>
+  (await desktopCall(threadId, "thread-follower-compact-thread", { conversationId: threadId }, pipe)) != null
 
 // --- the plugin's own app-server (JSON-RPC, one JSON object per line over stdio) ---
 
@@ -304,6 +320,8 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
   let server = null
   let idle = null
   const active = new Map() // threadId → held server requests, while a turn we started runs
+  const turnIds = new Map() // threadId → id of the running turn we started
+  const compacting = new Set()
   const setActive = (threadId) => {
     active.set(threadId, [])
     if (!markerDir) return
@@ -312,6 +330,8 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
   }
   const clearActive = (threadId) => {
     active.delete(threadId)
+    turnIds.delete(threadId)
+    compacting.delete(threadId)
     if (markerDir) fs.rmSync(bridgeMarker(markerDir, threadId), { force: true })
   }
   const touch = () => {
@@ -331,14 +351,16 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       push(p.threadId, m.method === QUESTION ? "question" : "approval", m.method === QUESTION ? questionText(p.questions) : approvalSummary(m))
       return
     }
+    if (m.method === "turn/started" && held && p.turn?.id) turnIds.set(p.threadId, p.turn.id)
     if (m.method === "item/completed" && held && p.item?.type === "agentMessage" && p.item.text) last.set(p.threadId, p.item.text)
     if (m.method === "serverRequest/resolved" && held) active.set(p.threadId, held.filter((r) => r.id !== p.requestId))
     if (m.method === "turn/completed" && held) {
+      const compacted = compacting.has(p.threadId)
       clearActive(p.threadId)
       const reply = last.get(p.threadId) ?? ""
       last.delete(p.threadId)
       if (p.turn?.status === "failed") push(p.threadId, "failed", p.turn.error?.message ?? "未知错误")
-      else if (p.turn?.status === "completed") push(p.threadId, "done", reply)
+      else if (p.turn?.status === "completed") push(p.threadId, compacted ? "info" : "done", compacted ? "上下文已压缩" : reply)
       server?.call("thread/unsubscribe", { threadId: p.threadId }).catch(() => {})
       touch()
     }
@@ -350,17 +372,23 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
     touch()
     return s
   }
-  const input = (text) => [{ type: "text", text, text_elements: [] }]
-  const startTurn = async (s, threadId, text) => {
+  const turnParams = (threadId, text, { images, model } = {}) => ({ threadId, input: turnInput(text, images), ...(model && { model }) })
+  const startTurn = async (s, threadId, text, opts) => {
     setActive(threadId)
     try {
-      await s.call("turn/start", { threadId, input: input(text) })
+      const r = await s.call("turn/start", turnParams(threadId, text, opts))
+      if (r?.turn?.id && !turnIds.has(threadId)) turnIds.set(threadId, r.turn.id)
     } catch (e) {
       clearActive(threadId)
       s.call("thread/unsubscribe", { threadId }).catch(() => {})
       throw e
     }
   }
+  // One writer per thread: resume fails while a terminal or the desktop is running it.
+  const resume = (s, threadId) =>
+    s.call("thread/resume", { threadId, excludeTurns: true }).catch((e) => {
+      throw /writer/i.test(e.message) ? new Error(BUSY) : e
+    })
   const take = (threadId, question) => (active.get(threadId) ?? []).filter((r) => (r.method === QUESTION) === question)
   const answer = (threadId, req, result) => {
     server?.respond(req.id, result)
@@ -368,21 +396,45 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
   }
   const b = {
     running: (threadId) => active.has(threadId),
-    async send(threadId, text) {
+    // opts: { images: [absolute paths], model }.
+    async send(threadId, text, opts) {
       const s = await ensure()
       // Our turn is still running: turn/start adds the text to it.
-      if (active.has(threadId)) return void (await s.call("turn/start", { threadId, input: input(text) }))
-      // One writer per thread: resume fails while a terminal or the desktop is running it.
-      await s.call("thread/resume", { threadId, excludeTurns: true }).catch((e) => {
-        throw /writer/i.test(e.message) ? new Error(BUSY) : e
-      })
-      await startTurn(s, threadId, text)
+      if (active.has(threadId)) return void (await s.call("turn/start", turnParams(threadId, text, opts)))
+      await resume(s, threadId)
+      await startTurn(s, threadId, text, opts)
     },
-    async create(cwd, text) {
+    async create(cwd, text, opts) {
       const s = await ensure()
       const { thread } = await s.call("thread/start", { cwd })
-      await startTurn(s, thread.id, text)
+      await startTurn(s, thread.id, text, opts)
       return thread.id
+    },
+    // Stops our running turn of the thread; false when none runs here.
+    async interrupt(threadId) {
+      const turnId = turnIds.get(threadId)
+      if (!active.has(threadId) || !turnId) return false
+      await (await ensure()).call("turn/interrupt", { threadId, turnId })
+      return true
+    },
+    // Compaction runs as a turn of its own; its completion is pushed as "info".
+    async compact(threadId) {
+      if (active.has(threadId)) throw new Error("这个对话正在运行，等它结束再压缩")
+      const s = await ensure()
+      await resume(s, threadId)
+      setActive(threadId)
+      compacting.add(threadId)
+      try {
+        await s.call("thread/compact/start", { threadId })
+      } catch (e) {
+        clearActive(threadId)
+        s.call("thread/unsubscribe", { threadId }).catch(() => {})
+        throw e
+      }
+    },
+    async models() {
+      const s = await ensure()
+      return (await s.call("model/list", {})).data ?? []
     },
     // Newest first.
     async turns(threadId, limit) {
@@ -440,7 +492,7 @@ async function query(sql, ...args) {
 // Non-archived threads the user started (subagents and auto-reviewers excluded).
 const USER_THREADS = "archived = 0 and coalesce(thread_source, 'user') = 'user' and source not like '%subagent%'"
 
-export const codexThread = async (id) => (await query("select name, title, cwd from threads where id = ?", id))[0] ?? null
+export const codexThread = async (id) => (await query("select name, title, cwd, model from threads where id = ?", id))[0] ?? null
 
 export const codexThreads = ({ cwd, limit = 10 } = {}) =>
   query(

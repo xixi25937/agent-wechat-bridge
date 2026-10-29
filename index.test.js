@@ -1,7 +1,11 @@
 import assert from "node:assert/strict"
 import { getEventListeners } from "node:events"
+import crypto from "node:crypto"
 import { test } from "node:test"
-import { clip, codexPushText, dirLabel, eventKey, format, formAnswer, historyLines, imagePaths, inboundText, mergeLines, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
+import {
+  PAIR_MS, aesKeyOf, chunkLines, clip, codexPushText, dirLabel, eventKey, extOf, format, formAnswer, historyLines, imagePaths, inboundMedia,
+  inboundText, liveMedia, mediaAck, mergeLines, modelLines, parseCommand, pickDir, pickModel, replyText, sessionIDOf, shouldSend, sleep, withMedia,
+} from "./index.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
 const ok = { type: "session.execution.succeeded", data: { sessionID: "s1" } }
@@ -37,6 +41,7 @@ test("replyText", () => {
   assert.equal(replyText([a(null), a("最终", "回复"), user, a("旧的")]), "最终\n回复")
   assert.equal(replyText([a(null), user, a("旧的")]), "")
   assert.equal(replyText([a(null), user, a("旧的")], false), "旧的")
+  assert.equal(replyText([{ type: "idle" }, { type: "compaction" }, a("旧的")]), "")
   assert.equal(replyText([{ type: "assistant", content: [{ type: "reasoning", text: "想" }] }]), "")
 })
 
@@ -195,6 +200,118 @@ test("inboundText", () => {
   assert.equal(inboundText({ ...msg, from_user_id: undefined }, undefined), null)
   assert.equal(inboundText({ ...msg, item_list: [{ type: 3, voice_item: { text: "列表" } }] }, "me"), "列表")
   assert.equal(inboundText({ ...msg, item_list: [{ type: 2 }] }, "me"), null)
+})
+
+test("parseCommand slash", () => {
+  assert.deepEqual(parseCommand("/model"), { type: "slash", name: "model", args: "" })
+  assert.deepEqual(parseCommand("/model 3"), { type: "slash", name: "model", args: "3" })
+  assert.deepEqual(parseCommand("/Model claude sonnet"), { type: "slash", name: "Model", args: "claude sonnet" })
+  assert.deepEqual(parseCommand("5 /stop"), { type: "slash", n: 5, name: "stop", args: "" })
+  assert.deepEqual(parseCommand("5：/compact"), { type: "slash", n: 5, name: "compact", args: "" })
+  assert.deepEqual(parseCommand("/review 看下\n改动"), { type: "slash", name: "review", args: "看下\n改动" })
+  assert.deepEqual(parseCommand("/exa:web_search_help"), { type: "slash", name: "exa:web_search_help", args: "" })
+  // The plugin's own commands still win.
+  assert.deepEqual(parseCommand("/list"), { type: "list" })
+  assert.deepEqual(parseCommand("/ls"), { type: "list" })
+  assert.deepEqual(parseCommand("/help"), { type: "help" })
+  assert.deepEqual(parseCommand("/dirs"), { type: "dirs" })
+  assert.deepEqual(parseCommand("/cd 2"), { type: "cd", arg: "2" })
+  assert.deepEqual(parseCommand("/new 你好"), { type: "new", text: "你好" })
+  assert.deepEqual(parseCommand("/history 3"), { type: "history", count: 3 })
+  assert.deepEqual(parseCommand("/img a.png"), { type: "image", path: "a.png" })
+  // Malformed own commands show help instead of reaching the AI.
+  assert.deepEqual(parseCommand("/img 好看吗"), { type: "help" })
+  assert.deepEqual(parseCommand("/history abc"), { type: "help" })
+  assert.deepEqual(parseCommand("/cd"), { type: "dirs" })
+  // Ordinary text is unaffected.
+  assert.deepEqual(parseCommand("/usr/bin 是什么"), { type: "text", text: "/usr/bin 是什么" })
+  assert.deepEqual(parseCommand("3 /usr/local 下有什么"), { type: "text", n: 3, text: "/usr/local 下有什么" })
+  assert.deepEqual(parseCommand("看看 /model 的用法"), { type: "text", text: "看看 /model 的用法" })
+  assert.deepEqual(parseCommand("3 图"), { type: "text", n: 3, text: "图" })
+  assert.deepEqual(parseCommand("发"), { type: "text", text: "发" })
+})
+
+test("inboundMedia", () => {
+  const msg = (...items) => ({ message_type: 1, from_user_id: "me", item_list: items })
+  const media = { encrypt_query_param: "p" }
+  assert.deepEqual(inboundMedia(msg({ type: 2, image_item: { media: { ...media, aes_key: "k" }, mid_size: 99 } }), "me"), [
+    { kind: "image", media: { ...media, aes_key: "k" }, key: "k", name: "", size: 99 },
+  ])
+  assert.deepEqual(inboundMedia(msg({ type: 2, image_item: { media, aeskey: "hex" } }), "me")[0].key, "hex")
+  assert.deepEqual(inboundMedia(msg({ type: 4, file_item: { media: { ...media, aes_key: "k" }, file_name: " a.pdf ", len: "12" } }), "me"), [
+    { kind: "file", media: { ...media, aes_key: "k" }, key: "k", name: "a.pdf", size: 12 },
+  ])
+  assert.deepEqual(inboundMedia(msg({ type: 1, text_item: { text: "x" } }, { type: 5, video_item: {} }), "me"), [])
+  assert.deepEqual(inboundMedia(msg({ type: 2, image_item: { media } }), "other"), [])
+  assert.deepEqual(inboundMedia({ ...msg({ type: 2, image_item: { media } }), message_type: 2 }, "me"), [])
+})
+
+test("aesKeyOf", () => {
+  const key = crypto.randomBytes(16)
+  const hex = key.toString("hex")
+  assert.deepEqual(aesKeyOf(hex), key)
+  assert.deepEqual(aesKeyOf(hex.toUpperCase()), key)
+  assert.deepEqual(aesKeyOf(key.toString("base64")), key)
+  // What sendImage puts in aes_key: base64 of the hex string.
+  assert.deepEqual(aesKeyOf(Buffer.from(hex).toString("base64")), key)
+  assert.deepEqual(aesKeyOf(` ${hex} `), key)
+  assert.throws(() => aesKeyOf("short"), /密钥/)
+  assert.throws(() => aesKeyOf(""), /密钥/)
+})
+
+test("extOf", () => {
+  const b = (...parts) => Buffer.concat(parts.map((p) => (typeof p === "string" ? Buffer.from(p, "latin1") : Buffer.from(p))))
+  assert.equal(extOf(b([0x89], "PNG\r\n\x1a\n")), "png")
+  assert.equal(extOf(b([0xff, 0xd8, 0xff, 0xe0])), "jpg")
+  assert.equal(extOf(b("GIF89a")), "gif")
+  assert.equal(extOf(b("RIFF", [1, 2, 3, 4], "WEBPVP8 ")), "webp")
+  assert.equal(extOf(b([0, 0, 0, 0x18], "ftypheic")), "heic")
+  assert.equal(extOf(b("%PDF-1.7")), "pdf")
+  assert.equal(extOf(b("PK\x03\x04")), "zip")
+  assert.equal(extOf(b("hello world")), null)
+  assert.equal(extOf(Buffer.alloc(0)), null)
+})
+
+test("image pairing", () => {
+  const now = 1_000_000
+  const img = (p, at = now) => ({ kind: "image", path: p, at })
+  const items = [img("a.png", now - PAIR_MS - 1), img("b.png", now - 1000), { kind: "file", path: "C:\\x\\r.pdf", at: now }]
+  const live = liveMedia(items, now)
+  assert.deepEqual(live.map((i) => i.path), ["b.png", "C:\\x\\r.pdf"], "expired media is dropped")
+  assert.deepEqual(liveMedia(undefined, now), [])
+  assert.deepEqual(withMedia("这是什么", [img("b.png")]), { text: "这是什么", images: ["b.png"] })
+  assert.deepEqual(withMedia("发", [img("b.png")]), { text: "请看图片", images: ["b.png"] })
+  assert.deepEqual(withMedia("Send", [img("b.png")]), { text: "请看图片", images: ["b.png"] })
+  assert.deepEqual(withMedia("图", [img("b.png"), img("c.png")]), { text: "请看图片", images: ["b.png", "c.png"] })
+  assert.deepEqual(withMedia("看下", live), { text: "看下\n\n微信发来的文件已保存在：\nC:\\x\\r.pdf", images: ["b.png"] })
+  assert.deepEqual(withMedia("发", [live[1]]), { text: "请看文件\n\n微信发来的文件已保存在：\nC:\\x\\r.pdf", images: [] })
+  assert.deepEqual(withMedia("发", []), { text: "发", images: [] })
+  assert.equal(mediaAck([img("b.png")], "[3]"), "收到图片（共 1 张），接着发文字说明，会一起发给 [3]（不用说明就回「发」）")
+  assert.equal(mediaAck(live, "[3]"), "收到图片和文件（共 1 张图片、1 个文件），接着发文字说明，会一起发给 [3]（不用说明就回「发」）")
+  assert.match(mediaAck([img("b.png")], undefined), /用「编号 文字」指定/)
+  assert.equal(mediaAck([], "[3]", 1), "有 1 个没收到（下载失败）")
+  assert.match(mediaAck([img("b.png")], "[3]", 1), /^有 1 个没收到（下载失败）；收到图片（共 1 张）/)
+})
+
+test("pickModel / modelLines / chunkLines", () => {
+  const ms = [
+    { id: "claude-sonnet-5-5", label: "yapi/claude-sonnet-5-5", name: "Sonnet", image: true },
+    { id: "claude-sonnet-5-5", label: "yapi2/claude-sonnet-5-5", name: "Sonnet", image: true },
+    { id: "deepseek-v4-pro", label: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", image: false },
+  ]
+  assert.deepEqual(pickModel(ms, "3"), [ms[2]])
+  assert.deepEqual(pickModel(ms, "9"), [])
+  assert.deepEqual(pickModel(ms, "yapi2/claude-sonnet-5-5"), [ms[1]])
+  assert.deepEqual(pickModel(ms, "claude-sonnet-5-5"), [ms[0], ms[1]], "same id on two providers is ambiguous")
+  assert.deepEqual(pickModel(ms, "V4 PRO"), [ms[2]])
+  assert.deepEqual(pickModel(ms, "gpt"), [])
+  assert.deepEqual(modelLines(ms, "yapi2/claude-sonnet-5-5"), [
+    "1. yapi/claude-sonnet-5-5",
+    "2. yapi2/claude-sonnet-5-5 ← 当前",
+    "3. deepseek/deepseek-v4-pro（不看图）",
+  ])
+  assert.deepEqual(chunkLines(["aaa", "bbb", "ccc"], 7), ["aaa\nbbb", "ccc"])
+  assert.deepEqual(chunkLines(["a"]), ["a"])
 })
 
 test("eventKey", () => {

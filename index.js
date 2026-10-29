@@ -2,8 +2,11 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
-import { BUSY, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopSend } from "./codex.js"
+import { fileURLToPath, pathToFileURL } from "node:url"
+import {
+  BUSY, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
+  desktopSend,
+} from "./codex.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set(["session.execution.succeeded", "session.execution.failed", "permission.asked", "form.created"])
@@ -32,6 +35,10 @@ const HELP = [
   "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
   "新对话 内容 → 在选中的文件夹里开新对话（标着 Codex 的文件夹开 Codex 对话）",
   "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
+  "发图片/文件 → 先存着，下一条文字（或「3 内容」）带上它们一起发；不用说明就回「发」或「3 图」（10 分钟内有效）",
+  "/model → 列出模型；/model 3 或 /model 名字 → 切换对话的模型（也可以「3 /model …」）",
+  "/stop → 停止正在运行的回复；/compact → 压缩上下文",
+  "其他 /命令 → OpenCode 自己的命令（比如 /review）",
   "Codex 对话标着「Codex ·」，用法相同",
 ].join("\n")
 const IMG = /\.(png|jpe?g|gif|webp)$/i
@@ -39,6 +46,10 @@ const MAX_IMAGES = 4
 const IMAGE_MAX_BYTES = 10 * 1024 * 1024
 const TOO_BIG = "太大（超过 10 MB）"
 const CDN = "https://novac2c.cdn.weixin.qq.com/c2c"
+const INBOUND_MAX_BYTES = 20 * 1024 * 1024
+// Images and files from WeChat wait this long for the text they belong to.
+export const PAIR_MS = 10 * 60_000
+const SEND_WORD = /^(图|发|send)$/i
 
 export const short = (s, n = 80) => {
   const t = String(s ?? "").replace(/\s+/g, " ").trim()
@@ -63,7 +74,8 @@ export function sessionIDOf(event) {
 // Text of the newest assistant message that has any; `msgs` is newest first. Stops at the run's user prompt.
 export function replyText(msgs, stopAtUser = true) {
   for (const m of msgs ?? []) {
-    if (stopAtUser && m.type === "user") break
+    // A compaction (「/compact」) ends the run too, so its push doesn't repeat the reply before it.
+    if (stopAtUser && (m.type === "user" || m.type === "compaction")) break
     if (m.type !== "assistant") continue
     const t = (m.content ?? [])
       .filter((c) => c.type === "text")
@@ -132,6 +144,7 @@ const KEYWORDS = [
   ["help", /^(帮助|\/?help|\?|？)$/i],
   ["dirs", /^(目录|文件夹|\/?dirs?)$/i],
 ]
+const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img"])
 const keyword = (w) => KEYWORDS.find(([, re]) => re.test(w) || re.test(w.replace(/[。.！!？?~～…]+$/, "")))?.[0]
 
 export function parseCommand(text) {
@@ -152,6 +165,14 @@ export function parseCommand(text) {
   m = t.match(/^(?:图|\/img)[\s:：]+(.+)$/i)
   const img = m?.[1].trim().replace(/^[`"'“「]+|[`"'”」]+$/g, "")
   if (img && IMG.test(img)) return { type: "image", path: img }
+  // "/model 3", "5 /stop". The plugin's own slash commands are matched above; a malformed one shows help rather
+  // than reaching the AI. "/usr/bin 是什么" has no space after the name and stays a normal message.
+  m = t.match(/^(?:(\d{1,4})[\s:：,，]+)?\/([a-z][\w:.-]*)(?:\s+([\s\S]*))?$/i)
+  if (m) {
+    const own = m[2].toLowerCase()
+    if (OWN_SLASH.has(own)) return { type: own === "cd" ? "dirs" : "help" }
+    return { type: "slash", ...(m[1] && { n: Number(m[1]) }), name: m[2], args: m[3]?.trim() ?? "" }
+  }
   m = t.match(/^(\d{1,4})$/)
   if (m) return { type: "show", n: Number(m[1]) }
   m = t.match(/^(\d{1,4})[\s:：,，]+([\s\S]+)$/)
@@ -181,9 +202,11 @@ export function formAnswer(form, text) {
   }
 }
 
+const fromOwner = (msg, ownerID) => !!ownerID && msg?.message_type === 1 && msg.from_user_id === ownerID && !msg.group_id
+
 // Text of an inbound iLink message from the owner, or null for anything else (other senders, bot echoes, media).
 export function inboundText(msg, ownerID) {
-  if (!ownerID || msg?.message_type !== 1 || msg.from_user_id !== ownerID || msg.group_id) return null
+  if (!fromOwner(msg, ownerID)) return null
   const t = (msg.item_list ?? [])
     .map((i) => (i.type === 1 ? i.text_item?.text : i.type === 3 ? i.voice_item?.text : ""))
     .filter(Boolean)
@@ -191,6 +214,125 @@ export function inboundText(msg, ownerID) {
     .trim()
   return t || null
 }
+
+// Image (item type 2) and file (type 4) items of an owner's message: CDN media, AES key, name and declared size.
+export function inboundMedia(msg, ownerID) {
+  if (!fromOwner(msg, ownerID)) return []
+  return (msg.item_list ?? []).flatMap((i) => {
+    const kind = i.type === 2 ? "image" : i.type === 4 ? "file" : null
+    const it = kind === "image" ? i.image_item : i.file_item
+    if (!kind) return []
+    const key = it?.media?.aes_key ?? it?.media?.aeskey ?? it?.aes_key ?? it?.aeskey
+    return [{ kind, media: it?.media, key, name: String(it?.file_name ?? "").trim(), size: Number(kind === "image" ? it?.mid_size : it?.len) || 0 }]
+  })
+}
+
+// AES-128 key of inbound media: 32 hex chars, base64 of the 16 raw bytes, or base64 of the 32 hex chars (what we send).
+export function aesKeyOf(value) {
+  const t = String(value ?? "").trim()
+  const hex = /^[0-9a-f]{32}$/i
+  if (hex.test(t)) return Buffer.from(t, "hex")
+  const raw = Buffer.from(t, "base64")
+  if (raw.length === 16) return raw
+  const s = raw.toString("utf8").trim()
+  if (hex.test(s)) return Buffer.from(s, "hex")
+  throw new Error("不认识的密钥格式")
+}
+
+// File extension from the first bytes, or null.
+export function extOf(buf) {
+  const s = (a, b) => buf.toString("latin1", a, b)
+  if (buf[0] === 0x89 && s(1, 4) === "PNG") return "png"
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg"
+  if (s(0, 4) === "GIF8") return "gif"
+  if (s(0, 4) === "RIFF" && s(8, 12) === "WEBP") return "webp"
+  if (s(4, 8) === "ftyp" && /^(heic|heix|mif1)$/.test(s(8, 12))) return "heic"
+  if (s(0, 2) === "BM") return "bmp"
+  if (s(0, 4) === "%PDF") return "pdf"
+  if (s(0, 4) === "PK\x03\x04") return "zip"
+  return null
+}
+const IMAGE_EXTS = new Set(["png", "jpg", "gif", "webp"])
+
+const cdnURL = (media) => {
+  try {
+    const u = new URL(media?.full_url?.trim() ?? "")
+    if (u.protocol === "https:" && u.hostname === new URL(CDN).hostname) return u.href
+  } catch {}
+  const param = media?.encrypt_query_param?.trim()
+  if (!param) throw new Error("没有下载参数")
+  return `${CDN}/download?encrypted_query_param=${encodeURIComponent(param)}`
+}
+
+// Downloads and decrypts one inbound media item (CDN GET, AES-128-ECB). Throws over INBOUND_MAX_BYTES.
+export async function downloadMedia(media, key) {
+  const aes = aesKeyOf(key)
+  const res = await fetch(cdnURL(media), { signal: AbortSignal.timeout(60_000) })
+  if (res.status !== 200) throw new Error(`cdn download http=${res.status} ${short(res.headers.get("x-error-message") ?? "", 120)}`)
+  const chunks = []
+  let n = 0
+  for await (const c of res.body) {
+    if ((n += c.length) > INBOUND_MAX_BYTES + 16) throw new Error("超过 20 MB")
+    chunks.push(c)
+  }
+  const d = crypto.createDecipheriv("aes-128-ecb", aes, null)
+  return Buffer.concat([d.update(Buffer.concat(chunks)), d.final()])
+}
+
+const day = (t = new Date()) => `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`
+
+// Saves an inbound item under DIR/inbound-images/<date>/; images that aren't png/jpg/gif/webp count as files.
+async function saveMedia(d) {
+  if (d.size > INBOUND_MAX_BYTES) throw new Error("超过 20 MB")
+  if (!d.media || !d.key) throw new Error("没有下载信息")
+  const buf = await downloadMedia(d.media, d.key)
+  const ext = extOf(buf)
+  const kind = d.kind === "image" && IMAGE_EXTS.has(ext) ? "image" : "file"
+  const id = `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`
+  // Files keep their name (the agent sees it); "a/../b" or reserved characters can't escape the folder.
+  const name = kind === "file" && d.name ? `${id}-${d.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, "_")}` : `${id}.${ext ?? "bin"}`
+  const dir = path.join(DIR, "inbound-images", day())
+  await fs.promises.mkdir(dir, { recursive: true })
+  const file = path.join(dir, name)
+  await fs.promises.writeFile(file, buf)
+  return { kind, path: file }
+}
+
+// Buffered media that is still waiting for its text.
+export const liveMedia = (items, now = Date.now()) => (items ?? []).filter((i) => now - i.at < PAIR_MS)
+
+// Prompt text and image paths for a message with buffered media. 「发」/「图」 alone sends them with a default text;
+// files other than images go in as their saved paths.
+export function withMedia(text, items) {
+  const images = items.filter((i) => i.kind === "image").map((i) => i.path)
+  const files = items.filter((i) => i.kind !== "image").map((i) => i.path)
+  let t = items.length && SEND_WORD.test(text.trim()) ? (images.length ? "请看图片" : "请看文件") : text
+  if (files.length) t += `\n\n微信发来的文件已保存在：\n${files.join("\n")}`
+  return { text: t, images }
+}
+
+// Reply to an image or file without text. `target` is like "[3]"; `failed` counts items that couldn't be downloaded.
+export function mediaAck(items, target, failed = 0) {
+  const imgs = items.filter((i) => i.kind === "image").length
+  const files = items.length - imgs
+  const what = !files ? `图片（共 ${imgs} 张）` : !imgs ? `文件（共 ${files} 个）` : `图片和文件（共 ${imgs} 张图片、${files} 个文件）`
+  const bad = failed ? `有 ${failed} 个没收到（下载失败）` : ""
+  if (!items.length) return bad
+  const to = target ? `会一起发给 ${target}` : "用「编号 文字」指定发给哪个对话"
+  return `${bad ? bad + "；" : ""}收到${what}，接着发文字说明，${to}（不用说明就回「发」）`
+}
+
+// Models as { id, providerID?, label, name, image, isDefault }. By list number, exact id / label, or name fragment;
+// returns every match so the caller can ask again when there are several.
+export function pickModel(models, arg) {
+  const a = String(arg ?? "").trim().toLowerCase()
+  if (/^\d+$/.test(a)) return models[Number(a) - 1] ? [models[Number(a) - 1]] : []
+  const exact = models.filter((m) => m.label.toLowerCase() === a || m.id.toLowerCase() === a)
+  return exact.length ? exact : models.filter((m) => `${m.label} ${m.name ?? ""}`.toLowerCase().includes(a))
+}
+
+export const modelLines = (models, current) =>
+  models.map((m, i) => `${i + 1}. ${m.label}${m.label === current ? " ← 当前" : ""}${m.image ? "" : "（不看图）"}`)
 
 // Every plugin instance (one per location) receives every event; they share the event id.
 export const eventKey = (event) =>
@@ -319,6 +461,13 @@ async function imageProblem(file) {
 export async function sendImage(file) {
   const problem = await imageProblem(file)
   if (problem) throw new Error(`${path.basename(file)} ${problem}`)
+  const { item, steps } = await uploadImage(file)
+  steps.push(`sendmessage ${await sendItems([item])}`)
+  return steps.join(", ")
+}
+
+// Upload only: the image item sendmessage would carry, and the step statuses.
+export async function uploadImage(file) {
   const { to } = recipient()
   const buf = await fs.promises.readFile(file)
   const key = crypto.randomBytes(16)
@@ -350,8 +499,7 @@ export async function sendImage(file) {
     throw new Error(`cdn upload failed: http=${res.status} ${short(res.headers.get("x-error-message") ?? "", 120)}`)
   steps.push(`cdn http=${res.status}`)
   const media = { encrypt_query_param: param, aes_key: Buffer.from(key.toString("hex")).toString("base64"), encrypt_type: 1 }
-  steps.push(`sendmessage ${await sendItems([{ type: 2, image_item: { media, mid_size: data.length } }])}`)
-  return steps.join(", ")
+  return { item: { type: 2, image_item: { media, mid_size: data.length } }, steps }
 }
 
 // Absolute path for a path or file:/// URL as written; null for other URLs, or a relative path without a base.
@@ -402,7 +550,12 @@ async function oc(pathname, body) {
 
 const sid = (id) => encodeURIComponent(id)
 // Inbound commands go through the HTTP API, not a plugin ctx: ctx.permission.* only sees its own location's sessions.
-const prompt = (sessionID, text) => oc(`/api/session/${sid(sessionID)}/prompt`, { text })
+// Images go as file:// URIs; the server reads them and stores them inline with their mime type.
+const prompt = (sessionID, text, images = []) =>
+  oc(`/api/session/${sid(sessionID)}/prompt`, {
+    text,
+    ...(images.length && { files: images.map((p) => ({ uri: pathToFileURL(p).href, name: path.basename(p) })) }),
+  })
 const lastReply = async (sessionID, stopAtUser = true) =>
   replyText((await oc(`/api/session/${sid(sessionID)}/message?limit=30&order=desc`)).data, stopAtUser)
 
@@ -477,18 +630,21 @@ async function newSession(text) {
   if (dir.startsWith(CODEX)) {
     if (!text) return "Codex 新对话要带内容：「新对话 内容」"
     const cwd = dirPath(dir)
-    const id = await bridge().create(cwd, text)
+    const m = takeMedia(text)
+    const id = await bridge().create(cwd, m.text, { images: m.images })
     const n = numOf(CODEX + id)
     update((s) => (s.last = s.target = CODEX + id))
-    return `已在 Codex · ${base(cwd)} 新建 [${n}]，已发出（在后台运行，桌面端重新打开这个对话能看到）`
+    return `已在 Codex · ${base(cwd)} 新建 [${n}]，已发出${m.note}（在后台运行，桌面端重新打开这个对话能看到）`
   }
   // Reuse the folder's latest model: the server default may not be usable (it failed once with gpt-5.5).
   const model = toArr(await oc(sessionsURL(1, dir)).catch(() => []))[0]?.model
   const session = (await oc("/api/session", { location: { directory: dir }, ...(model && { model }) })).data
   const n = numOf(session.id)
   update((s) => (s.last = s.target = session.id))
-  if (text) await prompt(session.id, text)
-  return `已在 ${base(dir)} 新建 [${n}]${text ? "，已发出" : "，接着直接发内容就行"}`
+  // Without text the media stays buffered for the next message, which goes to this new session.
+  const m = text ? takeMedia(text) : null
+  if (m) await prompt(session.id, m.text, m.images)
+  return `已在 ${base(dir)} 新建 [${n}]${m ? `，已发出${m.note}` : "，接着直接发内容就行"}`
 }
 
 export async function run(cmd) {
@@ -518,10 +674,11 @@ export async function run(cmd) {
   }
   if (cmd.type === "text" && !cmd.text) return HELP
   // Unnumbered text goes to the session the user last picked, not the last push: other sessions push all the time.
-  const sessionID = cmd.n == null ? (state().target ?? state().last) : sessionOf(cmd.n)
+  const sessionID = cmd.n == null ? targetID() : sessionOf(cmd.n)
   if (!sessionID) return cmd.n == null ? HELP : `没有 [${cmd.n}]，发「列表」查看`
   if (cmd.n != null && state().target !== sessionID) update((s) => (s.target = sessionID))
   const n = numOf(sessionID)
+  if (cmd.type === "slash") return sessionID.startsWith(CODEX) ? slashCodex(cmd, sessionID.slice(CODEX.length), n) : slashOC(cmd, sessionID, n)
   if (sessionID.startsWith(CODEX)) return runCodex(cmd, sessionID.slice(CODEX.length), n)
   if (cmd.type === "show") {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
@@ -549,8 +706,109 @@ export async function run(cmd) {
     return `已回答 [${n}]`
   }
   if (decision) return `[${n}] 没有待批准的请求`
-  await prompt(sessionID, t)
-  return `已发给 [${n}]${forms.length ? "（它在等一个表单，请在桌面端回答）" : ""}`
+  if (noMedia(t)) return noMedia(t)
+  const { text, images, note } = takeMedia(t)
+  await prompt(sessionID, text, images)
+  return `已发给 [${n}]${note}${forms.length ? "（它在等一个表单，请在桌面端回答）" : ""}`
+}
+
+const targetID = () => state().target ?? state().last
+
+// Buffered WeChat media for the prompt being sent now; the buffer is emptied. Media past PAIR_MS is dropped.
+// ponytail: emptied before the prompt is sent, so a failed prompt loses the images; resend them if that bites.
+function takeMedia(text) {
+  const items = liveMedia(g.media)
+  g.media = []
+  const r = withMedia(text, items)
+  const imgs = r.images.length
+  const files = items.length - imgs
+  const note = items.length ? `（带了${[imgs && `${imgs} 张图片`, files && `${files} 个文件`].filter(Boolean).join("、")}）` : ""
+  return { ...r, note }
+}
+
+// Splits list lines into messages under the WeChat push size.
+export function chunkLines(lines, max = MAX_CHARS - 100) {
+  const out = [""]
+  for (const l of lines) {
+    if (out.at(-1) && out.at(-1).length + l.length + 1 > max) out.push("")
+    out[out.length - 1] += (out.at(-1) ? "\n" : "") + l
+  }
+  return out.filter(Boolean)
+}
+
+// Model list, or a switch to models[pick]. `current` is the label of the model in use.
+function modelReply(n, models, current, arg, apply, note) {
+  if (!models.length) return `[${n}] 没有可用的模型`
+  const footer = "回复「/model 编号」或「/model 名字」切换"
+  if (!arg) return chunkLines([`[${n}] 可用模型（共 ${models.length} 个）：`, ...modelLines(models, current), footer])
+  const found = pickModel(models, arg)
+  if (!found.length) return `[${n}] 没找到模型「${arg}」，发「/model」查看`
+  if (found.length > 1) {
+    const lines = modelLines(models, current).filter((_, i) => found.includes(models[i]))
+    return chunkLines([`[${n}] 有 ${found.length} 个匹配「${arg}」，回「/model 编号」选一个：`, ...lines.slice(0, 30)])
+  }
+  return apply(found[0]).then(() => `已把 [${n}] 切到 ${found[0].label}${note ?? ""}`)
+}
+
+async function slashOC(cmd, sessionID, n) {
+  const name = cmd.name.toLowerCase()
+  const session = (await oc(`/api/session/${sid(sessionID)}`)).data
+  const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
+  if (name === "model") {
+    const models = toArr(await oc(`/api/model?${loc}`))
+      .filter((m) => m.enabled && m.status !== "deprecated")
+      .map((m) => ({ id: m.id, providerID: m.providerID, label: `${m.providerID}/${m.id}`, name: m.name, image: m.capabilities?.input?.includes("image") }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+    const cur = session?.model && `${session.model.providerID}/${session.model.id}`
+    return modelReply(n, models, cur, cmd.args, (m) => oc(`/api/session/${sid(sessionID)}/model`, { model: { id: m.id, providerID: m.providerID } }), "（这个对话之后都用它，桌面端也是）")
+  }
+  if (name === "stop") {
+    const r = await oc(`/api/session/${sid(sessionID)}/interrupt`, {})
+    return r?.interrupted ? `已停止 [${n}]` : `[${n}] 没有在运行`
+  }
+  if (name === "compact") {
+    await oc(`/api/session/${sid(sessionID)}/compact`, {})
+    return `[${n}] 开始压缩上下文`
+  }
+  const cmds = toArr(await oc(`/api/command?${loc}`)).map((c) => c.name)
+  const known = cmds.find((c) => c.toLowerCase() === name)
+  if (!known) return `不认识的命令 /${cmd.name}，发「帮助」查看${cmds.length ? `\nOpenCode 命令：${cmds.map((c) => "/" + c).join(" ")}` : ""}`
+  const { text, images, note } = takeMedia(cmd.args)
+  await oc(`/api/session/${sid(sessionID)}/command`, {
+    name: known,
+    text,
+    ...(images.length && { files: images.map((p) => ({ uri: pathToFileURL(p).href, name: path.basename(p) })) }),
+  })
+  return `已在 [${n}] 运行 /${known}${note}`
+}
+
+async function slashCodex(cmd, threadId, n) {
+  const name = cmd.name.toLowerCase()
+  if (name === "model") {
+    const models = (await bridge().models())
+      .filter((m) => !m.hidden)
+      .map((m) => ({ id: m.model, label: m.model, name: m.displayName, image: m.inputModalities?.includes("image") ?? true }))
+    const cur = state().codexModels?.[threadId] ?? (await codexThread(threadId))?.model
+    return modelReply(n, models, cur, cmd.args, async (m) => update((s) => ((s.codexModels ??= {})[threadId] = m.id)),
+      "（从微信发出的每一轮都带上它，下一轮生效；Codex 会把它记成这个对话之后的模型）")
+  }
+  if (name === "stop") {
+    if (await bridge().interrupt(threadId)) return `已停止 [${n}]`
+    const r = await desktopInterrupt(threadId).catch((e) => (warn("codex desktop stop:", e), null))
+    if (r) return `已停止 [${n}]（电脑上的 Codex 窗口）`
+    return r === "" ? `[${n}] 没有在运行` : `[${n}] 没有在运行（在终端里跑的只能在电脑上停）`
+  }
+  if (name === "compact") {
+    if (await desktopCompact(threadId).catch((e) => (warn("codex desktop compact:", e), false))) return `[${n}] 开始压缩上下文（电脑上的 Codex 窗口）`
+    try {
+      await bridge().compact(threadId)
+    } catch (e) {
+      if (e.message === BUSY) return `[${n}] ${BUSY}`
+      throw e
+    }
+    return `[${n}] 开始压缩上下文，完成后推送`
+  }
+  return `不认识的命令 /${cmd.name}，发「帮助」查看（Codex 对话支持 /model /stop /compact）`
 }
 
 // Codex approval records written by codex-hook.js, oldest first; records past PENDING_TTL are deleted.
@@ -611,16 +869,22 @@ async function runCodex(cmd, threadId, n) {
   const answered = bridge().reply(threadId, t)
   if (answered === "answered") return `已回答 [${n}]`
   if (answered === "mismatch") return `[${n}] 有几个问题就回几行答案，按顺序`
+  if (noMedia(t)) return noMedia(t)
+  const { text, images, note } = takeMedia(t)
+  const opts = { images, model: state().codexModels?.[threadId] }
   try {
-    if (!bridge().running(threadId) && (await desktopSend(threadId, t).catch((e) => (warn("codex desktop send:", e), false))))
-      return `已发给 [${n}]（电脑上的 Codex 窗口里能看到）`
-    await bridge().send(threadId, t)
+    if (!bridge().running(threadId) && (await desktopSend(threadId, text, undefined, opts).catch((e) => (warn("codex desktop send:", e), false))))
+      return `已发给 [${n}]${note}（电脑上的 Codex 窗口里能看到）`
+    await bridge().send(threadId, text, opts)
   } catch (e) {
     if (e.message === BUSY) return `[${n}] ${BUSY}`
     throw e
   }
-  return `已发给 [${n}]（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
+  return `已发给 [${n}]${note}（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
 }
+
+// 「发」 / 「3 图」 with nothing buffered: say so instead of sending the word to the AI.
+const noMedia = (t) => (SEND_WORD.test(t.trim()) && !liveMedia(g.media).length ? "没有待发的图片或文件（10 分钟内发来的才算）" : null)
 
 // Pushes for turns the bridge runs, same text as the Codex hooks and the OpenCode pushes.
 export function codexPushText(head, n, kind, text) {
@@ -666,10 +930,27 @@ export async function replyImages(reply, dir) {
   return { files, big }
 }
 
-async function inbound(msg, floor) {
+// Downloads a message's images and files into the buffer; returns the ack text.
+async function bufferMedia(items) {
+  let failed = 0
+  for (const d of items) {
+    try {
+      g.media = [...liveMedia(g.media), { ...(await saveMedia(d)), at: Date.now() }]
+    } catch (e) {
+      failed++
+      warn("inbound media:", e)
+    }
+  }
+  const id = targetID()
+  return mediaAck(liveMedia(g.media), id && `[${numOf(id)}]`, failed)
+}
+
+// Handles one polled message. `out` sends each reply (exported with it so a check can run without WeChat).
+export async function inbound(msg, floor, out = send) {
   const account = readJson(path.join(DIR, "account.json"))
   const text = inboundText(msg, account?.userId)
-  if (text == null) return
+  const media = inboundMedia(msg, account?.userId)
+  if (text == null && !media.length) return
   if (msg.context_token && msg.context_token !== state().contextToken) {
     update((s) => (s.contextToken = msg.context_token))
   }
@@ -680,11 +961,13 @@ async function inbound(msg, floor) {
   if (g.handled.has(key)) return
   g.handled.add(key)
   if (g.handled.size > 200) g.handled.delete(g.handled.values().next().value)
-  const reply = await run(parseCommand(text)).catch((e) => `出错了：${short(e?.message, 150)}`)
+  // A photo and its caption arrive as separate messages: media waits in g.media for the next text.
+  const ack = media.length ? await bufferMedia(media) : ""
+  const reply = text == null ? ack : await run(parseCommand(text)).catch((e) => `出错了：${short(e?.message, 150)}`)
   // run() returns a string, or an array sent one message at a time (spaced out so WeChat doesn't throttle).
-  for (const [i, r] of [reply].flat().entries()) {
+  for (const [i, r] of [reply].flat().filter(Boolean).entries()) {
     if (i) await new Promise((resolve) => setTimeout(resolve, 300))
-    await send(r)
+    await out(r)
   }
 }
 

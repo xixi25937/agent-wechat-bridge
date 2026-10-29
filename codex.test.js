@@ -7,7 +7,7 @@ import path from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import {
-  approvalSummary, bridgeMarker, codexMsgs, createBridge, decisionRequest, desktopApprove, desktopOwns, desktopSend, frame,
+  approvalSummary, bridgeMarker, codexMsgs, createBridge, decisionRequest, desktopApprove, desktopCompact, desktopInterrupt, desktopOwns, desktopSend, frame,
   pendingApprovals, questionAnswers, questionText, serverResponse, startTurnParams, unframe,
 } from "./codex.js"
 
@@ -43,6 +43,11 @@ test("approval params", () => {
   assert.deepEqual(startTurnParams("t1", "hi"), {
     conversationId: "t1",
     turnStart: { request: { threadId: "t1", input: [{ type: "text", text: "hi", text_elements: [] }] }, context: {} },
+  })
+  assert.deepEqual(startTurnParams("t1", "看", { images: ["C:\\a.png"], model: "m1" }).turnStart.request, {
+    threadId: "t1",
+    input: [{ type: "text", text: "看", text_elements: [] }, { type: "localImage", path: "C:\\a.png" }],
+    model: "m1",
   })
 })
 
@@ -90,7 +95,7 @@ function fakeDesktop({ owns, requests }) {
         if (m.type !== "request") continue
         if (m.method === "initialize") reply({ resultType: "success", handledByClientId: "me", result: { clientId: "me" } })
         else if (m.method === "thread-owner-discovery") reply(owns ? { resultType: "success", handledByClientId: "owner", result: {} } : { resultType: "error", error: "no-client-found" })
-        else reply({ resultType: "success", handledByClientId: "owner", result: { ok: true } })
+        else reply({ resultType: "success", handledByClientId: "owner", result: { ok: true, ...(m.method === "thread-follower-interrupt-turn" && { interruptedTurnId: "turn-9" }) } })
       }
     })
   })
@@ -117,10 +122,20 @@ test("desktop approve and send over the pipe", { skip: process.platform !== "win
   const [st] = asks("thread-follower-start-turn")
   assert.equal(st.version, 2)
   assert.deepEqual(st.params, startTurnParams("t1", "只回复：好的"))
+  assert.equal(await desktopSend("t1", "看", d.pipe, { images: ["C:\\a.png"] }), true)
+  assert.deepEqual(asks("thread-follower-start-turn")[1].params.turnStart.request.input[1], { type: "localImage", path: "C:\\a.png" })
+  assert.equal(await desktopInterrupt("t1", d.pipe), "turn-9")
+  const [it] = asks("thread-follower-interrupt-turn")
+  assert.equal(it.version, 4)
+  assert.deepEqual(it.params, { conversationId: "t1", mode: "user-stop" })
+  assert.equal(await desktopCompact("t1", d.pipe), true)
+  assert.deepEqual(asks("thread-follower-compact-thread")[0].params, { conversationId: "t1" })
   d.close()
   const none = await fakeDesktop({ owns: false, requests })
   assert.equal(await desktopApprove("t1", true, none.pipe), null)
   assert.equal(await desktopSend("t1", "x", none.pipe), false)
+  assert.equal(await desktopInterrupt("t1", none.pipe), null)
+  assert.equal(await desktopCompact("t1", none.pipe), false)
   none.close()
   // Desktop not running at all.
   assert.equal(await desktopOwns("t1", `\\\\.\\pipe\\wx-test-missing`), false)
@@ -156,6 +171,21 @@ test("bridge: resume, held approval, question, completion, stop", async () => {
     await assert.rejects(b.send("busy", "x"), /正在电脑上打开/)
     assert.equal(b.running("busy"), false)
     assert.equal(await b.create("C:\\x", "hi"), "new-thread")
+    // Images and model go into turn/start; /stop interrupts the turn we started; /compact runs as its own turn.
+    const of = (id) => pushed.filter((p) => p[0] === id)
+    await b.send("echo", "看图", { images: ["C:\\a.png"], model: "m1" })
+    await until(() => of("echo").length)
+    assert.equal(of("echo")[0][1], "done")
+    assert.deepEqual(JSON.parse(of("echo")[0][2]), { input: [{ type: "text", text: "看图", text_elements: [] }, { type: "localImage", path: "C:\\a.png" }], model: "m1" })
+    assert.deepEqual((await b.models()).map((m) => m.model), ["m1"])
+    assert.equal(await b.interrupt("slow"), false)
+    await b.send("slow", "数到 300")
+    assert.equal(await b.interrupt("slow"), true)
+    await until(() => !b.running("slow"))
+    assert.deepEqual(of("slow"), [], "an interrupted turn pushes nothing")
+    await b.compact("t1")
+    await until(() => of("t1").length === 4)
+    assert.deepEqual(of("t1")[3], ["t1", "info", "上下文已压缩"])
   } finally {
     b.stop()
   }
