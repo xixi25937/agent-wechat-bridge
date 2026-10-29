@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { getEventListeners } from "node:events"
 import { test } from "node:test"
-import { clip, eventKey, format, formAnswer, historyLines, imagePaths, inboundText, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
+import { clip, codexPushText, dirLabel, eventKey, format, formAnswer, historyLines, imagePaths, inboundText, mergeLines, parseCommand, pickDir, replyText, sessionIDOf, shouldSend, sleep } from "./index.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
 const ok = { type: "session.execution.succeeded", data: { sessionID: "s1" } }
@@ -144,11 +144,33 @@ test("historyLines", () => {
 })
 
 test("pickDir", () => {
-  const dirs = ["C:\\a\\11", "C:\\a\\马原", "C:\\a\\PPT模板"]
+  const dirs = ["C:\\a\\11", "C:\\a\\马原", "C:\\a\\PPT模板", "codex:C:\\b\\11", "codex:C:\\b\\proj"]
   assert.equal(pickDir(dirs, "2"), "C:\\a\\马原")
   assert.equal(pickDir(dirs, "9"), undefined)
   assert.equal(pickDir(dirs, "ppt"), "C:\\a\\PPT模板")
   assert.equal(pickDir(dirs, "马原"), "C:\\a\\马原")
+  assert.equal(pickDir(dirs, "4"), "codex:C:\\b\\11")
+  assert.equal(pickDir(dirs, "Codex · 11"), "codex:C:\\b\\11")
+  assert.equal(pickDir(dirs, "codex 11"), "codex:C:\\b\\11")
+  assert.equal(pickDir(dirs, "proj"), "codex:C:\\b\\proj")
+  assert.equal(pickDir(dirs, "codex 马原"), undefined)
+  assert.equal(dirLabel("codex:C:\\b\\proj"), "Codex · proj")
+  assert.equal(dirLabel("C:\\a\\马原"), "马原")
+})
+
+test("codexPushText", () => {
+  const h = "[4] Codex · proj / 修登录"
+  assert.equal(codexPushText(h, 4, "done", "好的"), `${h}\n好的`)
+  assert.equal(codexPushText(h, 4, "done", ""), `${h}\n完成（没有文字回复）`)
+  assert.equal(codexPushText(h, 4, "failed", "rate\nlimited"), `${h}\n出错：rate limited`)
+  assert.match(codexPushText(h, 4, "approval", "git push"), /^\[4\] Codex · proj \/ 修登录\n等你批准：git push\n回复「4 y」批准，「4 n」拒绝/)
+  assert.equal(codexPushText(h, 4, "question", "有问题问你：x"), `${h}\n有问题问你：x`)
+})
+
+test("mergeLines", () => {
+  const rows = [{ updated: 1, line: "a" }, { updated: 3, line: "c" }, { line: "z" }, { updated: 2, line: "b" }]
+  assert.deepEqual(mergeLines(rows), ["c", "b", "a", "z"])
+  assert.deepEqual(mergeLines(rows, 2), ["c", "b"])
 })
 
 test("formAnswer", () => {

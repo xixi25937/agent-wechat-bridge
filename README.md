@@ -7,9 +7,10 @@
 | OpenCode 桌面端 | ✓ | ✓ | ✓ |
 | OpenCode 终端（`opencode`、`opencode run`，默认模式） | ✓ | ✓ | ✓ |
 | OpenCode 终端 `--standalone` | ✓ | 未验证 | 未验证 |
-| Codex 桌面端、Codex CLI（hooks） | ✓ | ✓ | 下一步 |
+| Codex 桌面端 | ✓ | ✓（电脑和微信都能批） | ✓ |
+| Codex 终端（`codex`） | ✓ | ✓（微信只等 60 秒，见下） | ✓（终端没在跑这个对话时） |
 
-OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚本（`codex-hook.js`），两边共用编号和微信登录。
+OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚本（`codex-hook.js`）加插件里的 Codex 模块（`codex.js`），两边共用编号和微信登录。**微信里的所有命令（包括 Codex 的）都由 OpenCode 后台服务执行，OpenCode 桌面端或后台服务要开着。**
 
 ## 前提
 
@@ -51,10 +52,27 @@ Codex 桌面端和 `codex` CLI 都读 `~/.codex/hooks.json`。在里面加两个
 
 新加或改过的 hook 要先信任才会运行，没信任的 hook 会被跳过：在终端运行 `codex`，输入 `/hooks`，把这两个 hook 设为信任。信任记在 `~/.codex/config.toml` 的 `[hooks.state]` 里，桌面端也认（两边读同一份配置）。改了 `command` 或 `timeout` 要重新信任。
 
+`timeout: 600` 可以保留：现在批准 hook 在桌面端立刻返回，在终端最多等 `CODEX_WECHAT_APPROVAL_TIMEOUT` 秒。改小 timeout 要重新信任，没必要。
+
 - **回复完成**（`Stop`）：推送 `[编号] Codex · 目录 / 标题` 和最终回复，回复里提到的图片也发（规则同下面「图片」）。子代理不推。标题读 `~/.codex/state_5.sqlite`。推送在后台进程里发，不拖慢 Codex。
-- **请求批准**（`PermissionRequest`，shell 提权、改文件、MCP 工具）：推送要做的操作和「N y / N n」提示，然后等你回复，等的时候 Codex 停在这一步。`N y` 批准一次，`N n` 拒绝。9 分钟没回复就推「超时，回电脑上处理」，Codex 弹出平常的批准框。等待时长用环境变量 `CODEX_WECHAT_APPROVAL_TIMEOUT`（秒，最多 590）改。
-- 微信回复由 OpenCode 后台服务收（见「注意」），它把答案写到 `~/.cli-bridge/codex-pending/`，hook 读到后告诉 Codex。OpenCode 没在运行时照常推送，但会注明微信回复收不到，Codex 直接弹批准框。
+- **请求批准**（`PermissionRequest`，shell 提权、改文件）：推送要做的操作和「N y / N n」提示。之后分三种情况：
+  - **桌面端**（对话在 Codex 桌面窗口里打开着）：hook 立刻返回，桌面端照常弹批准框。你在电脑上点或者在微信回 `N y` / `N n` 都行，先到的算数。微信的回答通过桌面端的本地管道 `\\.\pipe\codex-ipc` 交给窗口，等于替你点了那个按钮。电脑上已经处理过了再回 `N y`，会收到「已经在电脑上处理了」。
+  - **终端**（`codex` TUI、`codex exec`）：终端没有能从外面回答批准框的通道，所以 hook 还是先等微信：默认 60 秒（环境变量 `CODEX_WECHAT_APPROVAL_TIMEOUT`，秒，最多 590），等的时候终端停在这一步、不弹框；60 秒没回复就不做决定，终端弹出平常的批准框，之后微信回 `N y` 会收到「已经在电脑上处理了」。
+  - **从微信发起的对话**（见下面「从微信控制 Codex」）：由插件自己的 app-server 运行，批准请求由插件推送，只能在微信里批准（电脑上没有窗口在显示它）。
+- hook 判断用哪种方式：插件正在跑这个对话 → 微信；否则问桌面端是否打开着它 → 桌面端；都不是 → 终端。
+- 微信回复由 OpenCode 后台服务收（见「注意」）。OpenCode 没在运行时照常推送，但会注明微信回复收不到，Codex 直接弹批准框。
 - hook 出任何错都直接退出、不做决定，Codex 照常运行。回复推送的结果和错误每次一行，追加在 `~/.cli-bridge/codex-hook.log`；批准 hook 的错误交给 Codex（显示为 hook 失败）。
+
+### 从微信控制 Codex
+
+和 OpenCode 一样的命令，对标着 `Codex ·` 的编号都能用：
+
+- `N 内容`：继续这个 Codex 对话。对话在桌面窗口里打开着时，消息发到桌面窗口（窗口里能看到，回复照常由 Stop hook 推送）。没打开时，插件在后台用桌面端自带的 `codex.exe app-server` 运行这一轮，回复、批准请求、提问和出错都由插件推送；桌面端之后重新打开这个对话能看到这一轮。对话正在终端里运行时回「该对话正在电脑上打开，请稍后或在电脑上操作」。
+- `N`、`N 历史 k`：最后一条回复、最近 k 条消息（通过 app-server 读，不会改动对话）。
+- `列表`：OpenCode 和 Codex 对话按最近更新混排，Codex 的标 `Codex ·`。
+- `目录`：先列 OpenCode 的文件夹，再列 Codex 用过的文件夹（标 `Codex ·`）。`目录 Codex · 名字` 或 `目录 codex 名字` 只在 Codex 文件夹里找。选中 Codex 文件夹后 `新对话 内容` 开 Codex 新对话（必须带内容），模型等设置用 `~/.codex/config.toml` 的默认值。
+- 后台运行的对话提问时（`request_user_input`），推送问题；回 `N 答案`，多个问题每行一个、按顺序。桌面窗口里的提问只在窗口里回答。
+- 插件的 app-server 按需启动（第一次大约 5 到 10 秒），空闲 10 分钟、插件热重载或 OpenCode 退出时关掉，不留进程。它和桌面端用同一个 `~/.codex`（同样的登录、配置、对话记录）。
 
 ## 推送
 
@@ -83,7 +101,7 @@ Codex 桌面端和 `codex` CLI 都读 `~/.codex/hooks.json`。在里面加两个
 | `图 路径` / `/img 路径` | 把电脑上的图片发到微信。相对路径按「目录」选中的文件夹算；必须以图片扩展名结尾，所以「图片怎么发」照常发给对话 |
 | `帮助` | 显示用法 |
 
-Codex 对话目前只支持 `N y` / `N n`。对 Codex 编号发 `N 内容`、`N`、`N 历史` 会回「Codex 对话暂不支持这个操作」，`列表` 只列 OpenCode 对话。
+Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「从微信控制 Codex」。
 
 ## 图片
 
@@ -96,18 +114,25 @@ Codex 对话目前只支持 `N y` / `N n`。对 Codex 编号发 `N 内容`、`N`
 - **安全**：只处理机器人登录账号本人（`account.json` 里的 `userId`）发来的消息，其他人发的一律忽略。但能用这个微信号、或能拿到 `~/.cli-bridge` 里凭据的人，就能让 OpenCode 执行命令、批准权限。保管好手机和这些文件。
 - 不要同时运行 cli-chat-bridge 的 `wechat-opencode` 守护进程。两边会抢同一个机器人的消息。
 - 微信的 context_token 大约 24 小时后过期。很久没给机器人发消息时推送会失败（日志里出现 `ret=-2`）。随便给机器人发一条消息就会刷新。
-- 只有桌面端后台服务接收微信消息，其他 `opencode serve` 进程只推送。想让别的进程收消息，可以设置 `WECHAT_NOTIFY_POLL=1`，但同一时间只能有一个进程在收。
+- 只有桌面端后台服务接收微信消息（Codex 的命令也由它执行），其他 `opencode serve` 进程只推送。想让别的进程收消息，可以设置 `WECHAT_NOTIFY_POLL=1`，但同一时间只能有一个进程在收。
 - 插件自己的状态（编号、收消息游标、最新的 context_token）存在 `~/.cli-bridge/opencode-wechat-notify.json`，OpenCode 和 Codex 共用（Codex 对话的键是 `codex:<线程 id>`）。可以用环境变量 `WECHAT_NOTIFY_DIR` 换目录。
 - `opencode --standalone` 的对话会推送，但微信里的 `N 内容`、`N y` 等命令由后台服务执行。后台服务能读到这个对话（数据库共用），可私有服务里等待中的批准请求它大概率管不到。要在微信里操作就别加 `--standalone`。
-- Codex 只有 hook，从微信给 Codex 发消息、看 Codex 历史要接 Codex app-server，下一步做。
+- 桌面端的 `\\.\pipe\codex-ipc` 是 Codex 桌面端内部用的接口，没有公开文档，参数是从桌面端 26.1023 版本里读出来的。桌面端升级后如果微信发消息或批准对桌面窗口不起作用，回复里会带出错原因，在电脑上操作即可（终端和后台运行的对话不受影响）。
 - 凭据缺失、发送失败或 OpenCode 接口出错时，只在服务日志（`~/.local/share/opencode/log/opencode.log`）里打一行 `[wechat-notify]` 警告，不影响 OpenCode。
 
 ## 测试
 
 ```sh
-npm test            # 命令解析、格式化、截断、去重、Codex 批准握手等自检，不联网
+npm test            # 命令解析、格式化、截断、去重、Codex 批准握手、桌面管道帧格式（假管道）、app-server 桥（假 app-server）等自检，不联网
 npm run send-test   # 真实发送一条测试消息到微信
 ```
+
+手动检查 Codex（每步看微信推送）：
+
+1. 桌面端发消息：在 Codex 桌面端打开一个对话（窗口里点开就行），微信发 `列表` 找到它的编号 N，发 `N 只回复：好的`。应回「已发给 [N]（电脑上的 Codex 窗口里能看到）」，窗口里出现这条消息，回复完成后收到推送。
+2. 桌面端批准：在这个对话里让 Codex 做一件需要批准的事（比如沙盒外写文件）。微信收到「等你批准…（电脑上也可以直接点）」，同时窗口弹出批准框。回 `N y`，窗口里的批准框应消失、继续执行。再来一次，这次在电脑上点，然后微信回 `N y`，应收到「已经在电脑上处理了」。
+3. 后台对话：微信发 `目录`，选一个 `Codex ·` 文件夹（`目录 编号`），发 `新对话 只回复：好的`，应收到「已在 Codex · … 新建 [M]」和回复推送；再发 `M 历史 2`。
+4. 终端批准：在终端运行 `codex`，让它做一件需要批准的事。微信收到「…（60 秒内没回复就在电脑上处理）」，60 秒内回 `N y` 终端继续执行；不回则 60 秒后终端弹出批准框。
 
 ## 许可证
 

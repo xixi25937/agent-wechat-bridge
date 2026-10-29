@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { BUSY, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopSend } from "./codex.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set(["session.execution.succeeded", "session.execution.failed", "permission.asked", "form.created"])
@@ -13,7 +14,9 @@ export const DIR = process.env.WECHAT_NOTIFY_DIR || path.join(os.homedir(), ".cl
 const STATE_FILE = path.join(DIR, "opencode-wechat-notify.json")
 // Codex approval handshake with codex-hook.js: <id>.json is the request, <id>.answer is "allow" or "deny".
 export const PENDING_DIR = path.join(DIR, "codex-pending")
-const CODEX_TODO = "Codex 对话暂不支持这个操作（下一步会加）"
+const CODEX = "codex:"
+// A Codex approval record older than this no longer matches a 「N y」.
+const PENDING_TTL = 60 * 60_000
 const SERVICE_FILE = path.join(os.homedir(), ".local", "state", "opencode", "service.json")
 const YES = /^(y|yes|是|批准|同意)$/i
 const NO = /^(n|no|否|不|拒绝)$/i
@@ -27,9 +30,9 @@ const HELP = [
   "3 历史 10 → [3] 最近 10 条消息（默认 5，最多 20）",
   "列表 → 最近的对话和编号",
   "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
-  "新对话 内容 → 在选中的文件夹里开新对话",
+  "新对话 内容 → 在选中的文件夹里开新对话（标着 Codex 的文件夹开 Codex 对话）",
   "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
-  "Codex 对话（标着 Codex）目前只支持 3 y / 3 n",
+  "Codex 对话标着「Codex ·」，用法相同",
 ].join("\n")
 const IMG = /\.(png|jpe?g|gif|webp)$/i
 const MAX_IMAGES = 4
@@ -411,36 +414,74 @@ async function push(sessionID, text) {
 const sessionsURL = (limit, dir) =>
   `/api/session?limit=${limit}&parentID=null${dir ? `&directory=${encodeURIComponent(dir)}` : ""}`
 
+// One line per conversation, newest first: `{ updated, line }` from OpenCode and Codex merged.
+export const mergeLines = (rows, limit = 10) =>
+  [...rows].sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0)).slice(0, limit).map((r) => r.line)
+
+const codexLine = (t) => ({
+  updated: t.updated,
+  line: `${codexHead(numOf(CODEX + t.id), t.cwd, t, { base, short })} · ${bridge().running(t.id) ? "运行中" : "空闲"}`,
+})
+
+// `dir` is an OpenCode folder, or `codex:<folder>` for one listing only Codex threads.
 async function listSessions(dir) {
-  const [list, active] = await Promise.all([
+  if (dir?.startsWith(CODEX)) {
+    const lines = (await codexThreads({ cwd: dir.slice(CODEX.length) })).map((t) => codexLine(t).line)
+    return lines.length ? lines.join("\n") : "没有对话"
+  }
+  const [list, active, codex] = await Promise.all([
     oc(sessionsURL(10, dir)),
     oc("/api/session/active").catch(() => ({ data: {} })),
+    dir ? [] : codexThreads(),
   ])
-  const lines = toArr(list)
+  const rows = toArr(list)
     .filter((s) => !s.time?.archived)
-    .map((s) => `${head(numOf(s.id), s)} · ${active.data?.[s.id] ? "运行中" : (STATUS[s.outcome] ?? "空闲")}`)
+    .map((s) => ({
+      updated: s.time?.updated,
+      line: `${head(numOf(s.id), s)} · ${active.data?.[s.id] ? "运行中" : (STATUS[s.outcome] ?? "空闲")}`,
+    }))
+  const lines = mergeLines([...rows, ...codex.map(codexLine)])
   return lines.length ? lines.join("\n") : "没有对话"
 }
 
+// OpenCode folders, then `codex:<folder>` for the folders of Codex threads.
 async function listDirs() {
-  const dirs = toArr(await oc("/api/project"))
-    .filter((p) => p.canonical && fs.existsSync(p.canonical))
-    .sort((a, b) => (b.time?.active ?? 0) - (a.time?.active ?? 0))
-    .map((p) => p.canonical)
+  const [projects, codex] = await Promise.all([oc("/api/project").catch((e) => (warn(e), [])), codexDirs()])
+  const dirs = [
+    ...toArr(projects)
+      .filter((p) => p.canonical && fs.existsSync(p.canonical))
+      .sort((a, b) => (b.time?.active ?? 0) - (a.time?.active ?? 0))
+      .map((p) => p.canonical),
+    ...codex.map((d) => CODEX + d.cwd),
+  ]
   update((s) => (s.dirs = dirs))
   return dirs
 }
 
+export const dirLabel = (d) => (d.startsWith(CODEX) ? `Codex · ${base(d.slice(CODEX.length))}` : base(d))
+const dirPath = (d) => (d?.startsWith(CODEX) ? d.slice(CODEX.length) : d)
+
 // Folder by number from the last 「目录」 listing, or by folder name.
 export function pickDir(dirs, arg) {
   if (/^\d+$/.test(arg)) return dirs[Number(arg) - 1]
-  const a = arg.toLowerCase()
-  return dirs.find((d) => base(d).toLowerCase() === a) ?? dirs.find((d) => base(d).toLowerCase().includes(a))
+  // 「目录 Codex · 11」 or 「目录 codex 11」 picks among Codex folders only.
+  const a = arg.trim().toLowerCase()
+  const name = a.replace(/^codex(\s*[·.]\s*|\s+)/, "")
+  const ds = name !== a ? dirs.filter((d) => d.startsWith(CODEX)) : dirs
+  return ds.find((d) => base(dirPath(d)).toLowerCase() === name) ?? ds.find((d) => base(dirPath(d)).toLowerCase().includes(name))
 }
 
 async function newSession(text) {
   const dir = state().dir
   if (!dir) return "先发「目录」选一个文件夹"
+  if (dir.startsWith(CODEX)) {
+    if (!text) return "Codex 新对话要带内容：「新对话 内容」"
+    const cwd = dirPath(dir)
+    const id = await bridge().create(cwd, text)
+    const n = numOf(CODEX + id)
+    update((s) => (s.last = s.target = CODEX + id))
+    return `已在 Codex · ${base(cwd)} 新建 [${n}]，已发出（在后台运行，桌面端重新打开这个对话能看到）`
+  }
   // Reuse the folder's latest model: the server default may not be usable (it failed once with gpt-5.5).
   const model = toArr(await oc(sessionsURL(1, dir)).catch(() => []))[0]?.model
   const session = (await oc("/api/session", { location: { directory: dir }, ...(model && { model }) })).data
@@ -450,7 +491,7 @@ async function newSession(text) {
   return `已在 ${base(dir)} 新建 [${n}]${text ? "，已发出" : "，接着直接发内容就行"}`
 }
 
-async function run(cmd) {
+export async function run(cmd) {
   if (cmd.type === "multi") {
     const out = []
     for (const c of cmd.cmds) out.push(await run(c))
@@ -460,17 +501,17 @@ async function run(cmd) {
   if (cmd.type === "list") return listSessions()
   if (cmd.type === "dirs") {
     const dirs = await listDirs()
-    return dirs.length ? `文件夹：\n${dirs.map((d, i) => `${i + 1}. ${base(d)}`).join("\n")}\n回复「目录 编号」选择` : "没有文件夹"
+    return dirs.length ? `文件夹：\n${dirs.map((d, i) => `${i + 1}. ${dirLabel(d)}`).join("\n")}\n回复「目录 编号」选择` : "没有文件夹"
   }
   if (cmd.type === "cd") {
     const dir = pickDir(state().dirs ?? (await listDirs()), cmd.arg) ?? pickDir(await listDirs(), cmd.arg)
     if (!dir) return `没找到「${cmd.arg}」，发「目录」查看`
     update((s) => (s.dir = dir))
-    return `已选中 ${base(dir)}\n${await listSessions(dir)}\n回复「编号 内容」继续旧对话，「新对话 内容」开新对话`
+    return `已选中 ${dirLabel(dir)}\n${await listSessions(dir)}\n回复「编号 内容」继续旧对话，「新对话 内容」开新对话`
   }
   if (cmd.type === "new") return newSession(cmd.text)
   if (cmd.type === "image") {
-    const file = toPath(cmd.path, state().dir)
+    const file = toPath(cmd.path, dirPath(state().dir))
     if (!file) return /^[a-z][\w+.-]+:/i.test(cmd.path) && !/^file:/i.test(cmd.path) ? "只能发电脑上的文件" : "相对路径要先发「目录」选文件夹"
     await sendImage(file)
     return [] // the image itself is the confirmation
@@ -481,12 +522,7 @@ async function run(cmd) {
   if (!sessionID) return cmd.n == null ? HELP : `没有 [${cmd.n}]，发「列表」查看`
   if (cmd.n != null && state().target !== sessionID) update((s) => (s.target = sessionID))
   const n = numOf(sessionID)
-  if (sessionID.startsWith("codex:")) {
-    const decision = cmd.type === "text" && cmd.n != null ? (YES.test(cmd.text) ? "allow" : NO.test(cmd.text) ? "deny" : null) : null
-    if (!decision) return CODEX_TODO
-    const ids = answerCodex(readPending(), n, decision)
-    return ids.length ? `${decision === "allow" ? "已批准" : "已拒绝"} [${n}]` : `[${n}] 没有待批准的请求`
-  }
+  if (sessionID.startsWith(CODEX)) return runCodex(cmd, sessionID.slice(CODEX.length), n)
   if (cmd.type === "show") {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
     return `${head(n, session)}\n${clip(await lastReply(sessionID, false)) || "（还没有回复）"}`
@@ -517,26 +553,105 @@ async function run(cmd) {
   return `已发给 [${n}]${forms.length ? "（它在等一个表单，请在桌面端回答）" : ""}`
 }
 
-// Unanswered Codex approval requests, oldest first.
-export function readPending(dir = PENDING_DIR) {
+// Codex approval records written by codex-hook.js, oldest first; records past PENDING_TTL are deleted.
+// `done` records are ones the computer already handled; answered ones (with an .answer file) are left out.
+export function readPending(dir = PENDING_DIR, now = Date.now()) {
   let names = []
   try {
     names = fs.readdirSync(dir)
   } catch {}
-  return names
-    .filter((f) => f.endsWith(".json") && !names.includes(f.replace(/\.json$/, ".answer")))
-    .map((f) => readJson(path.join(dir, f)))
-    .filter((p) => p?.id)
-    .sort((a, b) => a.created - b.created)
+  const out = []
+  for (const f of names.filter((f) => f.endsWith(".json") && !names.includes(f.replace(/\.json$/, ".answer")))) {
+    const p = readJson(path.join(dir, f))
+    if (!p?.id) continue
+    if (now - p.created > PENDING_TTL) fs.rmSync(path.join(dir, f), { force: true })
+    else out.push(p)
+  }
+  return out.sort((a, b) => a.created - b.created)
 }
 
-// Picks which pending requests a 「N y」/「N n」 answers: allow approves the oldest one for N, deny rejects all of N's
-// (same as OpenCode). Writes <id>.answer for each and returns their ids.
+const dropPending = (ps, dir = PENDING_DIR) => ps.forEach((p) => fs.rmSync(path.join(dir, `${p.id}.json`), { force: true }))
+
+// Answers the waiting terminal hooks of [n] (allow: the oldest, deny: all) by writing <id>.answer. Returns their ids.
 export function answerCodex(pending, n, decision, dir = PENDING_DIR) {
-  const mine = pending.filter((p) => p.n === n)
+  const mine = pending.filter((p) => p.n === n && !p.done && (p.mode ?? "wait") === "wait")
   const picked = decision === "allow" ? mine.slice(0, 1) : mine
   for (const p of picked) fs.writeFileSync(path.join(dir, `${p.id}.answer`), decision)
   return picked.map((p) => p.id)
+}
+
+// 「N y」/「N n」 for a Codex thread: our own turn, a waiting terminal hook, or the desktop window.
+async function approveCodex(threadId, n, allow) {
+  const verb = allow ? "已批准" : "已拒绝"
+  const mine = readPending().filter((p) => p.threadId === threadId)
+  let count = bridge().approve(threadId, allow)
+  if (!count) count = answerCodex(mine, n, allow ? "allow" : "deny").length
+  if (!count && mine.some((p) => p.mode === "desktop" && !p.done)) count = (await desktopApprove(threadId, allow)) ?? 0
+  if (count) {
+    // Desktop and bridge records only exist to route the answer; the terminal hook removes its own.
+    dropPending(mine.filter((p) => p.mode !== "wait").slice(0, allow ? 1 : undefined))
+    return `${verb} [${n}]`
+  }
+  if (mine.length) {
+    dropPending(mine.filter((p) => p.mode !== "wait" || p.done))
+    return "已经在电脑上处理了"
+  }
+  return `[${n}] 没有待批准的请求`
+}
+
+async function runCodex(cmd, threadId, n) {
+  const head = async () => codexHead(n, "", await codexThread(threadId), { base, short })
+  if (cmd.type === "show") {
+    const reply = replyText(codexMsgs(await bridge().turns(threadId, 3)), false)
+    return `${await head()}\n${clip(reply) || "（还没有回复）"}`
+  }
+  if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count)
+  const t = cmd.text
+  if (cmd.n != null && (YES.test(t) || NO.test(t))) return approveCodex(threadId, n, YES.test(t))
+  const answered = bridge().reply(threadId, t)
+  if (answered === "answered") return `已回答 [${n}]`
+  if (answered === "mismatch") return `[${n}] 有几个问题就回几行答案，按顺序`
+  try {
+    if (!bridge().running(threadId) && (await desktopSend(threadId, t).catch((e) => (warn("codex desktop send:", e), false))))
+      return `已发给 [${n}]（电脑上的 Codex 窗口里能看到）`
+    await bridge().send(threadId, t)
+  } catch (e) {
+    if (e.message === BUSY) return `[${n}] ${BUSY}`
+    throw e
+  }
+  return `已发给 [${n}]（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
+}
+
+// Pushes for turns the bridge runs, same text as the Codex hooks and the OpenCode pushes.
+export function codexPushText(head, n, kind, text) {
+  if (kind === "done") return `${head}\n${clip(text) || "完成（没有文字回复）"}`
+  if (kind === "failed") return `${head}\n出错：${short(text, 300)}`
+  if (kind === "approval") return `${head}\n等你批准：${short(text, 300)}\n回复「${n} y」批准，「${n} n」拒绝（这个对话在后台运行，只能在微信里批准）`
+  return `${head}\n${text}`
+}
+
+async function codexPush(threadId, kind, text) {
+  const key = CODEX + threadId
+  const n = numOf(key)
+  const thread = await codexThread(threadId)
+  let msg = codexPushText(codexHead(n, "", thread, { base, short }), n, kind, text)
+  const { files, big } = kind === "done" ? await replyImages(text, cleanDir(thread?.cwd)) : { files: [], big: [] }
+  if (big.length) msg += `\n（图片太大没发：${big.join("、")}）`
+  await push(key, msg)
+  for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
+}
+
+// One app-server bridge per process; a hot-reloaded module stops the old one (it would still run old code).
+function bridge() {
+  if (g.bridge?.gen !== GEN) {
+    g.bridge?.stop()
+    g.bridge = createBridge({
+      markerDir: PENDING_DIR,
+      push: (threadId, kind, text) => codexPush(threadId, kind, text).catch((e) => warn("codex push:", e)),
+    })
+    g.bridge.gen = GEN
+  }
+  return g.bridge
 }
 
 // Images mentioned in a reply that can be sent, plus names of the ones over the size limit.
@@ -636,6 +751,8 @@ export default {
       g.poller?.abort()
       g.poller = null
     } else if (g.poller?.gen !== GEN) startPoller()
+    // Hot reload: the old module's app-server would keep running old code.
+    if (g.bridge && g.bridge.gen !== GEN) (g.bridge.stop(), (g.bridge = null))
     const handle = async (event) => {
       if (!TYPES.has(event?.type)) return
       const sessionID = sessionIDOf(event)
@@ -667,6 +784,8 @@ export default {
       if (!g.ctxs.size) {
         g.poller?.abort()
         g.poller = null
+        g.bridge?.stop()
+        g.bridge = null
       }
     }
   },

@@ -7,11 +7,14 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
-// Seconds to wait for a WeChat answer; stays below the 600 s hook timeout in hooks.json.
-const WAIT_S = Math.min(Number(process.env.CODEX_WECHAT_APPROVAL_TIMEOUT) || 540, 590)
-const NO_TEXT = "完成（没有文字回复）"
+import { bridgeMarker, cleanDir, codexHead, desktopOwns } from "./codex.js"
 
-const cleanDir = (cwd) => String(cwd ?? "").replace(/^\\\\\?\\/, "")
+export { codexHead }
+
+// Terminal (TUI / exec) only: seconds to wait for a WeChat answer before Codex shows its own prompt.
+// The desktop and turns started from WeChat never wait: their approvals are answered through the live process.
+const WAIT_S = Math.min(Number(process.env.CODEX_WECHAT_APPROVAL_TIMEOUT) || 60, 590)
+const NO_TEXT = "完成（没有文字回复）"
 
 // Thread row from Codex's state db, or null (old Node, db locked or missing, thread not written yet).
 export async function threadInfo(id, db = path.join(process.env.CODEX_HOME || path.join(process.env.USERPROFILE || process.env.HOME || "", ".codex"), "state_5.sqlite")) {
@@ -29,10 +32,6 @@ export async function threadInfo(id, db = path.join(process.env.CODEX_HOME || pa
 }
 
 export const isSubagent = (t) => /^(subagent|guardian_review)$/.test(t?.thread_source ?? "") || /"subagent"/.test(t?.source ?? "")
-
-export function codexHead(n, cwd, thread, { base, short }) {
-  return `[${n}] Codex · ${base(cleanDir(cwd || thread?.cwd))} / ${short(thread?.name || thread?.title, 40) || "未命名会话"}`
-}
 
 // What the approval is for: the shell command, the files an apply_patch touches, or the MCP tool and its arguments.
 export function permissionSummary(p, short) {
@@ -76,33 +75,51 @@ async function onStop(p, m) {
   for (const f of files) await m.sendImage(f).catch((e) => console.error("[codex-hook] image:", m.short(e?.message, 150)))
 }
 
-export async function onPermission(p, m, waitS = WAIT_S) {
+// Who answers a WeChat 「N y」: "bridge" (a turn the plugin runs), "desktop" (the window has the thread loaded), or
+// "wait" (a terminal: no channel reaches the TUI, so this hook waits briefly for the answer file).
+export async function approvalMode(threadId, pendingDir, owns = desktopOwns) {
+  // Bridge turns push and answer their own approvals (see createBridge in codex.js).
+  if (fs.existsSync(bridgeMarker(pendingDir, threadId))) return "bridge"
+  return (await owns(threadId).catch(() => false)) ? "desktop" : "wait"
+}
+
+export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
   const thread = await threadInfo(p.session_id)
   const key = `codex:${p.session_id}`
   const n = m.numOf(key)
   const listening = alive(m.state().pollerPid)
-  const tail = listening
-    ? `回复「${n} y」批准，「${n} n」拒绝（${Math.max(1, Math.round(waitS / 60))} 分钟内没回复就回电脑上处理）`
-    : "（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上处理）"
+  const how = listening ? (mode ?? (await approvalMode(p.session_id, m.PENDING_DIR))) : null
+  if (how === "bridge") return ""
+  const tail = !listening
+    ? "（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上处理）"
+    : how === "wait"
+      ? `回复「${n} y」批准，「${n} n」拒绝（${waitS} 秒内没回复就在电脑上处理）`
+      : `回复「${n} y」批准，「${n} n」拒绝（电脑上也可以直接点）`
   m.update((s) => (s.last = key))
-  const sent = await m.send(`${codexHead(n, p.cwd, thread, m)}\n等你批准：${permissionSummary(p, m.short)}\n${tail}`)
+  const summary = permissionSummary(p, m.short)
+  const sent = await m.send(`${codexHead(n, p.cwd, thread, m)}\n等你批准：${summary}\n${tail}`)
   if (!listening || sent === "error") return ""
   fs.mkdirSync(m.PENDING_DIR, { recursive: true })
   const id = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`
   const req = path.join(m.PENDING_DIR, `${id}.json`)
   const ans = path.join(m.PENDING_DIR, `${id}.answer`)
-  fs.writeFileSync(req, JSON.stringify({ id, n, threadId: p.session_id, pid: process.pid, summary: permissionSummary(p, m.short), created: Date.now() }))
+  const record = { id, n, threadId: p.session_id, mode: how, pid: process.pid, summary, created: Date.now() }
+  fs.writeFileSync(req, JSON.stringify(record))
+  // No decision: Codex shows its normal prompt; the plugin answers it through the desktop or its own app-server.
+  if (how !== "wait") return ""
+  let answered = false
   try {
     for (const end = Date.now() + waitS * 1000; Date.now() < end; ) {
       const a = fs.existsSync(ans) && fs.readFileSync(ans, "utf-8").trim()
-      if (a) return decisionOutput(a)
-      await new Promise((r) => setTimeout(r, Math.min(1000, waitS * 1000)))
+      if (a) return (answered = true), decisionOutput(a)
+      await new Promise((r) => setTimeout(r, Math.min(500, waitS * 1000)))
     }
-    await m.send(`[${n}] 超时，回电脑上处理`)
     return ""
   } finally {
-    fs.rmSync(req, { force: true })
     fs.rmSync(ans, { force: true })
+    // Timed out: keep the record as done, so a late 「N y」 gets 「已经在电脑上处理了」.
+    if (answered) fs.rmSync(req, { force: true })
+    else fs.writeFileSync(req, JSON.stringify({ ...record, done: Date.now() }))
   }
 }
 
@@ -119,6 +136,9 @@ async function main() {
     const p = JSON.parse(raw || "{}")
     if (event === "stop-send") await onStop(p, await import("./index.js"))
     else if ((event || p.hook_event_name) === "Stop") {
+      // A turn started from WeChat: the plugin pushes the reply itself. Checked here, before the turn ends.
+      const { PENDING_DIR } = await import("./index.js")
+      if (fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) return process.exit(0)
       // Codex waits for Stop hooks before ending the turn, so send from a detached process and return at once.
       const file = path.join(os.tmpdir(), `codex-wechat-stop-${process.pid}-${Date.now()}.json`)
       fs.writeFileSync(file, raw)
