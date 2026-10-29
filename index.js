@@ -11,6 +11,7 @@ import { desktopReply, readQuestion } from "./codex-question.js"
 // Namespace import: a hot reload can pair this file with an older codex-question.js that lacks asyncAnswer.
 import * as asyncQuestion from "./codex-question.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
+import { md, numbered, ul } from "./md.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set([
@@ -42,47 +43,33 @@ const CODEX = "codex:"
 const PENDING_TTL = 60 * 60_000
 const SERVICE_FILE = path.join(os.homedir(), ".local", "state", "opencode", "service.json")
 const STATUS = { succeeded: "完成", failed: "出错", interrupted: "中断" }
-const HELP = [
-  "用法：",
-  "3 内容 → 发给 [3] 号对话",
-  "直接发内容 → 发给你上次用编号指定的对话（回复里会标明发给了哪个对话）",
-  "[3] 有问题等你回答时：「3 答案」；几个问题可以一行一个一次回完，也可以一条一个；「-」跳过可选的，「3 忽略」不回答",
-  "3 y / 3 n → 批准一次 / 拒绝 [3] 的权限请求",
-  "3 → 再看一次 [3] 的最后回复",
-  "3 历史 10 → [3] 最近 10 条消息（默认 5，最多 20）",
-  "列表 → 最近的对话和编号（对话 24 小时没用，编号就回收给别的对话）",
-  "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
-  "新对话 内容 → 在选中的文件夹里开新对话（标着 Codex 的文件夹开 Codex 对话）",
-  "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
-  "发图片/文件 → 先存着，下一条文字（或「3 内容」）带上它们一起发；不用说明就回「发」或「3 图」（10 分钟内有效）",
-  "实时 关 / 实时 开 → 关掉 / 打开回复过程中的推送（约 15 秒一条）；「3 实时 关」只管 [3]，「实时」看状态",
-  "3 撤回 → 撤回你发给 [3] 的最后一条消息和之后的回复（要再发「3 撤回 确认」）；不带编号就是当前对话，也认 /unsend",
-  "编号后面是 agent 和目录，如 [3] OpenCode · ttool、[5] Codex · proj；两种对话用法相同",
-  "/ 命令见下一条",
-].join("\n")
-const SLASH_HELP = [
-  "/ 命令（发给当前对话，也可以「3 /命令」指定）：",
-  "/model → 列出模型；/model 3 或 /model 名字 → 切换模型",
-  "/stop → 停止正在运行的回复",
-  "/compact → 压缩上下文",
-].join("\n")
+const section = (title, items) => md(`【${title}】`, ul(items))
+// Short sections of one-line bullets: WeChat shows the text as Markdown (see md.js).
+export const HELP = md(
+  section("发消息", ["3 内容 → 发给 [3] 号对话", "直接发内容 → 发给上次的对话", "回复会标明发给了谁"]),
+  section("看对话", ["3 → 再看 [3] 的最后回复", "3 历史 10 → 最近 10 条消息", "历史默认 5 条，最多 20", "列表 → 最近的对话和编号", "对话 24 小时没用，编号回收"]),
+  section("批准和回答", ["3 y / 3 n → 批准 / 拒绝", "3 答案 → 回答 [3] 的提问", "几个问题可一行一个回完", "「-」跳过，「3 忽略」不答"]),
+  section("文件夹和新对话", ["目录 → 列出文件夹", "目录 2 → 选第 2 个并列出对话", "新对话 内容 → 在选中的文件夹新建", "标着 Codex 的文件夹开 Codex 对话"]),
+  section("图片", ["图 路径 → 把电脑上的图发来", "相对路径按选中的文件夹算", "发图片/文件 → 先存着", "下一条文字带上它们一起发", "不用说明就回「发」或「3 图」", "10 分钟内有效"]),
+  section("撤回", ["3 撤回 → 撤回 [3] 最后一条", "再发「3 撤回 确认」才执行", "不带编号就是当前对话", "也认 /unsend"]),
+  section("实时推送", ["实时 关 / 实时 开 → 关 / 开", "回复过程中约 15 秒推一条", "3 实时 关 → 只关 [3]", "实时 → 看状态"]),
+  section("其他", ["编号后是 agent 和目录", "例：[3] OpenCode · ttool", "OpenCode 和 Codex 用法一样", "/ 命令 → 见下一条"]),
+)
 
 export function slashHelpText(t, commands) {
-  const lines = [SLASH_HELP]
-  if (t) lines[0] = lines[0].replace("当前对话", `当前对话 ${t}`)
-  if (commands?.length) {
-    lines.push("", "OpenCode 自带命令：")
-    for (const c of commands) lines.push(`/${c.name}${c.description ? ` → ${short(c.description, 50)}` : ""}`)
-  }
-  return lines.join("\n")
+  return md(
+    `【/ 命令】发给当前对话${t ? ` ${t}` : ""}`,
+    ul(["/model → 列出模型", "/model 3 → 切到第 3 个", "/model 名字 → 按名字切换", "/stop → 停止正在运行的回复", "/compact → 压缩上下文", "「3 /stop」指定对话"]),
+    commands?.length && md("【OpenCode 自带命令】", ul(commands.map((c) => `/${c.name}${c.description ? ` → ${short(c.description, 50)}` : ""}`))),
+  )
 }
-
+const SLASH_HELP = slashHelpText()
 // The slash list for the current target: OpenCode commands depend on the session's folder (plugins, skills).
 async function slashHelp() {
   const sessionID = targetID()
   if (!sessionID) return SLASH_HELP
   const t = await tag(sessionID)
-  if (sessionID.startsWith(CODEX)) return slashHelpText(t) + "\n（Codex 对话只支持上面这三个）"
+  if (sessionID.startsWith(CODEX)) return md(slashHelpText(t), "（Codex 对话只支持 /model、/stop、/compact）")
   const session = (await oc(`/api/session/${sid(sessionID)}`)).data
   const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
   return slashHelpText(t, toArr(await oc(`/api/command?${loc}`)))
@@ -116,20 +103,26 @@ const warn = (...a) => {
 export function clip(text, n, max = MAX_CHARS) {
   const t = String(text ?? "").trim()
   if (t.length <= max) return t
-  return `${t.slice(0, max)}\n…（还有 ${t.length - max} 字，${n == null ? "" : `发「${n} 历史 1」或`}看桌面端）`
+  return `${t.slice(0, max)}\n\n…（还有 ${t.length - max} 字，${n == null ? "" : `发「${n} 历史 1」或`}看桌面端）`
 }
 
 // One WeChat message per chunk of about `size` characters, cut at a paragraph or line break when one is in the
-// second half of the chunk. Chunks are numbered "(1/3)": on the first line of the first (which carries the full
-// "[N] OpenCode · 目录" tag), and after the short "[N]" on the others.
+// second half of the chunk, never before an indented line (the next chunk would open a nested item or code block with
+// it). Chunks are numbered "(1/3)": on the first line of the first when it carries the full "[N] OpenCode · 目录" tag,
+// otherwise in a line of its own; the others start with the short "[N] (2/3)" and a blank line.
 export function splitText(text, size = CHUNK_CHARS) {
   let rest = String(text ?? "")
   if (rest.length <= size) return [rest]
   const parts = []
+  const breakAt = (win, sep) => {
+    let i = win.lastIndexOf(sep)
+    while (i >= size / 2 && /^[ \t]/.test(rest.slice(i + sep.length, i + sep.length + 1))) i = win.lastIndexOf(sep, i - 1)
+    return i
+  }
   while (rest.length > size) {
     const win = rest.slice(0, size)
-    let cut = win.lastIndexOf("\n\n")
-    if (cut < size / 2) cut = win.lastIndexOf("\n")
+    let cut = breakAt(win, "\n\n")
+    if (cut < size / 2) cut = breakAt(win, "\n")
     if (cut < size / 2) cut = /[\ud800-\udbff]/.test(win.at(-1)) ? size - 1 : size
     parts.push(rest.slice(0, cut).trimEnd())
     rest = rest.slice(cut).replace(/^\n+/, "")
@@ -138,7 +131,7 @@ export function splitText(text, size = CHUNK_CHARS) {
   const k = parts.length
   if (k === 1) return parts
   const tag = parts[0].match(/^\[\d+\]/)?.[0]
-  return parts.map((p, i) => (i ? `${tag ? tag + " " : ""}(${i + 1}/${k})\n${p}` : p.replace(/^.*/, (l) => `${l} (1/${k})`)))
+  return parts.map((p, i) => (i ? `${tag ? tag + " " : ""}(${i + 1}/${k})\n\n${p}` : tag ? p.replace(/^.*/, (l) => `${l} (1/${k})`) : `(1/${k})\n\n${p}`))
 }
 
 const AGENT = (key) => (key.startsWith(CODEX) ? "Codex" : "OpenCode")
@@ -180,7 +173,7 @@ export function replyText(msgs, stopAtUser = true) {
     const t = (m.content ?? [])
       .filter((c) => c.type === "text")
       .map((c) => c.text)
-      .join("\n")
+      .join("\n\n")
       .trim()
     if (t) return t
   }
@@ -216,8 +209,10 @@ export function codexUnsendPlan(turns) {
 }
 
 export const unsendAsk = (n, p, running, t = `[${n}]`) =>
-  `${t} 将撤回${p.kind === "inbox" ? "还在排队的" : ""}「${short(p.text, 30)}」${p.replies ? `及之后的 ${p.replies} 条回复` : ""}` +
-  `${running ? "（会先停止正在运行的回复）" : ""}，确认发「${n} 撤回 确认」（2 分钟内有效）`
+  md(
+    `${t} 将撤回${p.kind === "inbox" ? "还在排队的" : ""}「${short(p.text, 30)}」${p.replies ? `及之后的 ${p.replies} 条回复` : ""}${running ? "（会先停止正在运行的回复）" : ""}`,
+    `确认发「${n} 撤回 确认」（2 分钟内有效）`,
+  )
 
 // "shell ×3、edit" for a Map of tool name → calls.
 const used = (tools) => [...tools].map(([k, v]) => (v > 1 ? `${k} ×${v}` : k)).join("、")
@@ -230,16 +225,16 @@ export function historyLines(msgs, n, count, full = `[${n}]`) {
   let tools = new Map()
   for (const m of [...(msgs ?? [])].reverse()) {
     const parts = m.content ?? []
-    const text = parts.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim()
+    const text = parts.filter((c) => c.type === "text").map((c) => c.text).join("\n\n").trim()
     if (m.type === "user") {
       tools = new Map()
       const t = userText(m)
-      if (t) items.push(`你：${clip(t)}`)
+      if (t) items.push(md("你：", clip(t)))
     } else if (m.type === "assistant") {
       for (const c of parts) if (c.type === "tool") tools.set(c.name, (tools.get(c.name) ?? 0) + 1)
       if (!text) continue
       const u = used(tools)
-      items.push(`AI：${clip(text)}${u ? `\n（调用了 ${u}）` : ""}`)
+      items.push(md("AI：", clip(text), u && `（调用了 ${u}）`))
       tools = new Map()
     }
   }
@@ -252,18 +247,17 @@ export function historyLines(msgs, n, count, full = `[${n}]`) {
 export function format(event, session, n, reply, live) {
   const d = event.data ?? {}
   const hd = head(n, session, event.location?.directory)
-  const h = hd + "\n"
   switch (event.type) {
     case "session.execution.succeeded":
       return session?.parentID ? null : doneText(hd, n, reply, live, ocTag(n, session, event.location?.directory))
     case "session.execution.failed":
-      return h + "出错：" + short(d.error?.message || d.error?.type || "未知错误", 300)
+      return md(hd, "出错：" + short(d.error?.message || d.error?.type || "未知错误", 300))
     case "permission.asked": {
       const what = d.message || [d.action, ...(d.resources ?? [])].filter(Boolean).join(" ")
-      return h + `等你批准：${short(what, 300)}\n回复「${n} y」批准一次，「${n} n」拒绝`
+      return md(hd, `等你批准：${short(what, 300)}`, `回复「${n} y」批准一次，「${n} n」拒绝`)
     }
     case "form.created":
-      return h + formText(d.form, n)
+      return md(hd, formText(d.form, n))
   }
   return null
 }
@@ -272,17 +266,21 @@ export function format(event, session, n, reply, live) {
 // A run that pushed progress ends with only what wasn't pushed, or one line when nothing is left; any other run
 // ends with its last reply, as without progress. `t`: the conversation's tag, for the one-line ending.
 export const doneText = (h, n, reply, live, t = `[${n}]`) =>
-  !live?.pushed ? `${h}\n${clip(reply, n) || "完成（没有文字回复）"}` : live.body ? `${h}\n${clip(live.body, n)}` : `${t} 完成`
+  !live?.pushed ? md(h, clip(reply, n) || "完成（没有文字回复）") : live.body ? md(h, clip(live.body, n)) : `${t} 完成`
 
-// Errors, approvals and questions carry the pending progress first (after the header line), so order is kept.
-export const withPre = (msg, live) => (live?.body ? msg.replace("\n", `\n${clip(live.body)}\n\n`) : msg)
+// Errors, approvals and questions carry the pending progress first (after the header paragraph), so order is kept.
+export function withPre(msg, live) {
+  if (!live?.body) return msg
+  const i = msg.indexOf("\n\n") < 0 ? msg.length : msg.indexOf("\n\n")
+  return `${msg.slice(0, i)}\n\n${clip(live.body)}${msg.slice(i)}`
+}
 
 // Body of a progress push: the text segments finished since the last push, then the tools called since then.
 // Empty without text: a tool summary alone waits for the next text.
 export function liveBody(texts, tools) {
   const t = texts.map((s) => s.trim()).filter(Boolean).join("\n\n")
   const u = used(tools ?? [])
-  return t && t + (u ? `\n（调用了 ${u}）` : "")
+  return t && md(t, u && `（调用了 ${u}）`)
 }
 
 // Wait before the next progress push of a conversation whose last push (or first segment) was at `at`.
@@ -298,7 +296,10 @@ export function liveCmd(s, key, n, on) {
     if (key !== "*") return `${tagIn(s, key, n)} 实时推送：${word(liveOn(s, key))}`
     const all = liveOn(s, "*")
     const other = Object.entries(s.live ?? {}).filter(([k, v]) => k !== "*" && v !== all && s.nums[k]).map(([k]) => tagIn(s, k))
-    return `实时推送：${word(all)}${other.length ? `（${other.join("、")} ${word(!all)}）` : ""}\n「实时 关」/「实时 开」切换所有对话，「编号 实时 关」只切换一个`
+    return md(
+      `实时推送：${word(all)}${other.length ? `（${other.join("、")} ${word(!all)}）` : ""}`,
+      "「实时 关」/「实时 开」切换所有对话，「编号 实时 关」只切换一个",
+    )
   }
   if (key === "*") s.live = { "*": on }
   else (s.live ??= {})[key] = on
@@ -468,7 +469,7 @@ export function mediaAck(items, target, failed = 0) {
   const bad = failed ? `有 ${failed} 个没收到（下载失败）` : ""
   if (!items.length) return bad
   const to = target ? `会一起发给 ${target}` : "用「编号 文字」指定发给哪个对话"
-  return `${bad ? bad + "；" : ""}收到${what}，接着发文字说明，${to}（不用说明就回「发」）`
+  return md(bad, `收到${what}`, `接着发文字说明，${to}（不用说明就回「发」）`)
 }
 
 // Models as { id, providerID?, label, name, image, isDefault }. By list number, exact id / label, or name fragment;
@@ -481,7 +482,7 @@ export function pickModel(models, arg) {
 }
 
 export const modelLines = (models, current) =>
-  models.map((m, i) => `${i + 1}. ${m.label}${m.label === current ? " ← 当前" : ""}${m.image ? "" : "（不看图）"}`)
+  models.map((m, i) => `${i + 1} ${m.label}${m.label === current ? " ← 当前" : ""}${m.image ? "" : "（不看图）"}`)
 
 // Every plugin instance (one per location) receives every event; they share the event id.
 export const eventKey = (event) =>
@@ -874,7 +875,7 @@ function push(sessionID, text) {
 // { texts, tools, at, pushed, timer, info, child }. `info()` resolves to { head } or { child: true } at push time.
 
 const NO_LIVE = { body: "", pushed: false }
-const PAUSE = "\n（实时推送先停一下：微信限制机器人连着发消息，回「实时」继续）"
+const PAUSE = "（实时推送先停一下：微信限制机器人连着发消息，回「实时」继续）"
 
 function liveEntry(key, info) {
   let e = g.progress.get(key)
@@ -922,7 +923,7 @@ async function flushLive(key, e) {
   if (child) return void Object.assign(e, { child: true, texts: [], tools: new Map() })
   if (g.progress.get(key) !== e) return
   const { body } = takeLive(key)
-  if (body) await push(key, `${h}\n${clip(body)}${(s.sent ?? 0) + 1 >= PROGRESS_MAX ? PAUSE : ""}`)
+  if (body) await push(key, md(h, clip(body), (s.sent ?? 0) + 1 >= PROGRESS_MAX && PAUSE))
 }
 
 const sessionsURL = (limit, dir) =>
@@ -931,6 +932,12 @@ const sessionsURL = (limit, dir) =>
 // One line per conversation, newest first: `{ updated, line }` from OpenCode and Codex merged.
 export const mergeLines = (rows, limit = 10) =>
   [...rows].sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0)).slice(0, limit).map((r) => r.line)
+
+// The 「列表」 text: one bullet per conversation.
+export const listText = (rows, limit) => {
+  const lines = mergeLines(rows, limit)
+  return lines.length ? ul(lines) : "没有对话"
+}
 
 const codexLine = (t) => ({
   updated: t.updated,
@@ -941,8 +948,7 @@ const codexLine = (t) => ({
 async function listSessions(dir) {
   await prune()
   if (dir?.startsWith(CODEX)) {
-    const lines = (await codexThreads({ cwd: dir.slice(CODEX.length) })).map((t) => codexLine(t).line)
-    return lines.length ? lines.join("\n") : "没有对话"
+    return listText((await codexThreads({ cwd: dir.slice(CODEX.length) })).map(codexLine), Infinity)
   }
   const [list, active, codex] = await Promise.all([
     oc(sessionsURL(10, dir)),
@@ -955,8 +961,7 @@ async function listSessions(dir) {
       updated: s.time?.updated,
       line: `${head(numOf(s.id), s)} · ${active.data?.[s.id] ? "运行中" : (STATUS[s.outcome] ?? "空闲")}`,
     }))
-  const lines = mergeLines([...rows, ...codex.map(codexLine)])
-  return lines.length ? lines.join("\n") : "没有对话"
+  return listText([...rows, ...codex.map(codexLine)])
 }
 
 // OpenCode folders, then `codex:<folder>` for the folders of Codex threads.
@@ -974,6 +979,8 @@ async function listDirs() {
 }
 
 export const dirLabel = (d) => (d.startsWith(CODEX) ? `Codex · ${base(d.slice(CODEX.length))}` : base(d))
+
+export const dirsText = (dirs) => (dirs.length ? md("文件夹：", numbered(dirs.map(dirLabel)), "回复「目录 编号」选择") : "没有文件夹")
 const dirPath = (d) => (d?.startsWith(CODEX) ? d.slice(CODEX.length) : d)
 
 // Folder by number from the last 「目录」 listing, or by folder name.
@@ -1018,14 +1025,13 @@ export async function run(cmd) {
   if (cmd.type === "help") return [HELP, await slashHelp().catch((e) => (warn("help:", e), SLASH_HELP))]
   if (cmd.type === "list") return listSessions()
   if (cmd.type === "dirs") {
-    const dirs = await listDirs()
-    return dirs.length ? `文件夹：\n${dirs.map((d, i) => `${i + 1}. ${dirLabel(d)}`).join("\n")}\n回复「目录 编号」选择` : "没有文件夹"
+    return dirsText(await listDirs())
   }
   if (cmd.type === "cd") {
     const dir = pickDir(state().dirs ?? (await listDirs()), cmd.arg) ?? pickDir(await listDirs(), cmd.arg)
     if (!dir) return `没找到「${cmd.arg}」，发「目录」查看`
     update((s) => (s.dir = dir))
-    return `已选中 ${dirLabel(dir)}\n${await listSessions(dir)}\n回复「编号 内容」继续旧对话，「新对话 内容」开新对话`
+    return md(`已选中 ${dirLabel(dir)}`, await listSessions(dir), "回复「编号 内容」继续旧对话，「新对话 内容」开新对话")
   }
   if (cmd.type === "new") return newSession(cmd.text)
   if (cmd.type === "image") {
@@ -1055,7 +1061,7 @@ export async function run(cmd) {
   if (sessionID.startsWith(CODEX)) return runCodex(cmd, sessionID.slice(CODEX.length), n, tg)
   if (cmd.type === "show") {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
-    return `${head(n, session)}\n${clip(await lastReply(sessionID, false), n) || "（还没有回复）"}`
+    return md(head(n, session), clip(await lastReply(sessionID, false), n) || "（还没有回复）")
   }
   if (cmd.type === "history") {
     // Tool-only assistant messages are skipped, so fetch extra.
@@ -1103,7 +1109,7 @@ async function answerForm(sessionID, n, tg, form, text, opts) {
   if (status === (a.cancel ? "cancelled" : "answered")) return a.cancel ? `已忽略 ${tg} 的问题` : `已回答 ${tg}`
   if (status && status !== "pending") return `${tg} 的问题已经在电脑上处理了`
   const why = short(err || `问题的状态是 ${status ?? "未知"}`, 200)
-  return `${tg} ${a.cancel ? "忽略" : "提交"}没成功：${why}${status === "pending" ? `\n请重新回答：\n${formText(form, n)}` : ""}`
+  return md(`${tg} ${a.cancel ? "忽略" : "提交"}没成功：${why}`, ...(status === "pending" ? ["请重新回答：", formText(form, n)] : []))
 }
 
 // 「N 撤回」 asks first and remembers what it would take back; 「N 撤回 确认」 within UNSEND_MS does it, if that is still
@@ -1197,16 +1203,25 @@ export function chunkLines(lines, max = CHUNK_CHARS) {
   return out.filter(Boolean)
 }
 
+// A header, a bullet list and a footer as messages under the WeChat push size: the header leads the first, the footer
+// ends the last, and a split falls between two items.
+export function listMessages(head, items, foot = "", max = CHUNK_CHARS) {
+  const parts = items.length ? chunkLines(ul(items).split("\n"), max - Math.max(head.length, foot.length) - 2) : [""]
+  parts[0] = md(head, parts[0])
+  parts[parts.length - 1] = md(parts.at(-1), foot)
+  return parts
+}
+
 // Model list, or a switch to models[pick]. `current` is the label of the model in use.
 function modelReply(tg, models, current, arg, apply, note) {
   if (!models.length) return `${tg} 没有可用的模型`
   const footer = "回复「/model 编号」或「/model 名字」切换"
-  if (!arg) return chunkLines([`${tg} 可用模型（共 ${models.length} 个）：`, ...modelLines(models, current), footer])
+  if (!arg) return listMessages(`${tg} 可用模型（共 ${models.length} 个）：`, modelLines(models, current), footer)
   const found = pickModel(models, arg)
   if (!found.length) return `${tg} 没找到模型「${arg}」，发「/model」查看`
   if (found.length > 1) {
     const lines = modelLines(models, current).filter((_, i) => found.includes(models[i]))
-    return chunkLines([`${tg} 有 ${found.length} 个匹配「${arg}」，回「/model 编号」选一个：`, ...lines.slice(0, 30)])
+    return listMessages(`${tg} 有 ${found.length} 个匹配「${arg}」，回「/model 编号」选一个：`, lines.slice(0, 30))
   }
   return apply(found[0]).then(() => `已把 ${tg} 切到 ${found[0].label}${note ?? ""}`)
 }
@@ -1235,7 +1250,7 @@ async function slashOC(cmd, sessionID, n, tg) {
   }
   const cmds = toArr(await oc(`/api/command?${loc}`)).map((c) => c.name)
   const known = cmds.find((c) => c.toLowerCase() === name)
-  if (!known) return `不认识的命令 /${cmd.name}，发「帮助」查看${cmds.length ? `\nOpenCode 命令：${cmds.map((c) => "/" + c).join(" ")}` : ""}`
+  if (!known) return md(`不认识的命令 /${cmd.name}，发「帮助」查看`, cmds.length && `OpenCode 命令：${cmds.map((c) => "/" + c).join(" ")}`)
   const { text, images, note } = takeMedia(cmd.args)
   await oc(`/api/session/${sid(sessionID)}/command`, {
     name: known,
@@ -1324,7 +1339,7 @@ async function runCodex(cmd, threadId, n, tg) {
   const head = async () => codexHead(n, "", await codexThread(threadId), { base, short })
   if (cmd.type === "show") {
     const reply = replyText(codexMsgs(await bridge().turns(threadId, 3)), false)
-    return `${await head()}\n${clip(reply, n) || "（还没有回复）"}`
+    return md(await head(), clip(reply, n) || "（还没有回复）")
   }
   if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count, tg)
   const t = cmd.text
@@ -1357,10 +1372,10 @@ const noMedia = (t) => (SEND_WORD.test(t.trim()) && !liveMedia(g.media).length ?
 
 // Pushes for turns the bridge runs, same text as the Codex hooks and the OpenCode pushes.
 export function codexPushText(head, n, kind, text) {
-  if (kind === "done") return `${head}\n${clip(text, n) || "完成（没有文字回复）"}`
-  if (kind === "failed") return `${head}\n出错：${short(text, 300)}`
-  if (kind === "approval") return `${head}\n等你批准：${short(text, 300)}\n回复「${n} y」批准，「${n} n」拒绝（这个对话在后台运行，只能在微信里批准）`
-  return `${head}\n${text}`
+  if (kind === "done") return md(head, clip(text, n) || "完成（没有文字回复）")
+  if (kind === "failed") return md(head, `出错：${short(text, 300)}`)
+  if (kind === "approval") return md(head, `等你批准：${short(text, 300)}`, `回复「${n} y」批准，「${n} n」拒绝（这个对话在后台运行，只能在微信里批准）`)
+  return md(head, text)
 }
 
 // Called synchronously in the order the app-server reports, so progress bookkeeping keeps that order.
@@ -1386,7 +1401,7 @@ async function codexSend(threadId, kind, text, live) {
   const h = codexHead(n, "", thread, { base, short })
   let msg = kind === "done" ? doneText(h, n, text, live, tagIn(state(), key, n)) : withPre(codexPushText(h, n, kind, text), live)
   const { files, big } = kind === "done" ? await replyImages(text, cleanDir(thread?.cwd)) : { files: [], big: [] }
-  if (big.length) msg += `\n（图片太大没发：${big.join("、")}）`
+  if (big.length) msg = md(msg, `（图片太大没发：${big.join("、")}）`)
   await push(key, msg)
   for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
 }
@@ -1550,7 +1565,7 @@ export default {
       if (!text) return
       if (event.type !== "session.execution.succeeded") text = withPre(text, live)
       const { files, big } = await replyImages(reply, session?.location?.directory ?? event.location?.directory)
-      if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
+      if (big.length) text = md(text, `（图片太大没发：${big.join("、")}）`)
       await push(sessionID, text)
       for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
     }

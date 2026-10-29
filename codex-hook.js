@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { bridgeMarker, cleanDir, codexHead, desktopOwns } from "./codex.js"
 import { asyncText, dropQuestion, noteQuestion, openAsks, readQuestion, waitQuestion } from "./codex-question.js"
 import { formText, questionForm } from "./form.js"
+import { md } from "./md.js"
 
 export { codexHead }
 
@@ -82,10 +83,14 @@ export async function onStop(p, m, { db } = {}) {
   // The desktop asks with request_user_input_async: the turn goes on and ends with a line like "已发送 3 个选项", so the
   // question itself is only in the thread history.
   const asks = await openAsks(p.session_id, db)
-  const tail = alive(m.state().pollerPid) ? "" : "\n（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上回答）"
-  const body = [m.clip(reply, n) || (asks.length ? "" : NO_TEXT), ...asks.map((a) => asyncText(a, n))].filter(Boolean).join("\n")
-  let text = `${codexHead(n, p.cwd, thread, m)}\n${body}${asks.length ? tail : ""}`
-  if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
+  const tail = !alive(m.state().pollerPid) && "（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上回答）"
+  const text = md(
+    codexHead(n, p.cwd, thread, m),
+    m.clip(reply, n) || (asks.length ? "" : NO_TEXT),
+    ...asks.map((a) => asyncText(a, n)),
+    asks.length && tail,
+    big.length && `（图片太大没发：${big.join("、")}）`,
+  )
   m.update((s) => remember(s, key, p.cwd, thread))
   console.error(`${new Date().toISOString()} Stop [${n}] ${await m.send(text)}`)
   for (const f of files) await m.sendImage(f).catch((e) => console.error("[codex-hook] image:", m.short(e?.message, 150)))
@@ -113,7 +118,7 @@ export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
       : `回复「${n} y」批准，「${n} n」拒绝（电脑上也可以直接点）`
   m.update((s) => remember(s, key, p.cwd, thread))
   const summary = permissionSummary(p, m.short)
-  const sent = await m.send(`${codexHead(n, p.cwd, thread, m)}\n等你批准：${summary}\n${tail}`)
+  const sent = await m.send(md(codexHead(n, p.cwd, thread, m), `等你批准：${summary}`, tail))
   if (!listening || sent === "error") return ""
   fs.mkdirSync(m.PENDING_DIR, { recursive: true })
   const id = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`
@@ -155,8 +160,7 @@ export async function onQuestion(p, m, opts) {
   const tail = listening ? "（电脑上也可以直接答）" : "（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上回答）"
   const sent = []
   for (const req of found) {
-    const text = `${codexHead(n, p.cwd, thread, m)}\n${formText(questionForm(req.params?.questions), n, false)}\n${tail}`
-    sent.push(await m.send(text))
+    sent.push(await m.send(md(codexHead(n, p.cwd, thread, m), formText(questionForm(req.params?.questions), n, false), tail)))
     if (listening && sent.at(-1) !== "error") noteQuestion(m.PENDING_DIR, id, n, [req.id])
   }
   return `[${n}] ${sent.join(" ")}`

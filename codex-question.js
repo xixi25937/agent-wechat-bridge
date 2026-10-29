@@ -6,6 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { desktopSnapshot, ipcConnect, ownerOf, questionResult } from "./codex.js"
 import { fieldsOf, formAction, questionForm, step, stepText } from "./form.js"
+import { md, numbered } from "./md.js"
 
 const QUESTION = "item/tool/requestUserInput"
 // A question can wait for the user a long time; the Stop hook and every answer remove the record sooner.
@@ -103,13 +104,11 @@ export async function openAsks(threadId, db = HISTORY) {
 // Push text for one open question. The whole question is shown (the form text cuts at 300 characters).
 export function asyncText({ questions }, n) {
   const many = questions.length > 1
-  const lines = ["有问题问你："]
-  questions.forEach((q, i) => {
-    lines.push(`${many ? `问题 ${i + 1}/${questions.length}：` : ""}${q.title}`)
-    ;(q.options ?? []).forEach((o, k) => lines.push(`  ${k + 1}. ${o}`))
-  })
-  lines.push(many ? `回复「${n} 答案」：一次回完，一行一个、按顺序` : `回复「${n} 答案」${questions[0].options?.length ? "（可以回编号，也可以直接写答案）" : ""}`)
-  return lines.join("\n")
+  return md(
+    "有问题问你：",
+    ...questions.map((q, i) => md(`${many ? `问题 ${i + 1}/${questions.length}：` : ""}${q.title}`, q.options?.length && numbered(q.options))),
+    many ? `回复「${n} 答案」：一次回完，一行一个、按顺序` : `回复「${n} 答案」${questions[0].options?.length ? "（可以回编号，也可以直接写答案）" : ""}`,
+  )
 }
 
 // Options answer with their text; anything else is the answer itself, as the window's "other" would be.

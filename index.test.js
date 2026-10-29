@@ -3,71 +3,91 @@ import { getEventListeners } from "node:events"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
-  KEEP_MS, PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, doneText, eventKey, extOf, format, historyLines,
-  imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, lowestFree, liveOn, mediaAck, mergeLines, modelLines, parseCommand, pickDir,
-  prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk, unsendPlan, withMedia, withPre,
+  HELP, KEEP_MS, PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, dirsText, doneText, eventKey, extOf, format,
+  historyLines, imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, listMessages, listText, lowestFree, liveOn, mediaAck, mergeLines,
+  modelLines, parseCommand, pickDir, prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk,
+  unsendPlan, withMedia, withPre,
 } from "./index.js"
+import { looseBreaks } from "./md.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
 const ok = { type: "session.execution.succeeded", data: { sessionID: "s1" } }
 
+// Every message the bridge composes must lay out under Markdown: paragraphs apart by a blank line, and a single "\n" only
+// between "- " items (WeChat shows any other single "\n" as a space).
+const flat = (...msgs) => msgs.flat().forEach((m) => assert.deepEqual(looseBreaks(m), [], `single \\n in: ${JSON.stringify(m)}`))
+
 test("format", () => {
-  assert.equal(format(ok, session, 3, "改好了"), "[3] OpenCode · 22 / 重构登录模块\n改好了")
-  assert.equal(format(ok, session, 3, ""), "[3] OpenCode · 22 / 重构登录模块\n完成（没有文字回复）")
+  const H = "[3] OpenCode · 22 / 重构登录模块"
+  assert.equal(format(ok, session, 3, "改好了"), `${H}\n\n改好了`)
+  assert.equal(format(ok, session, 3, ""), `${H}\n\n完成（没有文字回复）`)
+  assert.equal(format(ok, session, 3, "第一段\n第二行\n\n- 列表\n- 列表二"), `${H}\n\n第一段\n第二行\n\n- 列表\n- 列表二`, "the agent's text goes through untouched")
   assert.equal(format(ok, { ...session, parentID: "p" }, 3, "x"), null)
-  assert.equal(format({ ...ok, location: { directory: "/a/b" } }, undefined, 1, "x"), "[1] OpenCode · b / 未命名会话\nx")
-  assert.equal(format(ok, undefined, 1, "x"), "[1] OpenCode / 未命名会话\nx", "no folder known: just the agent")
-  assert.equal(
-    format({ type: "session.execution.failed", data: { error: { type: "x", message: "rate\nlimited" } } }, session, 3),
-    "[3] OpenCode · 22 / 重构登录模块\n出错：rate limited",
-  )
-  assert.equal(
-    format({ type: "permission.asked", data: { action: "shell", resources: ["git push"] } }, session, 3),
-    "[3] OpenCode · 22 / 重构登录模块\n等你批准：shell git push\n回复「3 y」批准一次，「3 n」拒绝",
-  )
+  assert.equal(format({ ...ok, location: { directory: "/a/b" } }, undefined, 1, "x"), "[1] OpenCode · b / 未命名会话\n\nx")
+  assert.equal(format(ok, undefined, 1, "x"), "[1] OpenCode / 未命名会话\n\nx", "no folder known: just the agent")
+  const failed = format({ type: "session.execution.failed", data: { error: { type: "x", message: "rate\nlimited" } } }, session, 3)
+  assert.equal(failed, `${H}\n\n出错：rate limited`)
+  const asked = format({ type: "permission.asked", data: { action: "shell", resources: ["git push"] } }, session, 3)
+  assert.equal(asked, `${H}\n\n等你批准：shell git push\n\n回复「3 y」批准一次，「3 n」拒绝`)
   // The one-line ending of a run whose progress was all pushed carries the tag, without the title.
   assert.equal(format(ok, session, 3, "x", { body: "", pushed: true }), "[3] OpenCode · 22 完成")
   const fields = [{ key: "db", type: "string", title: "选数据库", options: [{ value: "pg", label: "Postgres" }] }]
   const form = { type: "form.created", data: { form: { sessionID: "s1", title: "用哪个数据库？", fields } } }
   assert.equal(
     format(form, session, 3),
-    "[3] OpenCode · 22 / 重构登录模块\n有问题问你：用哪个数据库？\n选数据库（可跳过）\n  1. Postgres\n回复「3 答案」（可以回编号）\n不想回答发「3 忽略」",
+    `${H}\n\n有问题问你：用哪个数据库？\n\n选数据库（可跳过）\n\n- 1 Postgres\n\n回复「3 答案」（可以回编号）\n\n不想回答发「3 忽略」`,
   )
+  flat(failed, asked, format(form, session, 3))
   assert.equal(sessionIDOf(form), "s1")
 })
 
 test("clip", () => {
   assert.equal(clip(" hi "), "hi")
   assert.equal(clip("x".repeat(8000)), "x".repeat(8000))
-  assert.equal(clip("x".repeat(9000), 3), "x".repeat(8000) + "\n…（还有 1000 字，发「3 历史 1」或看桌面端）")
-  assert.equal(clip("x".repeat(9000)).slice(8000), "\n…（还有 1000 字，看桌面端）")
+  assert.equal(clip("x".repeat(9000), 3), "x".repeat(8000) + "\n\n…（还有 1000 字，发「3 历史 1」或看桌面端）")
+  assert.equal(clip("x".repeat(9000)).slice(8000), "\n\n…（还有 1000 字，看桌面端）")
 })
 
 test("splitText", () => {
-  assert.deepEqual(splitText("[3] OpenCode · a / b\nhi"), ["[3] OpenCode · a / b\nhi"])
-  // Paragraph breaks win, then line breaks; numbering goes on the header line (full tag) and after the short [N] on the rest.
+  assert.deepEqual(splitText("[3] OpenCode · a / b\n\nhi"), ["[3] OpenCode · a / b\n\nhi"])
+  // Paragraph breaks win, then line breaks; numbering goes on the header line (full tag) and, in a paragraph of its own,
+  // after the short [N] on the rest.
   const para = "x".repeat(700)
-  const parts = splitText(`[3] OpenCode · 22 / 标题\n${[para, para, para, para].join("\n\n")}`, 1800)
+  const parts = splitText(`[3] OpenCode · 22 / 标题\n\n${[para, para, para, para].join("\n\n")}`, 1800)
   assert.equal(parts.length, 2)
-  assert.ok(parts[0].startsWith("[3] OpenCode · 22 / 标题 (1/2)\n"))
+  assert.ok(parts[0].startsWith("[3] OpenCode · 22 / 标题 (1/2)\n\n"))
   assert.ok(parts[0].endsWith(para) && !parts[0].endsWith("\n"))
-  assert.equal(parts[1], `[3] (2/2)\n${para}\n\n${para}`)
+  assert.equal(parts[1], `[3] (2/2)\n\n${para}\n\n${para}`)
+  flat(parts)
   const lines = Array.from({ length: 50 }, (_, i) => `第 ${i} 行 ${"y".repeat(60)}`).join("\n")
   const byLine = splitText(lines, 1000)
   assert.ok(byLine.length >= 4 && byLine.every((p) => p.length <= 1000 + 12))
-  assert.equal(byLine.map((p, i) => p.replace(i ? /^\(\d+\/\d+\)\n/ : / \(1\/\d+\)$/m, "")).join("\n"), lines, "nothing is lost")
+  assert.equal(byLine.map((p, i) => p.replace(i ? /^\(\d+\/\d+\)\n\n/ : /^\(1\/\d+\)\n\n/, "")).join("\n"), lines, "nothing is lost")
   // No break at all: a hard cut that never splits an emoji's surrogate pair.
-  const hard = splitText("a" + "😀".repeat(20), 10).map((p, i) => p.replace(i ? /^\(\d+\/\d+\)\n/ : / \(1\/\d+\)$/, ""))
+  const hard = splitText("a" + "😀".repeat(20), 10).map((p) => p.replace(/^\(\d+\/\d+\)\n\n/, ""))
   assert.equal(hard.join(""), "a" + "😀".repeat(20))
   assert.ok(hard.every((p) => !/[\ud800-\udbff]$/.test(p) && !/^[\udc00-\udfff]/.test(p)))
   // The longest push: a capped 8000-character reply is five chunks.
-  assert.equal(splitText(`[3] h\n${clip("z".repeat(9000), 3)}`).length, 5)
+  assert.equal(splitText(`[3] h\n\n${clip("z".repeat(9000), 3)}`).length, 5)
+  // A bullet list is cut between two items, and the next chunk opens with the numbering paragraph, then the list.
+  const items = Array.from({ length: 40 }, (_, i) => `- 项目 ${i} ${"z".repeat(60)}`).join("\n")
+  const listed = splitText(`[3] OpenCode · 22 / 标题\n\n${items}`, 1000)
+  assert.ok(listed.length >= 3)
+  listed.forEach((p, i) => {
+    if (i) assert.match(p, new RegExp(`^\\[3\\] \\(${i + 1}/${listed.length}\\)\\n\\n- 项目 \\d+ z+(\\n- 项目 \\d+ z+)*$`))
+    else assert.match(p, /^\[3\] OpenCode · 22 \/ 标题 \(1\/\d+\)\n\n- 项目 0 /)
+  })
+  assert.equal(listed.map((p, i) => p.replace(i ? /^\[3\] \(\d+\/\d+\)\n\n/ : /^.*\n\n/, "")).join("\n"), items, "no item is lost or cut")
+  flat(listed)
+  // Not before an indented line (a nested item would open the next chunk as a code block): the unindented break wins.
+  const nested = Array.from({ length: 30 }, (_, i) => `- 项 ${i} ${"n".repeat(30)}\n    - 子项 ${i} ${"m".repeat(30)}`).join("\n")
+  for (const p of splitText(`[3] h\n\n${nested}`, 800).slice(1)) assert.ok(/^\[3\] \(\d+\/\d+\)\n\n- 项 /.test(p), p.slice(0, 40))
 })
 
 test("replyText", () => {
   const a = (...texts) => ({ type: "assistant", content: texts.map((t) => (t ? { type: "text", text: t } : { type: "tool" })) })
   const user = { type: "user", text: "q" }
-  assert.equal(replyText([a(null), a("最终", "回复"), user, a("旧的")]), "最终\n回复")
+  assert.equal(replyText([a(null), a("最终", "回复"), user, a("旧的")]), "最终\n\n回复", "separate text parts are separate paragraphs")
   assert.equal(replyText([a(null), user, a("旧的")]), "")
   assert.equal(replyText([a(null), user, a("旧的")], false), "旧的")
   assert.equal(replyText([{ type: "idle" }, { type: "compaction" }, a("旧的")]), "")
@@ -79,10 +99,11 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("/list"), { type: "list" })
   assert.deepEqual(parseCommand("帮助"), { type: "help" })
   assert.deepEqual(parseCommand("/"), { type: "help" })
-  const sh = slashHelpText("[7] OpenCode · ttool", [{ name: "review", description: "review changes" }, { name: "init" }])
+  const sh = slashHelpText("[7] OpenCode · ttool", [{ name: "review", description: "review changes" }, { name: "init" }, { name: "x", description: "两行\n说明" }])
   assert.ok(sh.includes("当前对话 [7] OpenCode · ttool") && sh.includes("/model") && sh.includes("/stop") && sh.includes("/compact"))
-  assert.ok(sh.includes("/review → review changes") && sh.includes("\n/init"))
+  assert.ok(sh.includes("\n- /review → review changes\n- /init\n- /x → 两行 说明"), "the folder's commands are bullets")
   assert.ok(!slashHelpText(undefined).includes("自带命令"))
+  flat(sh, slashHelpText(), HELP)
   assert.deepEqual(parseCommand("／"), { type: "help" })
   assert.deepEqual(parseCommand(" 3 "), { type: "show", n: 3 })
   assert.deepEqual(parseCommand("3 继续改\n第二行"), { type: "text", n: 3, text: "继续改\n第二行" })
@@ -124,6 +145,23 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("列表里第二个是什么"), { type: "text", text: "列表里第二个是什么" })
   assert.deepEqual(parseCommand("3 y"), { type: "text", n: 3, text: "y" })
   assert.deepEqual(parseCommand("帮助 列表 看看日志"), { type: "text", text: "帮助 列表 看看日志" })
+})
+
+test("帮助: titled sections of one-line bullets", () => {
+  // [title, list, title, list, ...]
+  const blocks = HELP.split("\n\n")
+  // Width in Chinese characters: a phone line holds about 16, and these items must stay near one line.
+  const em = (s) => [...s].reduce((w, c) => w + (c.charCodeAt(0) > 0x2000 ? 1 : c === " " ? 0.3 : 0.55), 0)
+  assert.ok(blocks.length % 2 === 0)
+  blocks.forEach((b, i) => {
+    if (i % 2) assert.ok(b.split("\n").every((l) => l.startsWith("- ") && em(l.slice(2)) <= 18), b)
+    else assert.match(b, /^【[^】]+】$/)
+  })
+  assert.deepEqual(blocks.filter((_, i) => i % 2 === 0).map((t) => t.slice(1, -1)), ["发消息", "看对话", "批准和回答", "文件夹和新对话", "图片", "撤回", "实时推送", "其他"])
+  assert.ok(slashHelpText("[7] OpenCode", [{ name: "init" }]).split("\n").every((l) => !l.startsWith("- ") || em(l.slice(2)) <= 18))
+  // Nothing Markdown could pick up: emphasis, headings, quotes, code.
+  assert.ok(!/[*_`#>]/.test(HELP) && !/[*_`#>]/.test(slashHelpText("[7] OpenCode · ttool")))
+  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend"]) assert.ok(HELP.includes(c), c)
 })
 
 test("imagePaths", () => {
@@ -168,22 +206,26 @@ test("historyLines", () => {
     user(" "),
     user("在吗"),
   ]
-  // Without a tag: plain "[N]" everywhere.
+  // Without a tag: plain "[N]" everywhere. The label is a paragraph of its own; the body goes through untouched.
   assert.deepEqual(historyLines(msgs, 5, 10), [
-    "[5] 你：在吗",
-    "[5] AI：你好",
-    "[5] 你：改一下",
-    "[5] AI：改好了\n（调用了 shell ×2、read）",
+    "[5] 你：\n\n在吗",
+    "[5] AI：\n\n你好",
+    "[5] 你：\n\n改一下",
+    "[5] AI：\n\n改好了\n\n（调用了 shell ×2、read）",
     "[5] 以上是最近 4 条（只找到这么多）",
   ])
   // With one: the first message carries the full tag, the rest the short one.
   const full = "[5] OpenCode · ttool"
-  assert.deepEqual(historyLines(msgs, 5, 2, full), [`${full} 你：改一下`, "[5] AI：改好了\n（调用了 shell ×2、read）", "[5] 以上是最近 2 条"])
+  const two = historyLines(msgs, 5, 2, full)
+  assert.deepEqual(two, [`${full} 你：\n\n改一下`, "[5] AI：\n\n改好了\n\n（调用了 shell ×2、read）", "[5] 以上是最近 2 条"])
+  flat(two)
   assert.deepEqual(historyLines([], 5, 3, full), [`${full} 还没有消息`])
   const many = []
   for (let i = 9; i >= 0; i--) many.push({ type: "assistant", content: [{ type: "text", text: `答${i}` }] }, { type: "user", text: `问${i}` })
   for (const c of [1, 2, 3, 4]) assert.equal(historyLines(many, 5, c).length, c + 1)
-  assert.deepEqual(historyLines(many, 5, 1), ["[5] AI：答9", "[5] 以上是最近 1 条"])
+  assert.deepEqual(historyLines(many, 5, 1), ["[5] AI：\n\n答9", "[5] 以上是最近 1 条"])
+  // A body that starts with a list or a heading is the agent's Markdown and stays as written.
+  assert.deepEqual(historyLines([{ type: "assistant", content: [{ type: "text", text: "# 标题\n\n- 一\n- 二" }] }], 5, 1)[0], "[5] AI：\n\n# 标题\n\n- 一\n- 二")
 })
 
 test("pickDir", () => {
@@ -203,17 +245,34 @@ test("pickDir", () => {
 
 test("codexPushText", () => {
   const h = "[4] Codex · proj / 修登录"
-  assert.equal(codexPushText(h, 4, "done", "好的"), `${h}\n好的`)
-  assert.equal(codexPushText(h, 4, "done", ""), `${h}\n完成（没有文字回复）`)
-  assert.equal(codexPushText(h, 4, "failed", "rate\nlimited"), `${h}\n出错：rate limited`)
-  assert.match(codexPushText(h, 4, "approval", "git push"), /^\[4\] Codex · proj \/ 修登录\n等你批准：git push\n回复「4 y」批准，「4 n」拒绝/)
-  assert.equal(codexPushText(h, 4, "question", "有问题问你：x"), `${h}\n有问题问你：x`)
+  assert.equal(codexPushText(h, 4, "done", "好的"), `${h}\n\n好的`)
+  assert.equal(codexPushText(h, 4, "done", ""), `${h}\n\n完成（没有文字回复）`)
+  assert.equal(codexPushText(h, 4, "failed", "rate\nlimited"), `${h}\n\n出错：rate limited`)
+  const approval = codexPushText(h, 4, "approval", "git push")
+  assert.match(approval, /^\[4\] Codex · proj \/ 修登录\n\n等你批准：git push\n\n回复「4 y」批准，「4 n」拒绝/)
+  assert.equal(codexPushText(h, 4, "question", "有问题问你：x"), `${h}\n\n有问题问你：x`)
+  flat(approval, codexPushText(h, 4, "failed", "x"))
 })
 
 test("mergeLines", () => {
   const rows = [{ updated: 1, line: "a" }, { updated: 3, line: "c" }, { line: "z" }, { updated: 2, line: "b" }]
   assert.deepEqual(mergeLines(rows), ["c", "b", "a", "z"])
   assert.deepEqual(mergeLines(rows, 2), ["c", "b"])
+})
+
+test("列表 and 目录 are bullet lists", () => {
+  const list = listText([
+    { updated: 1, line: "[2] Codex · proj / 修登录 · 空闲" },
+    { updated: 3, line: "[1] OpenCode · ttool / 重构登录模块 · 运行中" },
+  ])
+  assert.equal(list, "- [1] OpenCode · ttool / 重构登录模块 · 运行中\n- [2] Codex · proj / 修登录 · 空闲")
+  assert.equal(listText([]), "没有对话")
+  // 「目录 X」: the listing sits between the line that names the folder and the hint.
+  const cd = `已选中 ttool\n\n${list}\n\n回复「编号 内容」继续旧对话，「新对话 内容」开新对话`
+  const dirs = dirsText(["C:\\a\\ttool", "C:\\a\\读书笔记", "codex:C:\\b\\proj"])
+  assert.equal(dirs, "文件夹：\n\n- 1 ttool\n- 2 读书笔记\n- 3 Codex · proj\n\n回复「目录 编号」选择")
+  assert.equal(dirsText([]), "没有文件夹")
+  flat(list, cd, dirs)
 })
 
 test("inboundText", () => {
@@ -312,11 +371,12 @@ test("image pairing", () => {
   assert.deepEqual(withMedia("看下", live), { text: "看下\n\n微信发来的文件已保存在：\nC:\\x\\r.pdf", images: ["b.png"] })
   assert.deepEqual(withMedia("发", [live[1]]), { text: "请看文件\n\n微信发来的文件已保存在：\nC:\\x\\r.pdf", images: [] })
   assert.deepEqual(withMedia("发", []), { text: "发", images: [] })
-  assert.equal(mediaAck([img("b.png")], "[3]"), "收到图片（共 1 张），接着发文字说明，会一起发给 [3]（不用说明就回「发」）")
-  assert.equal(mediaAck(live, "[3]"), "收到图片和文件（共 1 张图片、1 个文件），接着发文字说明，会一起发给 [3]（不用说明就回「发」）")
+  assert.equal(mediaAck([img("b.png")], "[3]"), "收到图片（共 1 张）\n\n接着发文字说明，会一起发给 [3]（不用说明就回「发」）")
+  assert.equal(mediaAck(live, "[3]"), "收到图片和文件（共 1 张图片、1 个文件）\n\n接着发文字说明，会一起发给 [3]（不用说明就回「发」）")
   assert.match(mediaAck([img("b.png")], undefined), /用「编号 文字」指定/)
   assert.equal(mediaAck([], "[3]", 1), "有 1 个没收到（下载失败）")
-  assert.match(mediaAck([img("b.png")], "[3]", 1), /^有 1 个没收到（下载失败）；收到图片（共 1 张）/)
+  assert.match(mediaAck([img("b.png")], "[3]", 1), /^有 1 个没收到（下载失败）\n\n收到图片（共 1 张）/)
+  flat(mediaAck(live, "[3]"), mediaAck([img("b.png")], "[3]", 1))
 })
 
 test("pickModel / modelLines / chunkLines", () => {
@@ -332,12 +392,25 @@ test("pickModel / modelLines / chunkLines", () => {
   assert.deepEqual(pickModel(ms, "V4 PRO"), [ms[2]])
   assert.deepEqual(pickModel(ms, "gpt"), [])
   assert.deepEqual(modelLines(ms, "yapi2/claude-sonnet-5-5"), [
-    "1. yapi/claude-sonnet-5-5",
-    "2. yapi2/claude-sonnet-5-5 ← 当前",
-    "3. deepseek/deepseek-v4-pro（不看图）",
+    "1 yapi/claude-sonnet-5-5",
+    "2 yapi2/claude-sonnet-5-5 ← 当前",
+    "3 deepseek/deepseek-v4-pro（不看图）",
   ])
   assert.deepEqual(chunkLines(["aaa", "bbb", "ccc"], 7), ["aaa\nbbb", "ccc"])
   assert.deepEqual(chunkLines(["a"]), ["a"])
+  // The model list: header, bullets with visible numbers, footer; one message when it fits.
+  const one = listMessages("[3] 可用模型（共 3 个）：", modelLines(ms, "yapi2/claude-sonnet-5-5"), "回复「/model 编号」切换")
+  assert.deepEqual(one, [
+    "[3] 可用模型（共 3 个）：\n\n- 1 yapi/claude-sonnet-5-5\n- 2 yapi2/claude-sonnet-5-5 ← 当前\n- 3 deepseek/deepseek-v4-pro（不看图）\n\n回复「/model 编号」切换",
+  ])
+  // Too long: the header leads the first message, the footer ends the last, and a split falls between two items.
+  const long = Array.from({ length: 60 }, (_, i) => `${i + 1} provider/model-${"x".repeat(60)}-${i}`)
+  const many = listMessages("头", long, "尾")
+  assert.ok(many.length >= 3 && many.every((m) => m.length <= 1800))
+  assert.ok(many[0].startsWith("头\n\n- 1 ") && many.at(-1).endsWith("\n\n尾") && !many.slice(0, -1).some((m) => m.includes("尾")))
+  assert.ok(many.slice(1).every((m) => m.startsWith("- ")))
+  assert.equal(many.join("\n").match(/^- /gm).length, 60, "no item is lost")
+  flat(one, many)
 })
 
 test("eventKey", () => {
@@ -359,7 +432,7 @@ test("sleep", async () => {
 test("live progress: batching, final push without repeats", () => {
   const info = async () => ({ head: "[3] 22 / x" })
   const tools = new Map([["shell", 3], ["edit", 1]])
-  assert.equal(liveBody([" 第一步 ", "", "第二步"], tools), "第一步\n\n第二步\n（调用了 shell ×3、edit）")
+  assert.equal(liveBody([" 第一步 ", "", "第二步"], tools), "第一步\n\n第二步\n\n（调用了 shell ×3、edit）")
   assert.equal(liveBody([], tools), "", "a tool summary alone waits for text")
   assert.equal(liveDelay(1000, 1000), 15_000)
   assert.equal(liveDelay(1000, 10_000), 6000)
@@ -372,14 +445,14 @@ test("live progress: batching, final push without repeats", () => {
   addText("sL", "第二步", info)
   addTool("sL", "shell", info)
   // Two segments within the window go out as one push.
-  assert.deepEqual(takeLive("sL"), { body: "第一步\n\n第二步\n（调用了 shell ×2）", pushed: false })
+  assert.deepEqual(takeLive("sL"), { body: "第一步\n\n第二步\n\n（调用了 shell ×2）", pushed: false })
   addText("sL", "完成", info)
   const end = takeLive("sL", true)
   assert.deepEqual(end, { body: "完成", pushed: true })
-  assert.equal(doneText("[3] 22 / x", 3, "第一步\n第二步\n完成", end), "[3] 22 / x\n完成", "the final push only has what wasn't sent")
+  assert.equal(doneText("[3] 22 / x", 3, "第一步\n第二步\n完成", end), "[3] 22 / x\n\n完成", "the final push only has what wasn't sent")
   assert.equal(doneText("[3] 22 / x", 3, "完成", { body: "", pushed: true }), "[3] 完成")
-  assert.equal(doneText("[3] 22 / x", 3, "改好了", { body: "改好了", pushed: false }), "[3] 22 / x\n改好了", "a short run is one push, as before")
-  assert.equal(doneText("[3] 22 / x", 3, "", { body: "", pushed: false }), "[3] 22 / x\n完成（没有文字回复）")
+  assert.equal(doneText("[3] 22 / x", 3, "改好了", { body: "改好了", pushed: false }), "[3] 22 / x\n\n改好了", "a short run is one push, as before")
+  assert.equal(doneText("[3] 22 / x", 3, "", { body: "", pushed: false }), "[3] 22 / x\n\n完成（没有文字回复）")
   assert.deepEqual(takeLive("sL"), { body: "", pushed: false }, "the run's entry is gone")
   // Progress off: nothing is kept for a run that pushed nothing; a run that did still gets its rest at the end.
   addText("sOff", "a", info)
@@ -389,8 +462,9 @@ test("live progress: batching, final push without repeats", () => {
   addText("sOn", "b", info)
   assert.deepEqual(takeLive("sOn", true, false), { body: "b", pushed: true })
   // Errors, approvals and questions carry pending progress after their header line.
-  assert.equal(withPre("[3] 22 / x\n等你批准：git push", { body: "第二步" }), "[3] 22 / x\n第二步\n\n等你批准：git push")
-  assert.equal(withPre("[3] 22 / x\n出错：x", { body: "" }), "[3] 22 / x\n出错：x")
+  assert.equal(withPre("[3] 22 / x\n\n等你批准：git push", { body: "第二步" }), "[3] 22 / x\n\n第二步\n\n等你批准：git push")
+  assert.equal(withPre("[3] 22 / x\n\n出错：x", { body: "" }), "[3] 22 / x\n\n出错：x")
+  assert.equal(withPre("[3] h\n\n出错", { body: "花了 $& 和 $1" }), "[3] h\n\n花了 $& 和 $1\n\n出错", "the agent's text is never read as a replacement pattern")
 })
 
 test("实时 command", () => {
@@ -411,7 +485,8 @@ test("实时 command", () => {
   assert.match(liveCmd(s, "a", 1, false), /^\[1\] OpenCode · ttool 的实时推送已关闭/)
   assert.equal(liveOn(s, "a"), false)
   assert.equal(liveOn(s, "b"), true)
-  assert.match(liveCmd(s, "*", undefined), /^实时推送：开（\[1\] OpenCode · ttool 关）/)
+  assert.match(liveCmd(s, "*", undefined), /^实时推送：开（\[1\] OpenCode · ttool 关）\n\n「实时 关」/)
+  flat(liveCmd(s, "*", undefined))
   liveCmd(s, "*", undefined, false)
   assert.deepEqual(s.live, { "*": false }, "the global switch clears per-conversation ones")
   assert.equal(liveOn(s, "a"), false)
@@ -480,9 +555,10 @@ test("撤回 command and plan", () => {
   assert.deepEqual(codexUnsendPlan(turns), { kind: "codex", id: "t2", text: "跑测试", replies: 2 })
   assert.equal(codexUnsendPlan([]), null)
   const long = { kind: "revert", text: "一二三四五六七八九十".repeat(4), replies: 2 }
-  assert.equal(unsendAsk(3, long, true), "[3] 将撤回「一二三四五六七八九十一二三四五六七八九十一二三四五六七八九…」及之后的 2 条回复（会先停止正在运行的回复），确认发「3 撤回 确认」（2 分钟内有效）")
-  assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }), "[3] 将撤回还在排队的「排队中」，确认发「3 撤回 确认」（2 分钟内有效）")
-  assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }, false, "[3] Codex · proj"), "[3] Codex · proj 将撤回还在排队的「排队中」，确认发「3 撤回 确认」（2 分钟内有效）", "the number to type stays plain")
+  assert.equal(unsendAsk(3, long, true), "[3] 将撤回「一二三四五六七八九十一二三四五六七八九十一二三四五六七八九…」及之后的 2 条回复（会先停止正在运行的回复）\n\n确认发「3 撤回 确认」（2 分钟内有效）")
+  assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }), "[3] 将撤回还在排队的「排队中」\n\n确认发「3 撤回 确认」（2 分钟内有效）")
+  assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }, false, "[3] Codex · proj"), "[3] Codex · proj 将撤回还在排队的「排队中」\n\n确认发「3 撤回 确认」（2 分钟内有效）", "the number to type stays plain")
+  flat(unsendAsk(3, long, true))
   assert.equal(revertFiles({ files: [{ file: "C:\\x\\b.txt" }, { file: "keep.txt" }], snapshot: "s" }), "改过的 2 个文件也还原了：b.txt、keep.txt")
   assert.equal(revertFiles({ files: [], snapshot: "s" }), "这几轮没有改文件")
   assert.match(revertFiles({ files: [] }), /没有还原/)

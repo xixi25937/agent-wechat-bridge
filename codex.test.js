@@ -129,7 +129,7 @@ test("bridge: resume, held approval, question, completion, stop", async () => {
     assert.equal(b.approve("t1", true), 0)
     // Step by step: a wrong option is asked again, the first answer is kept on the held request.
     assert.match(b.reply("t1", "C", 4, "[4] Codex · proj"), /^\[4\] Codex · proj 第 1 题：「C」不是选项/)
-    assert.match(b.reply("t1", "1", 4), /^\[4\] 已记下 1\/2，下一个：\n问题 2\/2：密码（保密内容，会经过微信）/)
+    assert.match(b.reply("t1", "1", 4), /^\[4\] 已记下 1\/2，下一个：\n\n问题 2\/2：密码（保密内容，会经过微信）/)
     assert.match(b.reply("t1", "-", 4), /这一题必须回答/)
     assert.match(b.reply("t1", "忽略", 4), /没法忽略/)
     assert.equal(b.reply("t1", "hunter2", 4, "[4] Codex · proj"), "已回答 [4] Codex · proj")

@@ -1,4 +1,6 @@
 // Answering OpenCode forms and Codex questions from WeChat: all at once (one line per question) or one per message.
+import { md, numbered } from "./md.js"
+
 export const YES = /^(y|yes|是|批准|同意)$/i
 export const NO = /^(n|no|否|不|拒绝)$/i
 export const CANCEL = /^(忽略|取消|cancel)$/i
@@ -85,10 +87,10 @@ export function fieldLines(f, i, total) {
     f.secret && "保密内容，会经过微信",
   ].filter(Boolean)
   const head = cut([f.title, f.description].filter(Boolean).join("：") || f.key, 300)
-  return [
+  return md(
     `${total > 1 ? `问题 ${i}/${total}：` : ""}${head}${tags.length ? `（${tags.join("，")}）` : ""}`,
-    ...(f.options ?? []).map((o, k) => `  ${k + 1}. ${cut(o.label, 80)}`),
-  ].join("\n")
+    f.options?.length && numbered(f.options.map((o) => cut(o.label, 80))),
+  )
 }
 
 // Push text for a new form. `cancel`: whether 「N 忽略」 works (OpenCode forms). The question tool's title is
@@ -96,13 +98,11 @@ export function fieldLines(f, i, total) {
 export function formText(form, n, cancel = true) {
   const fs = fieldsOf(form)
   const title = form?.metadata?.kind === "question" ? "" : cut(form?.title, 200)
-  const lines = [`有问题问你：${title}`, ...fs.map((f, i) => fieldLines(f, i + 1, fs.length))]
-  if (fs.length > 1) {
-    const skip = fs.some(optional) ? "；跳过回「-」" : ""
-    lines.push(`回复「${n} 答案」：一次回完就一行一个、按顺序（或「1. 答案」），也可以一条一个${skip}`)
-  } else lines.push(`回复「${n} 答案」${fs[0]?.options?.length ? "（可以回编号）" : ""}`)
-  if (cancel) lines.push(`不想回答发「${n} 忽略」`)
-  return lines.join("\n")
+  const reply =
+    fs.length > 1
+      ? `回复「${n} 答案」：一次回完就一行一个、按顺序（或「1. 答案」），也可以一条一个${fs.some(optional) ? "；跳过回「-」" : ""}`
+      : `回复「${n} 答案」${fs[0]?.options?.length ? "（可以回编号）" : ""}`
+  return md(`有问题问你：${title}`, ...fs.map((f, i) => fieldLines(f, i + 1, fs.length)), reply, cancel && `不想回答发「${n} 忽略」`)
 }
 
 const todo = (form, p) => fieldsOf(form, p.answers).filter((f) => !p.done.includes(f.key))
@@ -147,9 +147,9 @@ export function step(form, progress, text) {
 export function stepText(form, n, r, tag = `[${n}]`) {
   const all = fieldsOf(form, r.progress?.answers)
   const ask = (f) => fieldLines(f, all.indexOf(f) + 1, all.length)
-  if (r.error) return `${tag} ${r.error}${r.field ? `\n${ask(r.field)}` : ""}`
+  if (r.error) return md(`${tag} ${r.error}`, r.field && ask(r.field))
   const k = all.filter((f) => r.progress.done.includes(f.key)).length
-  return `${tag} 已记下 ${k}/${all.length}，下一个：\n${ask(r.next)}\n回复「${n} 答案」`
+  return md(`${tag} 已记下 ${k}/${all.length}，下一个：`, ask(r.next), `回复「${n} 答案」`)
 }
 
 // What a WeChat message does to a pending form; never a prompt. `numbered`: the message had 「N 」 in front;
@@ -158,16 +158,16 @@ export function stepText(form, n, r, tag = `[${n}]`) {
 // starts with it says just "[7]".
 // Returns { cancel }, { reply } (nothing changes), { save, reply } (progress), or { submit: answer }.
 export function formAction(form, progress, text, n, { numbered = true, decision = false, cancel = true, tag = `[${n}]` } = {}) {
-  const wait = cancel ? `\n[${n}] 在等你回答问题，回答或发「${n} 忽略」` : ""
+  const wait = cancel && `[${n}] 在等你回答问题，回答或发「${n} 忽略」`
   const p = progress?.id === form.id ? progress : null
   if (CANCEL.test(text.trim())) {
     if (!cancel) return { reply: `${tag} 这个提问没法忽略，回答它，或发「${n} /stop」停止这一轮` }
     return numbered ? { cancel: true } : { reply: `要忽略 ${tag} 的问题请发「${n} 忽略」` }
   }
   const cur = todo(form, { done: p?.done ?? [], answers: p?.answers ?? {} })[0]
-  if (decision && cur?.type !== "boolean") return { reply: `${tag} 没有待批准的请求${wait}` }
+  if (decision && cur?.type !== "boolean") return { reply: md(`${tag} 没有待批准的请求`, wait) }
   const r = step(form, p, text)
-  if (r.error) return { reply: stepText(form, n, r, tag) + wait }
+  if (r.error) return { reply: md(stepText(form, n, r, tag), wait) }
   if (r.next) return { save: { id: form.id, ...r.progress }, reply: stepText(form, n, r, tag) }
   return { submit: r.progress.answers }
 }

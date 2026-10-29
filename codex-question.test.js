@@ -8,6 +8,7 @@ import {
   answerRequest, asyncAnswer, asyncText, desktopReply, dropQuestion, noteQuestion, openAsks, pendingQuestions, readQuestion, waitQuestion, writeQuestion,
 } from "./codex-question.js"
 import { agent, fakeHistory, sqlite, user } from "./fake-history.js"
+import { looseBreaks } from "./md.js"
 
 // Shapes of the desktop's conversation state: `requests` holds app-server ServerRequests (ToolRequestUserInputParams).
 const ask = (id, questions) => ({ method: "item/tool/requestUserInput", id, params: { threadId: "t1", turnId: "u1", itemId: "i1", questions } })
@@ -88,7 +89,7 @@ test("desktopReply: step by step, then one submit; the state is read back", { sk
   const reply = (t) => desktopReply("t1", t, 4, tg, { dir, pipe: d.pipe, settleMs: 5 })
   const submits = () => d.got.filter((m) => m.method === "thread-follower-submit-user-input")
   noteQuestion(dir, "t1", 4, [7])
-  assert.match(await reply("绿"), /^\[4\] Codex · proj 已记下 1\/2，下一个：\n问题 2\/2：数字：一个数字/, "free text answers a question that allows it")
+  assert.match(await reply("绿"), /^\[4\] Codex · proj 已记下 1\/2，下一个：\n\n问题 2\/2：数字：一个数字\n\n回复「4 答案」$/, "free text answers a question that allows it")
   assert.deepEqual(readQuestion(dir, "t1").progress, { id: 7, done: ["color"], answers: { color: "绿" } })
   assert.deepEqual(submits(), [])
   assert.match(await reply("-"), /这一题必须回答/, "Codex questions can't be skipped")
@@ -114,7 +115,7 @@ test("desktopReply: an option-only question asks again", { skip: process.platfor
   const d = await answering(requests)
   noteQuestion(dir, "t1", 4, [7])
   const reply = (t) => desktopReply("t1", t, 4, "[4]", { dir, pipe: d.pipe, settleMs: 5 })
-  assert.match(await reply("绿"), /^\[4\] 「绿」不是选项，回编号或选项文字\n颜色：喜欢哪个颜色？/)
+  assert.match(await reply("绿"), /^\[4\] 「绿」不是选项，回编号或选项文字\n\n颜色：喜欢哪个颜色？\n\n- 1 红 \(Recommended\)\n- 2 蓝$/)
   assert.equal(d.got.filter((m) => m.method === "thread-follower-submit-user-input").length, 0)
   assert.equal(await reply("蓝"), "已回答 [4]")
   d.close()
@@ -166,11 +167,14 @@ test("openAsks: open until the thread's next user message", skipDb, async () => 
 })
 
 test("asyncText: the whole question, numbered options, the reply hint", () => {
-  assert.equal(asyncText({ questions: OPTS }, 12), "有问题问你：\n再次测试\n  1. 选项一\n  2. 选项二\n  3. 选项三\n回复「12 答案」（可以回编号，也可以直接写答案）")
-  assert.equal(asyncText({ questions: FREE }, 3), "有问题问你：\n几月？\n回复「3 答案」")
+  assert.equal(asyncText({ questions: OPTS }, 12), "有问题问你：\n\n再次测试\n\n- 1 选项一\n- 2 选项二\n- 3 选项三\n\n回复「12 答案」（可以回编号，也可以直接写答案）")
+  assert.equal(asyncText({ questions: FREE }, 3), "有问题问你：\n\n几月？\n\n回复「3 答案」")
   const long = "长".repeat(500)
   assert.ok(asyncText({ questions: [{ title: long, options: null }] }, 3).includes(long), "not cut at 300 characters")
-  assert.equal(asyncText({ questions: [...FREE, ...OPTS] }, 4).split("\n").filter((l) => /^问题 \d\/2：/.test(l)).length, 2)
+  const two = asyncText({ questions: [...FREE, ...OPTS] }, 4)
+  assert.equal(two.split("\n").filter((l) => /^问题 \d\/2：/.test(l)).length, 2)
+  assert.deepEqual(looseBreaks(two), [])
+  assert.deepEqual(looseBreaks(asyncText({ questions: OPTS }, 12)), [])
 })
 
 test("asyncAnswer: options resolve to their text, sent as the window sends an answer", skipDb, async () => {

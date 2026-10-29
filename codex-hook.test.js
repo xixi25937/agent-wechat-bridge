@@ -10,6 +10,10 @@ import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, onQu
 import { fakeDesktop } from "./fake-desktop.js"
 import { agent, fakeHistory, sqlite, user } from "./fake-history.js"
 import { answerCodex, base, readPending, short } from "./index.js"
+import { looseBreaks } from "./md.js"
+
+// WeChat shows a single "\n" as a space; only blank lines and "- " items lay out.
+const flat = (...msgs) => msgs.forEach((m) => assert.deepEqual(looseBreaks(m), [], `single \\n in: ${JSON.stringify(m)}`))
 
 test("codexHead", () => {
   const h = (cwd, t) => codexHead(7, cwd, t, { base, short })
@@ -79,7 +83,8 @@ test("onPermission terminal: short wait, answer or timeout", async () => {
   const p = { session_id: "t", cwd: "C:\\a\\proj", tool_name: "Bash", tool_input: { command: "git push" } }
   // Timeout: no decision, no extra push, the record stays as done so a late 「5 y」 says the computer handled it.
   assert.equal(await onPermission(p, m, { waitS: 0.05, mode: "wait" }), "")
-  assert.match(sent[0], /^\[5\] Codex · proj \/ .+\n等你批准：git push\n回复「5 y」批准，「5 n」拒绝（0.05 秒内/)
+  assert.match(sent[0], /^\[5\] Codex · proj \/ .+\n\n等你批准：git push\n\n回复「5 y」批准，「5 n」拒绝（0.05 秒内/)
+  flat(sent[0])
   assert.equal(sent.length, 1)
   const [late] = readPending(dir)
   assert.ok(late.done)
@@ -151,17 +156,22 @@ test("onStop: an async question is pushed after the final reply, and only while 
   const Q = [{ title: "再次测试", options: ["选项一", "选项二"] }]
   const items = [["st1", 86, user("u1", "再来一次")], ["st1", 92, agent("call_1", "再次测试\n- 选项一\n- 选项二", Q)], ["st1", 96, agent("m1", p.last_assistant_message)]]
   await onStop(p, m, { db: fakeHistory(items) })
-  assert.match(sent[0], /^\[12\] Codex · proj \/ .+\n已发送 3 个选项，请选择其中一个。\n有问题问你：\n再次测试\n  1\. 选项一\n  2\. 选项二\n回复「12 答案」/)
+  assert.match(sent[0], /^\[12\] Codex · proj \/ .+\n\n已发送 3 个选项，请选择其中一个。\n\n有问题问你：\n\n再次测试\n\n- 1 选项一\n- 2 选项二\n\n回复「12 答案」/)
+  flat(sent[0])
   // The question is the whole reply: no 「完成（没有文字回复）」 line in front of it.
   await onStop({ ...p, last_assistant_message: "" }, m, { db: fakeHistory(items) })
-  assert.match(sent[1], /^\[12\] Codex · proj \/ .+\n有问题问你：\n/)
+  assert.match(sent[1], /^\[12\] Codex · proj \/ .+\n\n有问题问你：\n\n/)
   // Answered since (the window's reply is a user message): an ordinary push.
   await onStop(p, m, { db: fakeHistory([...items, ["st1", 105, user("u2", "选项二")]]) })
   assert.ok(!sent[2].includes("有问题问你"))
   assert.match(sent[2], /已发送 3 个选项/)
   // The service that receives the replies isn't running: say so.
   await onStop(p, { ...m, state: () => ({}) }, { db: fakeHistory(items) })
-  assert.match(sent[3], /微信回复收不到，请在电脑上回答）$/)
+  assert.match(sent[3], /\n\n（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上回答）$/)
+  flat(sent[3])
+  // Images too big to send are noted in a paragraph of their own.
+  await onStop(p, { ...m, replyImages: async () => ({ files: [], big: ["a.png"] }) }, { db: fakeHistory([...items, ["st1", 105, user("u2", "选项二")]]) })
+  assert.match(sent[4], /\n\n（图片太大没发：a\.png）$/)
   fs.rmSync(dir, { recursive: true })
 })
 
@@ -193,7 +203,8 @@ test("onQuestion: waits for the window's question, pushes it, leaves a record", 
   const opts = { pipe: d.pipe, tries: 50, gap: 20 }
   assert.equal(await onQuestion(p, m, opts), "[5] ok")
   assert.equal(sent.length, 1)
-  assert.match(sent[0], /^\[5\] Codex · proj \/ .+\n有问题问你：\n问题 1\/2：颜色：喜欢哪个颜色？（也可以直接写答案）\n  1\. 红\n  2\. 蓝\n问题 2\/2：数字：一个数字\n回复「5 答案」：一次回完就一行一个、按顺序（或「1\. 答案」），也可以一条一个\n（电脑上也可以直接答）$/)
+  assert.match(sent[0], /^\[5\] Codex · proj \/ .+\n\n有问题问你：\n\n问题 1\/2：颜色：喜欢哪个颜色？（也可以直接写答案）\n\n- 1 红\n- 2 蓝\n\n问题 2\/2：数字：一个数字\n\n回复「5 答案」：一次回完就一行一个、按顺序（或「1\. 答案」），也可以一条一个\n\n（电脑上也可以直接答）$/)
+  flat(sent[0])
   assert.ok(!/忽略/.test(sent[0]), "a Codex question can't be ignored")
   const rec = readQuestion(dir, "qt1")
   assert.deepEqual([rec.n, rec.requestIds], [5, [7]])
