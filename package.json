@@ -1,5 +1,5 @@
 {
-  "name": "opencode-wechat-notify",
+  "name": "agent-wechat-bridge",
   "version": "0.1.0",
   "description": "WeChat (iLink bot) bridge for coding agents: OpenCode V2 server plugin plus Codex hooks. Push replies, approve, and reply from WeChat.",
   "keywords": ["opencode-plugin", "opencode", "codex", "wechat"],
@@ -16,6 +16,6 @@
   },
   "scripts": {
     "test": "node --test",
-    "send-test": "node -e \"import('./index.js').then(m => m.send(process.argv[1] || 'opencode-wechat-notify 测试')).then(console.log)\""
+    "send-test": "node -e \"import('./index.js').then(m => m.send(process.argv[1] || 'agent-wechat-bridge 测试')).then(console.log)\""
   }
 }

@@ -1,4 +1,4 @@
-# opencode-wechat-notify
+# agent-wechat-bridge
 
 给编程 Agent 用的微信桥：用微信 ClawBot（iLink bot API）接收回复、批准权限、发消息。只用 Node 标准库，没有依赖。
 
@@ -27,7 +27,7 @@ OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚
 
 ```jsonc
 {
-  "plugins": ["C:/path/to/opencode-wechat-notify"]
+  "plugins": ["C:/path/to/agent-wechat-bridge"]
 }
 ```
 
@@ -43,13 +43,13 @@ Codex 桌面端和 `codex` CLI 都读 `~/.codex/hooks.json`。在里面加三个
 {
   "hooks": {
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "node \"C:\\path\\to\\opencode-wechat-notify\\codex-hook.js\" Stop", "timeout": 15 }] }
+      { "hooks": [{ "type": "command", "command": "node \"C:\\path\\to\\agent-wechat-bridge\\codex-hook.js\" Stop", "timeout": 15 }] }
     ],
     "PermissionRequest": [
-      { "hooks": [{ "type": "command", "command": "node \"C:\\path\\to\\opencode-wechat-notify\\codex-hook.js\" PermissionRequest", "timeout": 600, "statusMessage": "等微信批准" }] }
+      { "hooks": [{ "type": "command", "command": "node \"C:\\path\\to\\agent-wechat-bridge\\codex-hook.js\" PermissionRequest", "timeout": 600, "statusMessage": "等微信批准" }] }
     ],
     "PreToolUse": [
-      { "matcher": "request_user_input", "hooks": [{ "type": "command", "command": "node \"C:\\path\\to\\opencode-wechat-notify\\codex-hook.js\" PreToolUse", "timeout": 15 }] }
+      { "matcher": "request_user_input", "hooks": [{ "type": "command", "command": "node \"C:\\path\\to\\agent-wechat-bridge\\codex-hook.js\" PreToolUse", "timeout": 15 }] }
     ]
   }
 }
