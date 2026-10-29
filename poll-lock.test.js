@@ -152,3 +152,39 @@ test("index.js takes poll.lock only when eligible", async () => {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test("three processes: exactly one holds the lock, and another takes over when it is killed", async () => {
+  const dir = tmp()
+  const lockUrl = pathToFileURL(path.resolve("poll-lock.js")).href
+  // Each child reports "held" / "lost" on stdout; short intervals keep the test fast.
+  const code = `import { pollLock } from ${JSON.stringify(lockUrl)}
+    const l = pollLock(process.argv[1], { beatMs: 150, staleMs: 1500, standbyMs: 200,
+      onHeld: () => console.log("held"), onLost: () => console.log("lost") })
+    l.start(); setInterval(() => {}, 1000)`
+  const kids = [0, 1, 2].map(() => {
+    const p = spawn(process.execPath, ["--input-type=module", "-e", code, dir], { stdio: ["ignore", "pipe", "inherit"] })
+    p.held = false
+    p.stdout.on("data", (d) => {
+      for (const w of String(d).split(/\s+/)) if (w === "held") p.held = true
+      else if (w === "lost") p.held = false
+    })
+    return p
+  })
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+  const holders = () => kids.filter((k) => k.exitCode === null && !k.killed && k.held)
+  try {
+    for (let i = 0; i < 50 && holders().length !== 1; i++) await wait(100)
+    assert.equal(holders().length, 1, "one holder")
+    for (let i = 0; i < 10; i++) (await wait(100), assert.ok(holders().length <= 1, "never two"))
+    const first = holders()[0]
+    first.kill("SIGKILL") // no cleanup: the others must notice the dead pid
+    for (let i = 0; i < 60 && holders().length !== 1; i++) await wait(100)
+    assert.equal(holders().length, 1, "taken over")
+    assert.notEqual(holders()[0], first)
+    assert.equal(readLock(dir).pid, holders()[0].pid)
+  } finally {
+    for (const k of kids) k.kill("SIGKILL")
+    await wait(200)
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

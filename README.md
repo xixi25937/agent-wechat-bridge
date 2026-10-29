@@ -39,7 +39,15 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 
    Add `--dry-run` to preview without writing, `--opencode-only` or `--codex-only` to do half.
 
-3. **Finish by hand.** In a terminal run `codex`, type `/hooks` and trust the three new hooks (untrusted hooks are skipped). Restart OpenCode (`opencode service restart`, or quit and reopen the desktop app). Then send `帮助` or `/help` to the bot.
+   | You use | What receives your WeChat messages | What setup installs |
+   | --- | --- | --- |
+   | OpenCode only | the OpenCode plugin, while OpenCode runs | plugin |
+   | Codex only | a small background daemon, started at login | Codex hooks + daemon |
+   | Both | the OpenCode plugin; add `--daemon` to also receive messages while OpenCode is closed | plugin + Codex hooks (+ daemon) |
+
+   The daemon is `node daemon.js` (also `agent-wechat-bridge daemon`), started at login by a hidden launcher in the Windows Startup folder, a LaunchAgent on macOS or a systemd user unit on Linux. Only one process receives WeChat messages at a time: whoever holds `~/.cli-bridge/poll.lock` (heartbeat every 15 s; a dead holder is replaced within about a minute), so the plugin and the daemon can both run. `--no-daemon` skips it, `setup --uninstall-daemon` removes it and stops it.
+
+3. **Finish by hand.** In a terminal run `codex`, type `/hooks` and trust the three new hooks (untrusted hooks are skipped). If you use OpenCode, restart it (`opencode service restart`, or quit and reopen the desktop app). Then send `帮助` or `/help` to the bot.
 
 ### Other ways to install
 
@@ -50,12 +58,12 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 
 ## Limitations
 
-- Needs OpenCode 2.x (V2 plugin API) and Node.js 20.3 or newer. Reading Codex session titles needs Node 22.5 or newer.
-- Developed and used on Windows. Other platforms are untested.
+- Needs Node.js 20.3 or newer, and OpenCode 2.x (V2 plugin API) if you use OpenCode. Reading Codex session titles needs Node 22.5 or newer.
+- Developed and used on Windows. Other platforms are untested (the macOS and Linux autostart entries are unit-tested only).
 - WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/help`), and `/model`, `/stop`, `/compact` work as written.
 - Only messages from the WeChat account that logged in the bot are handled. Anyone who controls that account, or can read `~/.cli-bridge`, can run commands and approve permissions through your agents. Keep the phone and those files safe.
 - WeChat limits bots (from third-party implementations, not official documentation): about 10 bot messages after each message you send, and a `context_token` that expires after about 24 hours. Sending the bot any message resets both.
-- WeChat commands, including Codex ones, are executed by the OpenCode background service, so the OpenCode desktop app or `opencode serve --service` must be running. Do not run cli-chat-bridge's `wechat-opencode` daemon at the same time; both would fight over the same bot's messages.
+- WeChat commands are executed by whichever process holds the poll lock: the OpenCode background service, or the daemon. Without OpenCode running, the daemon still handles Codex; replies about OpenCode conversations say OpenCode isn't running. Do not run cli-chat-bridge's `wechat-opencode` daemon at the same time; both would fight over the same bot's messages.
 - Controlling the Codex desktop window uses its undocumented `codex-ipc` pipe, checked against desktop version 26.1023. A desktop upgrade can break it; terminal and background-run conversations are unaffected.
 - `opencode --standalone`: pushes work, other features are unverified.
 
@@ -75,11 +83,21 @@ License: MIT. Tests: `npm test` (no network, nothing is sent to WeChat).
 | Codex 桌面端 | ✓ | ✓（电脑和微信都能批） | ✓ | ✓（电脑和微信都能答，要多一个 hook，见下） |
 | Codex 终端（`codex`） | ✓ | ✓（微信只等 60 秒，见下） | ✓（终端没在跑这个对话时） | ✗（终端里的提问只能在终端回答） |
 
-OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚本（`codex-hook.js`）加插件里的 Codex 模块（`codex.js`、桌面提问 `codex-question.js`），两边共用编号和微信登录。**微信里的所有命令（包括 Codex 的）都由 OpenCode 后台服务执行，OpenCode 桌面端或后台服务要开着。**
+OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚本（`codex-hook.js`）加 Codex 模块（`codex.js`、桌面提问 `codex-question.js`），两边共用编号和微信登录。
+
+**谁来接收你在微信里发的消息：**
+
+| 你用的 | 接收微信消息的 | `setup` 装什么 |
+| --- | --- | --- |
+| 只用 OpenCode | OpenCode 插件（OpenCode 开着时） | 插件 |
+| 只用 Codex | 一个小的后台程序 `daemon.js`，开机自动启动 | Codex hook + 后台程序 |
+| 两个都用 | OpenCode 插件；加 `--daemon` 后，OpenCode 关着时由后台程序接收 | 插件 + Codex hook（+ 后台程序） |
+
+同一时间只有一个程序接收微信消息：谁拿到 `~/.cli-bridge/poll.lock` 谁收（每 15 秒更新一次心跳，拿着的程序退出后，约一分钟内由另一个接手），所以插件和后台程序可以同时开着。只有后台程序在收、OpenCode 没开时，Codex 对话照常能用，发给 OpenCode 对话的消息会回「OpenCode 没在运行」。
 
 ## 前提
 
-- Node.js 20.3 以上（OpenCode 插件跑在 OpenCode 里；Codex hook 用系统的 `node` 运行，读 Codex 会话标题要 Node 22.5 以上，否则标题显示「未命名会话」），OpenCode 2.x 桌面端（后台服务 `opencode serve --service`）。
+- Node.js 20.3 以上（OpenCode 插件跑在 OpenCode 里；Codex hook 和后台程序用系统的 `node` 运行，读 Codex 会话标题要 Node 22.5 以上，否则标题显示「未命名会话」）。用 OpenCode 的话要 OpenCode 2.x（后台服务 `opencode serve --service`）。
 - 先用 [cli-chat-bridge](https://www.npmjs.com/package/cli-chat-bridge)（AGPL，独立的包，不随本项目分发）的 `wechat-setup` 登录微信机器人：`npx -p cli-chat-bridge wechat-setup`，扫码后给机器人发一条消息。插件只读取它保存的凭据，不会改写：
   - `~/.cli-bridge/account.json`
   - `~/.cli-bridge/context_tokens.json`
@@ -93,6 +111,7 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 ```
 
 - `--dry-run`：只打印要做的改动，不写任何文件。`--opencode-only` / `--codex-only`：只配一边。
+- 后台程序：没装 OpenCode 时自动装上并立刻启动（Windows 是「启动」文件夹里一个隐藏窗口的 `.vbs`，macOS 是 LaunchAgent，Linux 是 systemd 用户服务）。装了 OpenCode 时要加 `--daemon` 才装。`--no-daemon` 不装，`setup --uninstall-daemon` 删掉开机启动并停掉正在运行的后台程序。手动运行：`npx agent-wechat-bridge daemon` 或 `node daemon.js`。
 - 它不会替你登录微信（没找到 `~/.cli-bridge/account.json` 时会告诉你命令），也不会替你信任 Codex hook 和重启 OpenCode，做完会提示这两步。
 - `npx` 的运行目录是 npm 的临时缓存，之后会被清掉，所以 `npx` 方式会把运行文件复制到 `~/.cli-bridge/agent-wechat-bridge/` 再登记这个目录，更新时再运行一次 `npx agent-wechat-bridge@latest setup`。想用固定目录：`npm i -g agent-wechat-bridge` 后运行 `agent-wechat-bridge setup`，登记的是全局安装目录。
 - 只装 OpenCode 插件的话，也可以把 npm 包名写进 `plugins`（`"agent-wechat-bridge"`，OpenCode 自己下载；或运行 `opencode plugin add agent-wechat-bridge`）。Codex 的 hook 需要一个固定目录，所以仍然用上面的命令，或按下面手动配置。
@@ -319,7 +338,7 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 - **安全**：只处理机器人登录账号本人（`account.json` 里的 `userId`）发来的消息，其他人发的一律忽略。但能用这个微信号、或能拿到 `~/.cli-bridge` 里凭据的人，就能让 OpenCode 执行命令、批准权限。保管好手机和这些文件。
 - 不要同时运行 cli-chat-bridge 的 `wechat-opencode` 守护进程。两边会抢同一个机器人的消息。
 - 微信的 context_token 大约 24 小时后过期。很久没给机器人发消息时推送会失败（日志里出现 `ret=-2`）。随便给机器人发一条消息就会刷新。
-- 只有桌面端后台服务接收微信消息（Codex 的命令也由它执行），其他 `opencode serve` 进程只推送。想让别的进程收消息，可以设置 `WECHAT_NOTIFY_POLL=1`，但同一时间只能有一个进程在收。
+- 接收微信消息的是拿到 `~/.cli-bridge/poll.lock` 的那个程序：OpenCode 桌面端后台服务，或者后台程序 `daemon.js`。其他 `opencode serve` 进程只推送；设置 `WECHAT_NOTIFY_POLL=1` 后它们也会参与抢锁，`WECHAT_NOTIFY_POLL=0` 则从不接收。不管怎么设，同一时间只有一个程序在收。
 - 插件自己的状态（编号、对话所在目录、收消息游标、最新的 context_token）存在 `~/.cli-bridge/opencode-wechat-notify.json`，OpenCode 和 Codex 共用（Codex 对话的键是 `codex:<线程 id>`）。可以用环境变量 `WECHAT_NOTIFY_DIR` 换目录。
 - `opencode --standalone` 的对话会推送，但微信里的 `N 内容`、`N y` 等命令由后台服务执行。后台服务能读到这个对话（数据库共用），可私有服务里等待中的批准请求它大概率管不到。要在微信里操作就别加 `--standalone`。
 - 桌面端的 `\\.\pipe\codex-ipc` 是 Codex 桌面端内部用的接口，没有公开文档，参数是从桌面端 26.1023 版本里读出来的（回答提问用的 `thread-follower-submit-user-input`、窗口状态里的提问 `item/tool/requestUserInput` 也是；`PreToolUse` 对 `request_user_input` 会触发，这一点用 codex-cli 0.165.0 的 `codex exec` 实测过，窗口里真实提问的形状只对照过桌面端源码）。桌面端升级后如果微信发消息、批准或回答提问对桌面窗口不起作用，回复里会带出错原因，在电脑上操作即可（终端和后台运行的对话不受影响）。
