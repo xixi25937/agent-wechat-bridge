@@ -487,7 +487,7 @@ if (!(g.progress instanceof Map)) g.progress = new Map()
 // State lives on disk and is re-read every time: several OpenCode server processes load this plugin and share it.
 // ponytail: read-modify-write without a lock, fine for a few writes a minute; two processes numbering a new
 // session in the same instant can still lose one mapping. A file lock fixes that if it ever shows up.
-export const state = () => ({ next: 1, nums: {}, ...readJson(STATE_FILE) })
+export const state = () => ({ nums: {}, ...readJson(STATE_FILE) })
 export function update(fn) {
   const s = state()
   fn(s)
@@ -502,8 +502,15 @@ export function update(fn) {
   return s
 }
 // Keys are OpenCode session ids, or `codex:<threadId>` for Codex threads; both share one numbering.
+// A number freed by removing its key from nums is handed out again; old state files may still carry an unused `next`.
+export function lowestFree(nums) {
+  const used = new Set(Object.values(nums))
+  let n = 1
+  while (used.has(n)) n++
+  return n
+}
 export function numOf(sessionID) {
-  return state().nums[sessionID] ?? update((s) => (s.nums[sessionID] ??= s.next++)).nums[sessionID]
+  return state().nums[sessionID] ?? update((s) => (s.nums[sessionID] ??= lowestFree(s.nums))).nums[sessionID]
 }
 const sessionOf = (n) => Object.entries(state().nums).find(([, v]) => v === n)?.[0]
 

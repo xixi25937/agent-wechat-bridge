@@ -4,7 +4,7 @@ import crypto from "node:crypto"
 import { test } from "node:test"
 import {
   PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, doneText, eventKey, extOf, format, historyLines,
-  imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, liveOn, mediaAck, mergeLines, modelLines, parseCommand, pickDir,
+  imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, lowestFree, liveOn, mediaAck, mergeLines, modelLines, parseCommand, pickDir,
   pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk, unsendPlan, withMedia, withPre,
 } from "./index.js"
 
@@ -411,6 +411,18 @@ test("实时 command", () => {
   liveCmd(s, "b", 2, true)
   assert.equal(liveOn(s, "b"), true)
   assert.equal(liveCmd(s, "b", 2), "[2] 实时推送：开")
+})
+
+test("lowestFree hands out the lowest unused number", () => {
+  assert.equal(lowestFree({}), 1, "empty state starts at 1")
+  assert.equal(lowestFree({ a: 1, b: 2 }), 3)
+  const nums = { a: 2, b: 4, c: 5 }
+  const got = []
+  for (const k of ["x", "y", "z", "w"]) got.push((nums[k] = lowestFree(nums)))
+  assert.deepEqual(got, [1, 3, 6, 7], "gaps are filled in order")
+  assert.deepEqual([nums.a, nums.b, nums.c], [2, 4, 5], "existing numbers stay")
+  delete nums.x
+  assert.equal(lowestFree(nums), 1, "a removed key frees its number")
 })
 
 test("撤回 command and plan", () => {
