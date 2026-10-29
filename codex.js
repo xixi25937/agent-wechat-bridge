@@ -301,8 +301,9 @@ export function approvalSummary(req) {
 }
 
 // Runs the turns WeChat starts on threads the desktop doesn't have loaded, and reports them itself through
-// push(threadId, kind, text) with kind "approval" | "question" | "done" | "failed": hooks may be untrusted for this
-// app-server, and codex-hook.js skips threads with a bridge marker so nothing is pushed twice.
+// push(threadId, kind, text) with kind "approval" | "question" | "done" | "failed" | "info", plus "text" (a finished
+// agent message), "tool" (a tool item's name) and "end" (an interrupted turn) for live progress: hooks may be
+// untrusted for this app-server, and codex-hook.js skips threads with a bridge marker so nothing is pushed twice.
 export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-server"] }) {
   let server = null
   let idle = null
@@ -340,7 +341,11 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       return
     }
     if (m.method === "turn/started" && held && p.turn?.id) turnIds.set(p.threadId, p.turn.id)
-    if (m.method === "item/completed" && held && p.item?.type === "agentMessage" && p.item.text) last.set(p.threadId, p.item.text)
+    if (m.method === "item/completed" && held && p.item?.type === "agentMessage" && p.item.text) {
+      last.set(p.threadId, p.item.text)
+      push(p.threadId, "text", p.item.text)
+    }
+    if (m.method === "item/started" && held && TOOL[p.item?.type]) push(p.threadId, "tool", TOOL[p.item.type](p.item))
     if (m.method === "serverRequest/resolved" && held) active.set(p.threadId, held.filter((r) => r.id !== p.requestId))
     if (m.method === "turn/completed" && held) {
       const compacted = compacting.has(p.threadId)
@@ -349,6 +354,7 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       last.delete(p.threadId)
       if (p.turn?.status === "failed") push(p.threadId, "failed", p.turn.error?.message ?? "未知错误")
       else if (p.turn?.status === "completed") push(p.threadId, compacted ? "info" : "done", compacted ? "上下文已压缩" : reply)
+      else push(p.threadId, "end", "")
       server?.call("thread/unsubscribe", { threadId: p.threadId }).catch(() => {})
       touch()
     }
@@ -418,6 +424,17 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
         clearActive(threadId)
         s.call("thread/unsubscribe", { threadId }).catch(() => {})
         throw e
+      }
+    },
+    // Drops turn `turnId` and every later one from the thread's history; files are not touched (see ThreadRevertParams).
+    async revert(threadId, turnId) {
+      if (active.has(threadId)) throw new Error("这个对话正在运行，先停止再撤回")
+      const s = await ensure()
+      await resume(s, threadId)
+      try {
+        await s.call("thread/revert", { threadId, beforeTurnId: turnId })
+      } finally {
+        s.call("thread/unsubscribe", { threadId }).catch(() => {})
       }
     },
     async models() {

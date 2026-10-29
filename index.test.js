@@ -3,8 +3,9 @@ import { getEventListeners } from "node:events"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
-  PAIR_MS, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, eventKey, extOf, format, historyLines, imagePaths, inboundMedia,
-  inboundText, liveMedia, mediaAck, mergeLines, modelLines, parseCommand, pickDir, pickModel, replyText, sessionIDOf, shouldSend, sleep, withMedia,
+  PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, doneText, eventKey, extOf, format, historyLines,
+  imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, liveOn, mediaAck, mergeLines, modelLines, parseCommand, pickDir,
+  pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk, unsendPlan, withMedia, withPre,
 } from "./index.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
@@ -34,8 +35,30 @@ test("format", () => {
 
 test("clip", () => {
   assert.equal(clip(" hi "), "hi")
-  const long = clip("x".repeat(2000))
-  assert.ok(long.startsWith("x".repeat(1500) + "\n…（已截断，共 2000 字"))
+  assert.equal(clip("x".repeat(8000)), "x".repeat(8000))
+  assert.equal(clip("x".repeat(9000), 3), "x".repeat(8000) + "\n…（还有 1000 字，发「3 历史 1」或看桌面端）")
+  assert.equal(clip("x".repeat(9000)).slice(8000), "\n…（还有 1000 字，看桌面端）")
+})
+
+test("splitText", () => {
+  assert.deepEqual(splitText("[3] a / b\nhi"), ["[3] a / b\nhi"])
+  // Paragraph breaks win, then line breaks; numbering goes on the header line and after the [N] tag.
+  const para = "x".repeat(700)
+  const parts = splitText(`[3] 22 / 标题\n${[para, para, para, para].join("\n\n")}`, 1800)
+  assert.equal(parts.length, 2)
+  assert.ok(parts[0].startsWith("[3] 22 / 标题 (1/2)\n"))
+  assert.ok(parts[0].endsWith(para) && !parts[0].endsWith("\n"))
+  assert.equal(parts[1], `[3] (2/2)\n${para}\n\n${para}`)
+  const lines = Array.from({ length: 50 }, (_, i) => `第 ${i} 行 ${"y".repeat(60)}`).join("\n")
+  const byLine = splitText(lines, 1000)
+  assert.ok(byLine.length >= 4 && byLine.every((p) => p.length <= 1000 + 12))
+  assert.equal(byLine.map((p, i) => p.replace(i ? /^\(\d+\/\d+\)\n/ : / \(1\/\d+\)$/m, "")).join("\n"), lines, "nothing is lost")
+  // No break at all: a hard cut that never splits an emoji's surrogate pair.
+  const hard = splitText("a" + "😀".repeat(20), 10).map((p, i) => p.replace(i ? /^\(\d+\/\d+\)\n/ : / \(1\/\d+\)$/, ""))
+  assert.equal(hard.join(""), "a" + "😀".repeat(20))
+  assert.ok(hard.every((p) => !/[\ud800-\udbff]$/.test(p) && !/^[\udc00-\udfff]/.test(p)))
+  // The longest push: a capped 8000-character reply is five chunks.
+  assert.equal(splitText(`[3] h\n${clip("z".repeat(9000), 3)}`).length, 5)
 })
 
 test("replyText", () => {
@@ -325,6 +348,104 @@ test("sleep", async () => {
   const pending = sleep(60_000, c.signal)
   c.abort()
   assert.equal(await pending, undefined)
+})
+
+test("live progress: batching, final push without repeats", () => {
+  const info = async () => ({ head: "[3] 22 / x" })
+  const tools = new Map([["shell", 3], ["edit", 1]])
+  assert.equal(liveBody([" 第一步 ", "", "第二步"], tools), "第一步\n\n第二步\n（调用了 shell ×3、edit）")
+  assert.equal(liveBody([], tools), "", "a tool summary alone waits for text")
+  assert.equal(liveDelay(1000, 1000), 15_000)
+  assert.equal(liveDelay(1000, 10_000), 6000)
+  assert.equal(liveDelay(1000, 30_000), 0)
+  // Ten plugin instances get the same event; only the first one records the segment.
+  const ev = { id: "evt_live_1", type: "session.text.ended", data: { sessionID: "sL", text: "第一步" } }
+  for (let i = 0; i < 10; i++) if (shouldSend(eventKey(ev))) addText("sL", ev.data.text, info)
+  addTool("sL", "shell", info)
+  addText("sL", "  ", info)
+  addText("sL", "第二步", info)
+  addTool("sL", "shell", info)
+  // Two segments within the window go out as one push.
+  assert.deepEqual(takeLive("sL"), { body: "第一步\n\n第二步\n（调用了 shell ×2）", pushed: false })
+  addText("sL", "完成", info)
+  const end = takeLive("sL", true)
+  assert.deepEqual(end, { body: "完成", pushed: true })
+  assert.equal(doneText("[3] 22 / x", 3, "第一步\n第二步\n完成", end), "[3] 22 / x\n完成", "the final push only has what wasn't sent")
+  assert.equal(doneText("[3] 22 / x", 3, "完成", { body: "", pushed: true }), "[3] 完成")
+  assert.equal(doneText("[3] 22 / x", 3, "改好了", { body: "改好了", pushed: false }), "[3] 22 / x\n改好了", "a short run is one push, as before")
+  assert.equal(doneText("[3] 22 / x", 3, "", { body: "", pushed: false }), "[3] 22 / x\n完成（没有文字回复）")
+  assert.deepEqual(takeLive("sL"), { body: "", pushed: false }, "the run's entry is gone")
+  // Progress off: nothing is kept for a run that pushed nothing; a run that did still gets its rest at the end.
+  addText("sOff", "a", info)
+  assert.deepEqual(takeLive("sOff", true, false), { body: "", pushed: false })
+  addText("sOn", "a", info)
+  takeLive("sOn")
+  addText("sOn", "b", info)
+  assert.deepEqual(takeLive("sOn", true, false), { body: "b", pushed: true })
+  // Errors, approvals and questions carry pending progress after their header line.
+  assert.equal(withPre("[3] 22 / x\n等你批准：git push", { body: "第二步" }), "[3] 22 / x\n第二步\n\n等你批准：git push")
+  assert.equal(withPre("[3] 22 / x\n出错：x", { body: "" }), "[3] 22 / x\n出错：x")
+})
+
+test("实时 command", () => {
+  assert.deepEqual(parseCommand("实时 关"), { type: "live", on: false })
+  assert.deepEqual(parseCommand("实时开"), { type: "live", on: true })
+  assert.deepEqual(parseCommand("/live off"), { type: "live", on: false })
+  assert.deepEqual(parseCommand("/LIVE on"), { type: "live", on: true })
+  assert.deepEqual(parseCommand("5 实时 关"), { type: "live", n: 5, on: false })
+  assert.deepEqual(parseCommand("5 /live on"), { type: "live", n: 5, on: true })
+  assert.deepEqual(parseCommand("实时"), { type: "live" })
+  assert.deepEqual(parseCommand("/live"), { type: "live" })
+  assert.deepEqual(parseCommand("/live maybe"), { type: "help" })
+  assert.deepEqual(parseCommand("实时更新一下文档"), { type: "text", text: "实时更新一下文档" })
+  assert.deepEqual(parseCommand("5 实时关掉了吗"), { type: "text", n: 5, text: "实时关掉了吗" })
+  const s = { nums: { a: 1, b: 2 } }
+  assert.equal(liveOn(s, "a"), true, "on by default")
+  assert.match(liveCmd(s, "a", 1, false), /\[1\] 的实时推送已关闭/)
+  assert.equal(liveOn(s, "a"), false)
+  assert.equal(liveOn(s, "b"), true)
+  assert.match(liveCmd(s, "*", undefined), /^实时推送：开（\[1\] 关）/)
+  liveCmd(s, "*", undefined, false)
+  assert.deepEqual(s.live, { "*": false }, "the global switch clears per-conversation ones")
+  assert.equal(liveOn(s, "a"), false)
+  liveCmd(s, "b", 2, true)
+  assert.equal(liveOn(s, "b"), true)
+  assert.equal(liveCmd(s, "b", 2), "[2] 实时推送：开")
+})
+
+test("撤回 command and plan", () => {
+  assert.deepEqual(parseCommand("撤回"), { type: "unsend" })
+  assert.deepEqual(parseCommand("3 撤回"), { type: "unsend", n: 3 })
+  assert.deepEqual(parseCommand("撤回 3"), { type: "unsend", n: 3 })
+  assert.deepEqual(parseCommand("/unsend 3"), { type: "unsend", n: 3 })
+  assert.deepEqual(parseCommand("3 /unsend"), { type: "unsend", n: 3 })
+  assert.deepEqual(parseCommand("3 撤回 确认"), { type: "unsend", n: 3, confirm: true })
+  assert.deepEqual(parseCommand("撤回 3 确认"), { type: "unsend", n: 3, confirm: true })
+  assert.deepEqual(parseCommand("撤回确认"), { type: "unsend", confirm: true })
+  assert.deepEqual(parseCommand("/unsend 3 confirm"), { type: "unsend", n: 3, confirm: true })
+  assert.deepEqual(parseCommand("/unsend abc"), { type: "help" })
+  assert.deepEqual(parseCommand("撤回上一步的修改"), { type: "text", text: "撤回上一步的修改" })
+  assert.deepEqual(parseCommand("3 撤回刚才的提交"), { type: "text", n: 3, text: "撤回刚才的提交" })
+  assert.equal(parseCommand("3 撤回 4").type, "text", "two numbers is not a command")
+  const a = (t) => ({ type: "assistant", content: t ? [{ type: "text", text: t }] : [{ type: "tool", name: "shell" }] })
+  const msgs = [a("好"), a(""), a("先看看"), { type: "user", id: "msg_2", text: "改一下" }, a("旧"), { type: "user", id: "msg_1", text: "旧问题" }]
+  assert.deepEqual(unsendPlan(msgs, []), { kind: "revert", id: "msg_2", text: "改一下", replies: 2 })
+  const inbox = [{ type: "compaction", id: "x" }, { type: "user", id: "msg_3", payload: { text: "排队中" } }, { type: "synthetic", id: "y" }]
+  assert.deepEqual(unsendPlan(msgs, inbox), { kind: "inbox", id: "msg_3", text: "排队中", replies: 0 }, "a queued message goes first")
+  assert.equal(unsendPlan([a("hi")], []), null)
+  const turns = [
+    { id: "t3", items: [{ type: "agentMessage", text: "压缩完了" }] },
+    { id: "t2", items: [{ type: "userMessage", content: [{ type: "text", text: "跑测试" }] }, { type: "commandExecution" }, { type: "agentMessage", text: "过了" }] },
+    { id: "t1", items: [{ type: "userMessage", content: [{ type: "text", text: "旧" }] }] },
+  ]
+  assert.deepEqual(codexUnsendPlan(turns), { kind: "codex", id: "t2", text: "跑测试", replies: 2 })
+  assert.equal(codexUnsendPlan([]), null)
+  const long = { kind: "revert", text: "一二三四五六七八九十".repeat(4), replies: 2 }
+  assert.equal(unsendAsk(3, long, true), "[3] 将撤回「一二三四五六七八九十一二三四五六七八九十一二三四五六七八九…」及之后的 2 条回复（会先停止正在运行的回复），确认发「3 撤回 确认」（2 分钟内有效）")
+  assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }), "[3] 将撤回还在排队的「排队中」，确认发「3 撤回 确认」（2 分钟内有效）")
+  assert.equal(revertFiles({ files: [{ file: "C:\\x\\b.txt" }, { file: "keep.txt" }], snapshot: "s" }), "改过的 2 个文件也还原了：b.txt、keep.txt")
+  assert.equal(revertFiles({ files: [], snapshot: "s" }), "这几轮没有改文件")
+  assert.match(revertFiles({ files: [] }), /没有还原/)
 })
 
 test("debounce", () => {

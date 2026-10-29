@@ -68,7 +68,7 @@ async function onStop(p, m) {
   const n = m.numOf(key)
   const reply = p.last_assistant_message ?? ""
   const { files, big } = await m.replyImages(reply, cleanDir(p.cwd))
-  let text = `${codexHead(n, p.cwd, thread, m)}\n${m.clip(reply) || NO_TEXT}`
+  let text = `${codexHead(n, p.cwd, thread, m)}\n${m.clip(reply, n) || NO_TEXT}`
   if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
   m.update((s) => (s.last = key))
   console.error(`${new Date().toISOString()} Stop [${n}] ${await m.send(text)}`)

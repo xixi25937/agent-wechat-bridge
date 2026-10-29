@@ -18,6 +18,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return p.threadId === "busy" ? out({ id: m.id, error: { code: -32600, message: "thread busy already has a live local writer" } }) : ok({ thread: { id: p.threadId } })
     case "thread/start":
       return ok({ thread: { id: "new-thread" } })
+    case "thread/revert":
+      return p.beforeTurnId === "turn1" ? ok({ thread: { id: p.threadId, turns: [] } }) : out({ id: m.id, error: { code: -32600, message: "unknown turn" } })
     case "model/list":
       return ok({ data: [{ id: "m1", model: "m1", displayName: "M1", hidden: false, inputModalities: ["text", "image"] }], nextCursor: null })
     case "thread/compact/start":

@@ -163,14 +163,16 @@ test("bridge: resume, held approval, question, completion, stop", async () => {
     assert.deepEqual(pushed[1], ["t1", "approval", "git push（推送）"])
     assert.equal(b.approve("t1", true), 1)
     await until(() => !b.running("t1"))
-    assert.deepEqual(pushed[2], ["t1", "done", "好的"])
+    // Each finished agent message is reported for live progress, then the turn's end with the last one.
+    assert.deepEqual(pushed[2], ["t1", "text", "好的"])
+    assert.deepEqual(pushed[3], ["t1", "done", "好的"])
     assert.ok(!fs.existsSync(bridgeMarker(dir, "t1")))
     // The fake fails resume for this id, like a thread a terminal is writing.
     await assert.rejects(b.send("busy", "x"), /正在电脑上打开/)
     assert.equal(b.running("busy"), false)
     assert.equal(await b.create("C:\\x", "hi"), "new-thread")
     // Images and model go into turn/start; /stop interrupts the turn we started; /compact runs as its own turn.
-    const of = (id) => pushed.filter((p) => p[0] === id)
+    const of = (id) => pushed.filter((p) => p[0] === id && p[1] !== "text")
     await b.send("echo", "看图", { images: ["C:\\a.png"], model: "m1" })
     await until(() => of("echo").length)
     assert.equal(of("echo")[0][1], "done")
@@ -180,10 +182,14 @@ test("bridge: resume, held approval, question, completion, stop", async () => {
     await b.send("slow", "数到 300")
     assert.equal(await b.interrupt("slow"), true)
     await until(() => !b.running("slow"))
-    assert.deepEqual(of("slow"), [], "an interrupted turn pushes nothing")
+    assert.deepEqual(of("slow"), [["slow", "end", ""]], "an interrupted turn only drops its live progress")
     await b.compact("t1")
     await until(() => of("t1").length === 4)
     assert.deepEqual(of("t1")[3], ["t1", "info", "上下文已压缩"])
+    // 「撤回」: thread/revert before the given turn; a thread a terminal holds is refused like any other resume.
+    await b.revert("t1", "turn1")
+    await assert.rejects(b.revert("t1", "nope"), /unknown turn/)
+    await assert.rejects(b.revert("busy", "turn1"), /正在电脑上打开/)
   } finally {
     b.stop()
   }
