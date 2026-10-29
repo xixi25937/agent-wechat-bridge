@@ -1,5 +1,66 @@
 # agent-wechat-bridge
 
+Drive your coding agents from WeChat. `agent-wechat-bridge` connects [OpenCode](https://opencode.ai) (a V2 server plugin) and [Codex](https://github.com/openai/codex) (hooks) to a WeChat ClawBot (the iLink bot API). Replies are pushed to your phone, you approve permission requests and answer the agent's questions by replying, and you can send new messages, images and files to any conversation. Node standard library only, no dependencies.
+
+The full documentation is in Chinese: [中文说明](#中文说明).
+
+<!-- screenshots: docs/demo-*.png -->
+
+## Features
+
+- **Push**: the final reply of each turn, live progress (merged, at most one message per 15 s), and errors arrive as `[3] OpenCode · project / title` followed by the text. Images mentioned in a reply are sent too.
+- **Approve**: permission requests arrive with the action to run. Reply `3 y` or `3 n`. For Codex desktop you can answer on the PC or in WeChat, whichever comes first.
+- **Answer questions**: the agent's question tool shows the options in WeChat. Answer with an option number, an option's text or free text, all at once or one by one.
+- **Control**: `3 your message` continues conversation 3 (OpenCode or Codex, shared numbering), `3` shows its last reply, and `3 历史` reads back recent messages. Also `/model`, `/stop`, `/compact`, undo, and starting a new conversation in a folder you pick.
+- **Send images and files** from WeChat into a conversation.
+
+| | Push replies | Approve | Send messages, history | Answer questions |
+| --- | --- | --- | --- | --- |
+| OpenCode desktop | ✓ | ✓ | ✓ | ✓ |
+| OpenCode terminal (`opencode`, `opencode run`) | ✓ | ✓ | ✓ | ✓ |
+| Codex desktop | ✓ | ✓ | ✓ | ✓ (needs the `PreToolUse` hook) |
+| Codex terminal (`codex`) | ✓ | ✓ (WeChat gets 60 s) | ✓ (if the terminal isn't running that conversation) | ✗ (answer in the terminal) |
+
+## Quick start
+
+1. **Log in the WeChat bot once.** This uses the separate [cli-chat-bridge](https://www.npmjs.com/package/cli-chat-bridge) package (AGPL-3.0, not bundled). Scan the QR code with WeChat, then send the bot any message. Credentials are saved under `~/.cli-bridge/`; this project only reads them.
+
+   ```sh
+   npx -p cli-chat-bridge wechat-setup
+   ```
+
+2. **Install the plugin and the Codex hooks** with one command. It backs up each file before changing it, skips what is already configured, and keeps JSONC comments in `opencode.json`.
+
+   ```sh
+   npx agent-wechat-bridge setup
+   ```
+
+   Add `--dry-run` to preview without writing, `--opencode-only` or `--codex-only` to do half.
+
+3. **Finish by hand.** In a terminal run `codex`, type `/hooks` and trust the three new hooks (untrusted hooks are skipped). Restart OpenCode (`opencode service restart`, or quit and reopen the desktop app). Then send `帮助` or `/help` to the bot.
+
+### Other ways to install
+
+- `npm i -g agent-wechat-bridge`, then `agent-wechat-bridge setup`. It registers the global install folder, which `npm update -g` updates in place.
+- From source: `git clone https://github.com/xixi25937/agent-wechat-bridge`, then `node setup.js` inside it. It registers the clone.
+- `npx` runs from a temporary cache that npm deletes later, so `npx agent-wechat-bridge setup` copies the runtime files to `~/.cli-bridge/agent-wechat-bridge/` and registers that folder. Run `npx agent-wechat-bridge@latest setup` again to update the copy.
+- Plugin only: OpenCode installs npm plugins itself. Put `"agent-wechat-bridge"` in `plugins` in `~/.config/opencode/opencode.json`, or run `opencode plugin add agent-wechat-bridge`. The Codex hooks need a fixed folder to point at, so use `setup` (or the manual steps in the Chinese section) for those.
+
+## Limitations
+
+- Needs OpenCode 2.x (V2 plugin API) and Node.js 20.3 or newer. Reading Codex session titles needs Node 22.5 or newer.
+- Developed and used on Windows. Other platforms are untested.
+- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/help`), and `/model`, `/stop`, `/compact` work as written.
+- Only messages from the WeChat account that logged in the bot are handled. Anyone who controls that account, or can read `~/.cli-bridge`, can run commands and approve permissions through your agents. Keep the phone and those files safe.
+- WeChat limits bots (from third-party implementations, not official documentation): about 10 bot messages after each message you send, and a `context_token` that expires after about 24 hours. Sending the bot any message resets both.
+- WeChat commands, including Codex ones, are executed by the OpenCode background service, so the OpenCode desktop app or `opencode serve --service` must be running. Do not run cli-chat-bridge's `wechat-opencode` daemon at the same time; both would fight over the same bot's messages.
+- Controlling the Codex desktop window uses its undocumented `codex-ipc` pipe, checked against desktop version 26.1023. A desktop upgrade can break it; terminal and background-run conversations are unaffected.
+- `opencode --standalone`: pushes work, other features are unverified.
+
+License: MIT. Tests: `npm test` (no network, nothing is sent to WeChat).
+
+## 中文说明
+
 给编程 Agent 用的微信桥：用微信 ClawBot（iLink bot API）接收回复、批准权限、发消息。只用 Node 标准库，没有依赖。
 
 微信里还能发图片和文件给对话、用 `/model` `/stop` `/compact` 等斜杠命令（见「在微信里回复」）。
@@ -17,13 +78,24 @@ OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚
 ## 前提
 
 - Node.js 20.3 以上（OpenCode 插件跑在 OpenCode 里；Codex hook 用系统的 `node` 运行，读 Codex 会话标题要 Node 22.5 以上，否则标题显示「未命名会话」），OpenCode 2.x 桌面端（后台服务 `opencode serve --service`）。
-- 先用 [cli-chat-bridge](https://www.npmjs.com/package/cli-chat-bridge) 的 `wechat-setup` 登录微信机器人。插件只读取它保存的凭据，不会改写：
+- 先用 [cli-chat-bridge](https://www.npmjs.com/package/cli-chat-bridge)（AGPL，独立的包，不随本项目分发）的 `wechat-setup` 登录微信机器人：`npx -p cli-chat-bridge wechat-setup`，扫码后给机器人发一条消息。插件只读取它保存的凭据，不会改写：
   - `~/.cli-bridge/account.json`
   - `~/.cli-bridge/context_tokens.json`
 
 ## 安装
 
-在全局配置 `~/.config/opencode/opencode.json` 的 `plugins` 里加上本目录的绝对路径：
+**一条命令**（OpenCode 插件加 Codex 的三个 hook 一起配好；已配好的跳过，改文件前先备份成 `.bak-时间`，`opencode.json` 里的注释保留）：
+
+```sh
+npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.js
+```
+
+- `--dry-run`：只打印要做的改动，不写任何文件。`--opencode-only` / `--codex-only`：只配一边。
+- 它不会替你登录微信（没找到 `~/.cli-bridge/account.json` 时会告诉你命令），也不会替你信任 Codex hook 和重启 OpenCode，做完会提示这两步。
+- `npx` 的运行目录是 npm 的临时缓存，之后会被清掉，所以 `npx` 方式会把运行文件复制到 `~/.cli-bridge/agent-wechat-bridge/` 再登记这个目录，更新时再运行一次 `npx agent-wechat-bridge@latest setup`。想用固定目录：`npm i -g agent-wechat-bridge` 后运行 `agent-wechat-bridge setup`，登记的是全局安装目录。
+- 只装 OpenCode 插件的话，也可以把 npm 包名写进 `plugins`（`"agent-wechat-bridge"`，OpenCode 自己下载；或运行 `opencode plugin add agent-wechat-bridge`）。Codex 的 hook 需要一个固定目录，所以仍然用上面的命令，或按下面手动配置。
+
+手动配置：在全局配置 `~/.config/opencode/opencode.json` 的 `plugins` 里加上本目录的绝对路径：
 
 ```jsonc
 {
@@ -37,7 +109,7 @@ OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚
 
 ## Codex（桌面端和 CLI）
 
-Codex 桌面端和 `codex` CLI 都读 `~/.codex/hooks.json`。在里面加三个 hook（文件已存在就合并进 `hooks` 里，别删别的条目），路径换成本目录：
+`setup` 已经把下面三个 hook 写好了，这一节是手动配置的方法。Codex 桌面端和 `codex` CLI 都读 `~/.codex/hooks.json`。在里面加三个 hook（文件已存在就合并进 `hooks` 里，别删别的条目），路径换成本目录：
 
 ```json
 {
@@ -254,7 +326,7 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 ## 测试
 
 ```sh
-npm test            # 消息排版（每条拼出来的消息没有单个换行，只有空行和 `- ` 列表）、命令解析（含斜杠命令、实时、撤回）、实时进度合并与去重、长文字分段、撤回目标、回答问题（一次回完、一条一个、跳过、忽略、选项匹配）、图片配对、文件头识别、密钥格式、格式化、去重、Codex 批准握手、桌面管道（假管道）、桌面提问（等待、回答、提交后回读）、app-server 桥（假 app-server）等自检，不联网
+npm test            # 消息排版（每条拼出来的消息没有单个换行，只有空行和 `- ` 列表）、命令解析（含斜杠命令、实时、撤回）、实时进度合并与去重、长文字分段、撤回目标、回答问题（一次回完、一条一个、跳过、忽略、选项匹配）、图片配对、文件头识别、密钥格式、格式化、去重、Codex 批准握手、桌面管道（假管道）、桌面提问（等待、回答、提交后回读）、app-server 桥（假 app-server）、`setup` 的 JSONC 和 hooks 合并（含假 HOME 端到端）等自检，不联网
 npm run send-test   # 真实发送一条测试消息到微信
 ```
 

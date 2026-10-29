@@ -2,15 +2,36 @@
   "name": "agent-wechat-bridge",
   "version": "0.1.0",
   "description": "WeChat (iLink bot) bridge for coding agents: OpenCode V2 server plugin plus Codex hooks. Push replies, approve, and reply from WeChat.",
-  "keywords": ["opencode-plugin", "opencode", "codex", "wechat"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "codex",
+    "codex-cli",
+    "wechat",
+    "weixin",
+    "ai-agent",
+    "ai-coding",
+    "notifications"
+  ],
   "license": "MIT",
   "author": "xixi25937",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xixi25937/agent-wechat-bridge.git"
+  },
+  "homepage": "https://github.com/xixi25937/agent-wechat-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/xixi25937/agent-wechat-bridge/issues"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
   },
-  "files": ["index.js", "codex.js", "codex-question.js", "codex-hook.js", "form.js", "md.js"],
+  "bin": {
+    "agent-wechat-bridge": "setup.js"
+  },
+  "files": ["index.js", "codex.js", "codex-question.js", "codex-hook.js", "form.js", "md.js", "setup.js"],
   "engines": {
     "node": ">=20.3"
   },
