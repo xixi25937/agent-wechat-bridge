@@ -4,7 +4,9 @@ Drive your coding agents from WeChat. `agent-wechat-bridge` connects [OpenCode](
 
 The full documentation is in Chinese: [中文说明](#中文说明).
 
-<!-- screenshots: docs/demo-*.png -->
+| Chat with a Codex desktop conversation | Switch models with `/model` | `帮助` (help) |
+| --- | --- | --- |
+| ![Chat](https://raw.githubusercontent.com/xixi25937/agent-wechat-bridge/main/docs/demo-chat.png) | ![Model](https://raw.githubusercontent.com/xixi25937/agent-wechat-bridge/main/docs/demo-model.png) | ![Help](https://raw.githubusercontent.com/xixi25937/agent-wechat-bridge/main/docs/demo-help.png) |
 
 ## Features
 
