@@ -59,6 +59,8 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("目录结构怎么整理"), { type: "text", text: "目录结构怎么整理" })
   assert.deepEqual(parseCommand("5 历史"), { type: "history", n: 5, count: 5 })
   assert.deepEqual(parseCommand("5 历史 10"), { type: "history", n: 5, count: 10 })
+  for (const c of [1, 2, 3, 4]) assert.deepEqual(parseCommand(`5 历史 ${c}`), { type: "history", n: 5, count: c })
+  assert.deepEqual(parseCommand("5 历史3"), { type: "history", n: 5, count: 3 })
   assert.deepEqual(parseCommand("历史"), { type: "history", count: 5 })
   assert.deepEqual(parseCommand("历史 30"), { type: "history", count: 20 })
   assert.deepEqual(parseCommand("历史 0"), { type: "history", count: 1 })
@@ -93,6 +95,10 @@ test("historyLines", () => {
   ])
   assert.deepEqual(historyLines(msgs, 5, 2), ["[5] 你：改一下", "[5] AI：改好了\n（调用了 shell ×2、read）", "[5] 以上是最近 2 条"])
   assert.deepEqual(historyLines([], 5, 3), ["[5] 还没有消息"])
+  const many = []
+  for (let i = 9; i >= 0; i--) many.push({ type: "assistant", content: [{ type: "text", text: `答${i}` }] }, { type: "user", text: `问${i}` })
+  for (const c of [1, 2, 3, 4]) assert.equal(historyLines(many, 5, c).length, c + 1)
+  assert.deepEqual(historyLines(many, 5, 1), ["[5] AI：答9", "[5] 以上是最近 1 条"])
 })
 
 test("pickDir", () => {
