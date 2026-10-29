@@ -9,8 +9,11 @@ const TYPES = new Set(["session.execution.succeeded", "session.execution.failed"
 const DEBOUNCE_MS = 5000
 const MAX_CHARS = 1500
 const TAG = "[wechat-notify]"
-const DIR = process.env.WECHAT_NOTIFY_DIR || path.join(os.homedir(), ".cli-bridge")
+export const DIR = process.env.WECHAT_NOTIFY_DIR || path.join(os.homedir(), ".cli-bridge")
 const STATE_FILE = path.join(DIR, "opencode-wechat-notify.json")
+// Codex approval handshake with codex-hook.js: <id>.json is the request, <id>.answer is "allow" or "deny".
+export const PENDING_DIR = path.join(DIR, "codex-pending")
+const CODEX_TODO = "Codex 对话暂不支持这个操作（下一步会加）"
 const SERVICE_FILE = path.join(os.homedir(), ".local", "state", "opencode", "service.json")
 const YES = /^(y|yes|是|批准|同意)$/i
 const NO = /^(n|no|否|不|拒绝)$/i
@@ -26,6 +29,7 @@ const HELP = [
   "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
   "新对话 内容 → 在选中的文件夹里开新对话",
   "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
+  "Codex 对话（标着 Codex）目前只支持 3 y / 3 n",
 ].join("\n")
 const IMG = /\.(png|jpe?g|gif|webp)$/i
 const MAX_IMAGES = 4
@@ -33,11 +37,11 @@ const IMAGE_MAX_BYTES = 10 * 1024 * 1024
 const TOO_BIG = "太大（超过 10 MB）"
 const CDN = "https://novac2c.cdn.weixin.qq.com/c2c"
 
-const short = (s, n = 80) => {
+export const short = (s, n = 80) => {
   const t = String(s ?? "").replace(/\s+/g, " ").trim()
   return t.length > n ? t.slice(0, n - 1) + "…" : t
 }
-const base = (dir) => (dir ? dir.split(/[\\/]/).filter(Boolean).pop() : "") || "?"
+export const base = (dir) => (dir ? dir.split(/[\\/]/).filter(Boolean).pop() : "") || "?"
 const toArr = (r) => (Array.isArray(r) ? r : (r?.data ?? []))
 const warn = (...a) => console.warn(TAG, ...a.map((x) => short(x?.message ?? x, 200)))
 
@@ -213,8 +217,8 @@ const GEN = {}
 // State lives on disk and is re-read every time: several OpenCode server processes load this plugin and share it.
 // ponytail: read-modify-write without a lock, fine for a few writes a minute; two processes numbering a new
 // session in the same instant can still lose one mapping. A file lock fixes that if it ever shows up.
-const state = () => ({ next: 1, nums: {}, ...readJson(STATE_FILE) })
-function update(fn) {
+export const state = () => ({ next: 1, nums: {}, ...readJson(STATE_FILE) })
+export function update(fn) {
   const s = state()
   fn(s)
   try {
@@ -227,7 +231,8 @@ function update(fn) {
   }
   return s
 }
-function numOf(sessionID) {
+// Keys are OpenCode session ids, or `codex:<threadId>` for Codex threads; both share one numbering.
+export function numOf(sessionID) {
   return state().nums[sessionID] ?? update((s) => (s.nums[sessionID] ??= s.next++)).nums[sessionID]
 }
 const sessionOf = (n) => Object.entries(state().nums).find(([, v]) => v === n)?.[0]
@@ -476,6 +481,12 @@ async function run(cmd) {
   if (!sessionID) return cmd.n == null ? HELP : `没有 [${cmd.n}]，发「列表」查看`
   if (cmd.n != null && state().target !== sessionID) update((s) => (s.target = sessionID))
   const n = numOf(sessionID)
+  if (sessionID.startsWith("codex:")) {
+    const decision = cmd.type === "text" && cmd.n != null ? (YES.test(cmd.text) ? "allow" : NO.test(cmd.text) ? "deny" : null) : null
+    if (!decision) return CODEX_TODO
+    const ids = answerCodex(readPending(), n, decision)
+    return ids.length ? `${decision === "allow" ? "已批准" : "已拒绝"} [${n}]` : `[${n}] 没有待批准的请求`
+  }
   if (cmd.type === "show") {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
     return `${head(n, session)}\n${clip(await lastReply(sessionID, false)) || "（还没有回复）"}`
@@ -504,6 +515,40 @@ async function run(cmd) {
   if (decision) return `[${n}] 没有待批准的请求`
   await prompt(sessionID, t)
   return `已发给 [${n}]${forms.length ? "（它在等一个表单，请在桌面端回答）" : ""}`
+}
+
+// Unanswered Codex approval requests, oldest first.
+export function readPending(dir = PENDING_DIR) {
+  let names = []
+  try {
+    names = fs.readdirSync(dir)
+  } catch {}
+  return names
+    .filter((f) => f.endsWith(".json") && !names.includes(f.replace(/\.json$/, ".answer")))
+    .map((f) => readJson(path.join(dir, f)))
+    .filter((p) => p?.id)
+    .sort((a, b) => a.created - b.created)
+}
+
+// Picks which pending requests a 「N y」/「N n」 answers: allow approves the oldest one for N, deny rejects all of N's
+// (same as OpenCode). Writes <id>.answer for each and returns their ids.
+export function answerCodex(pending, n, decision, dir = PENDING_DIR) {
+  const mine = pending.filter((p) => p.n === n)
+  const picked = decision === "allow" ? mine.slice(0, 1) : mine
+  for (const p of picked) fs.writeFileSync(path.join(dir, `${p.id}.answer`), decision)
+  return picked.map((p) => p.id)
+}
+
+// Images mentioned in a reply that can be sent, plus names of the ones over the size limit.
+export async function replyImages(reply, dir) {
+  const files = []
+  const big = []
+  for (const f of imagePaths(reply, dir)) {
+    const p = await imageProblem(f)
+    if (!p) files.push(f)
+    else if (p === TOO_BIG) big.push(path.basename(f))
+  }
+  return { files, big }
 }
 
 async function inbound(msg, floor) {
@@ -601,13 +646,7 @@ export default {
         event.type === "session.execution.succeeded" ? await lastReply(sessionID).catch((e) => (warn(e), "")) : ""
       let text = format(event, session, numOf(sessionID), reply)
       if (!text) return
-      const files = []
-      const big = []
-      for (const f of imagePaths(reply, session?.location?.directory ?? event.location?.directory)) {
-        const p = await imageProblem(f)
-        if (!p) files.push(f)
-        else if (p === TOO_BIG) big.push(path.basename(f))
-      }
+      const { files, big } = await replyImages(reply, session?.location?.directory ?? event.location?.directory)
       if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
       await push(sessionID, text)
       for (const f of files) await sendImage(f).catch((e) => warn("image:", e))

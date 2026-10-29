@@ -1,8 +1,8 @@
 {
   "name": "opencode-wechat-notify",
   "version": "0.1.0",
-  "description": "OpenCode V2 server plugin: push each session's replies to WeChat (iLink bot) and reply, approve, or answer from WeChat.",
-  "keywords": ["opencode-plugin", "opencode", "wechat"],
+  "description": "WeChat (iLink bot) bridge for coding agents: OpenCode V2 server plugin plus Codex hooks. Push replies, approve, and reply from WeChat.",
+  "keywords": ["opencode-plugin", "opencode", "codex", "wechat"],
   "license": "MIT",
   "author": "xixi25937",
   "type": "module",
@@ -10,7 +10,7 @@
   "exports": {
     ".": "./index.js"
   },
-  "files": ["index.js"],
+  "files": ["index.js", "codex-hook.js"],
   "engines": {
     "node": ">=20.3"
   },
