@@ -8,7 +8,7 @@ import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import {
   approvalSummary, bridgeMarker, codexMsgs, createBridge, decisionRequest, desktopApprove, desktopCompact, desktopInterrupt, desktopOwns, desktopSend, frame,
-  pendingApprovals, questionAnswers, questionText, serverResponse, startTurnParams, unframe,
+  pendingApprovals, questionResult, serverResponse, startTurnParams, unframe,
 } from "./codex.js"
 
 test("frame / unframe", () => {
@@ -51,15 +51,8 @@ test("approval params", () => {
   })
 })
 
-test("questions", () => {
-  const one = [{ id: "q1", header: "数据库", question: "用哪个？", options: [{ label: "Postgres" }, { label: "MySQL" }] }]
-  assert.equal(questionText(one), "有问题问你：\n数据库：用哪个？\n  1. Postgres\n  2. MySQL\n回复「编号 答案」（可以回选项编号）")
-  assert.deepEqual(questionAnswers(one, "2"), { answers: { q1: { answers: ["MySQL"] } } })
-  assert.deepEqual(questionAnswers(one, "随便"), { answers: { q1: { answers: ["随便"] } } })
-  const two = [...one, { id: "q2", question: "名字？", options: null }]
-  assert.deepEqual(questionAnswers(two, "1\n小明"), { answers: { q1: { answers: ["Postgres"] }, q2: { answers: ["小明"] } } })
-  assert.equal(questionAnswers(two, "1"), null)
-  assert.equal(questionAnswers([], "x"), null)
+test("questionResult", () => {
+  assert.deepEqual(questionResult({ q1: "MySQL", q2: "小明" }), { answers: { q1: { answers: ["MySQL"] }, q2: { answers: ["小明"] } } })
 })
 
 test("codexMsgs", () => {
@@ -151,16 +144,21 @@ test("bridge: resume, held approval, question, completion, stop", async () => {
     assert.ok(f())
   }
   try {
-    assert.equal(b.reply("t1", "x"), null)
+    assert.equal(b.reply("t1", "x", 4), null)
     await b.send("t1", "只回复：好的")
     assert.ok(b.running("t1"))
     assert.ok(fs.existsSync(bridgeMarker(dir, "t1")))
-    // The fake asks a question, then a command approval, then sends its reply and completes.
+    // The fake asks two questions, then a command approval, then sends its reply and completes.
     await until(() => pushed.length === 1)
     assert.equal(pushed[0][1], "question")
-    assert.match(pushed[0][2], /^有问题问你：/)
+    assert.deepEqual(pushed[0][2].map((q) => q.id), ["q", "pw"])
     assert.equal(b.approve("t1", true), 0)
-    assert.equal(b.reply("t1", "1"), "answered")
+    // Step by step: a wrong option is asked again, the first answer is kept on the held request.
+    assert.match(b.reply("t1", "C", 4), /^\[4\] 第 1 题：「C」不是选项/)
+    assert.match(b.reply("t1", "1", 4), /^\[4\] 已记下 1\/2，下一个：\n问题 2\/2：密码（保密内容，会经过微信）/)
+    assert.match(b.reply("t1", "-", 4), /这一题必须回答/)
+    assert.match(b.reply("t1", "忽略", 4), /没法忽略/)
+    assert.equal(b.reply("t1", "hunter2", 4), "已回答 [4]")
     await until(() => pushed.length === 2)
     assert.deepEqual(pushed[1], ["t1", "approval", "git push（推送）"])
     assert.equal(b.approve("t1", true), 1)

@@ -10,7 +10,7 @@
   "exports": {
     ".": "./index.js"
   },
-  "files": ["index.js", "codex.js", "codex-hook.js"],
+  "files": ["index.js", "codex.js", "codex-hook.js", "form.js"],
   "engines": {
     "node": ">=20.3"
   },

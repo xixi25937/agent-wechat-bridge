@@ -3,7 +3,7 @@ import { getEventListeners } from "node:events"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
-  PAIR_MS, aesKeyOf, chunkLines, clip, codexPushText, dirLabel, eventKey, extOf, format, formAnswer, historyLines, imagePaths, inboundMedia,
+  PAIR_MS, aesKeyOf, chunkLines, clip, codexPushText, dirLabel, eventKey, extOf, format, historyLines, imagePaths, inboundMedia,
   inboundText, liveMedia, mediaAck, mergeLines, modelLines, parseCommand, pickDir, pickModel, replyText, sessionIDOf, shouldSend, sleep, withMedia,
 } from "./index.js"
 
@@ -25,7 +25,10 @@ test("format", () => {
   )
   const fields = [{ key: "db", type: "string", title: "选数据库", options: [{ value: "pg", label: "Postgres" }] }]
   const form = { type: "form.created", data: { form: { sessionID: "s1", title: "用哪个数据库？", fields } } }
-  assert.equal(format(form, session, 3), "[3] 22 / 重构登录模块\n有问题问你：用哪个数据库？\n选数据库\n  1. Postgres\n回复「3 答案」（可以回编号）")
+  assert.equal(
+    format(form, session, 3),
+    "[3] 22 / 重构登录模块\n有问题问你：用哪个数据库？\n选数据库（可跳过）\n  1. Postgres\n回复「3 答案」（可以回编号）\n不想回答发「3 忽略」",
+  )
   assert.equal(sessionIDOf(form), "s1")
 })
 
@@ -176,18 +179,6 @@ test("mergeLines", () => {
   const rows = [{ updated: 1, line: "a" }, { updated: 3, line: "c" }, { line: "z" }, { updated: 2, line: "b" }]
   assert.deepEqual(mergeLines(rows), ["c", "b", "a", "z"])
   assert.deepEqual(mergeLines(rows, 2), ["c", "b"])
-})
-
-test("formAnswer", () => {
-  const sel = { fields: [{ key: "db", type: "string", options: [{ value: "pg", label: "Postgres" }, { value: "my", label: "MySQL" }] }] }
-  assert.deepEqual(formAnswer(sel, "2"), { db: "my" })
-  assert.deepEqual(formAnswer(sel, "Postgres"), { db: "pg" })
-  assert.deepEqual(formAnswer(sel, "随便"), { db: "随便" })
-  assert.deepEqual(formAnswer({ fields: [{ key: "ok", type: "boolean" }] }, "是"), { ok: true })
-  assert.equal(formAnswer({ fields: [{ key: "ok", type: "boolean" }] }, "也许"), null)
-  assert.deepEqual(formAnswer({ fields: [{ key: "n", type: "integer" }] }, "5"), { n: 5 })
-  assert.deepEqual(formAnswer({ fields: [{ key: "m", type: "multiselect", options: sel.fields[0].options }] }, "1，MySQL"), { m: ["pg", "my"] })
-  assert.equal(formAnswer({ fields: [{ key: "a", type: "string" }, { key: "b", type: "string" }] }, "x"), null)
 })
 
 test("inboundText", () => {

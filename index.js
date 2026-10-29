@@ -7,6 +7,7 @@ import {
   BUSY, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
   desktopSend,
 } from "./codex.js"
+import { NO, YES, formAction, formText, questionForm } from "./form.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set(["session.execution.succeeded", "session.execution.failed", "permission.asked", "form.created"])
@@ -21,13 +22,12 @@ const CODEX = "codex:"
 // A Codex approval record older than this no longer matches a 「N y」.
 const PENDING_TTL = 60 * 60_000
 const SERVICE_FILE = path.join(os.homedir(), ".local", "state", "opencode", "service.json")
-const YES = /^(y|yes|是|批准|同意)$/i
-const NO = /^(n|no|否|不|拒绝)$/i
 const STATUS = { succeeded: "完成", failed: "出错", interrupted: "中断" }
 const HELP = [
   "用法：",
-  "3 内容 → 发给 [3] 号对话（有待回答的问题时作为回答）",
+  "3 内容 → 发给 [3] 号对话",
   "直接发内容 → 发给你上次用编号指定的对话（回复里会标明发给了几号）",
+  "[3] 有问题等你回答时：「3 答案」；几个问题可以一行一个一次回完，也可以一条一个；「-」跳过可选的，「3 忽略」不回答",
   "3 y / 3 n → 批准一次 / 拒绝 [3] 的权限请求",
   "3 → 再看一次 [3] 的最后回复",
   "3 历史 10 → [3] 最近 10 条消息（默认 5，最多 20）",
@@ -125,16 +125,8 @@ export function format(event, session, n, reply) {
       const what = d.message || [d.action, ...(d.resources ?? [])].filter(Boolean).join(" ")
       return h + `等你批准：${short(what, 300)}\n回复「${n} y」批准一次，「${n} n」拒绝`
     }
-    case "form.created": {
-      const f = d.form ?? {}
-      const lines = [`有问题问你：${short(f.title, 200) || "表单"}`]
-      for (const x of (f.fields ?? []).filter((x) => !x.hidden)) {
-        lines.push(short([x.title, x.description].filter(Boolean).join("：") || x.key, 300))
-        ;(x.options ?? []).forEach((o, i) => lines.push(`  ${i + 1}. ${short(o.label, 80)}`))
-      }
-      lines.push(`回复「${n} 答案」${f.fields?.some((x) => x.options?.length) ? "（可以回编号）" : ""}`)
-      return h + lines.join("\n")
-    }
+    case "form.created":
+      return h + formText(d.form, n)
   }
   return null
 }
@@ -178,28 +170,6 @@ export function parseCommand(text) {
   m = t.match(/^(\d{1,4})[\s:：,，]+([\s\S]+)$/)
   if (m) return { type: "text", n: Number(m[1]), text: m[2].trim() }
   return { type: "text", text: t }
-}
-
-// Answer for a form with exactly one visible field, or null when it can't be answered from one text message.
-export function formAnswer(form, text) {
-  const fields = (form?.fields ?? []).filter((f) => !f.hidden && f.type !== "external")
-  if (fields.length !== 1) return null
-  const f = fields[0]
-  const t = String(text ?? "").trim()
-  const pick = (s) => (f.options?.[Number(s) - 1] ?? f.options?.find((o) => o.label === s || o.value === s))?.value
-  switch (f.type) {
-    case "boolean":
-      return YES.test(t) ? { [f.key]: true } : NO.test(t) ? { [f.key]: false } : null
-    case "number":
-    case "integer": {
-      const v = Number(t)
-      return t && Number.isFinite(v) ? { [f.key]: v } : null
-    }
-    case "multiselect":
-      return { [f.key]: t.split(/[\s,，、]+/).filter(Boolean).map((s) => pick(s) ?? s) }
-    default:
-      return { [f.key]: pick(t) ?? t }
-  }
 }
 
 const fromOwner = (msg, ownerID) => !!ownerID && msg?.message_type === 1 && msg.from_user_id === ownerID && !msg.group_id
@@ -532,11 +502,11 @@ export function imagePaths(text, baseDir) {
 }
 
 // Local OpenCode HTTP API, for what the plugin context doesn't expose in 2.0.32 (session list/active, forms, messages).
-async function oc(pathname, body) {
+async function oc(pathname, body, method = body ? "POST" : "GET") {
   const svc = readJson(SERVICE_FILE)
   if (!svc?.url || !svc?.password) throw new Error("找不到 OpenCode 服务信息")
   const res = await fetch(new URL(pathname, svc.url.replace("0.0.0.0", "127.0.0.1")), {
-    method: body ? "POST" : "GET",
+    method,
     headers: {
       Authorization: "Basic " + Buffer.from(`opencode:${svc.password}`).toString("base64"),
       ...(body && { "Content-Type": "application/json" }),
@@ -544,7 +514,14 @@ async function oc(pathname, body) {
     body: body && JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
   })
-  if (!res.ok) throw new Error(`OpenCode 接口返回 ${res.status} ${short(await res.text(), 120)}`)
+  if (!res.ok) {
+    const t = await res.text()
+    let msg = t
+    try {
+      msg = JSON.parse(t).message ?? t
+    } catch {}
+    throw new Error(`OpenCode 接口返回 ${res.status} ${short(msg, 200)}`)
+  }
   return res.status === 204 ? undefined : res.json()
 }
 
@@ -699,17 +676,38 @@ export async function run(cmd) {
     if (decision === "reject") return `已拒绝 [${n}]`
     return `已批准 [${n}]${perms.length > 1 ? `，还有 ${perms.length - 1} 个待批准` : ""}`
   }
-  const forms = toArr(await oc(`/api/session/${sid(sessionID)}/form`))
-  const answer = forms.length ? formAnswer(forms[0], t) : null
-  if (answer) {
-    await oc(`/api/session/${sid(sessionID)}/form/${sid(forms[0].id)}/reply`, { answer })
-    return `已回答 [${n}]`
-  }
+  // A prompt sent while a form is pending only waits in the inbox and the session stays blocked, so never send one.
+  const forms = await formsOf(sessionID)
+  if (forms.length) return answerForm(sessionID, n, forms[0], t, { numbered: cmd.n != null, decision: !!decision })
   if (decision) return `[${n}] 没有待批准的请求`
   if (noMedia(t)) return noMedia(t)
   const { text, images, note } = takeMedia(t)
   await prompt(sessionID, text, images)
-  return `已发给 [${n}]${note}${forms.length ? "（它在等一个表单，请在桌面端回答）" : ""}`
+  return `已发给 [${n}]${note}`
+}
+
+// Pending forms of a session; drops saved progress once none is pending.
+async function formsOf(sessionID) {
+  const forms = toArr(await oc(`/api/session/${sid(sessionID)}/form`))
+  if (!forms.length && state().forms?.[sessionID]) update((s) => delete s.forms[sessionID])
+  return forms
+}
+
+// One WeChat message against a pending form: progress is kept in the state file until the last answer, which is
+// submitted with every answer in one reply. The result is read back, so a rejected answer is reported.
+async function answerForm(sessionID, n, form, text, opts) {
+  const a = formAction(form, state().forms?.[sessionID], text, n, opts)
+  if (a.save) update((s) => ((s.forms ??= {})[sessionID] = a.save))
+  if (a.reply) return a.reply
+  const url = `/api/session/${sid(sessionID)}/form/${sid(form.id)}`
+  let err = ""
+  await (a.cancel ? oc(url, undefined, "DELETE") : oc(`${url}/reply`, { answer: a.submit })).catch((e) => (err = e.message))
+  const status = (await oc(url).catch(() => null))?.data?.state?.status
+  update((s) => s.forms && delete s.forms[sessionID])
+  if (status === (a.cancel ? "cancelled" : "answered")) return a.cancel ? `已忽略 [${n}] 的问题` : `已回答 [${n}]`
+  if (status && status !== "pending") return `[${n}] 的问题已经在电脑上处理了`
+  const why = short(err || `问题的状态是 ${status ?? "未知"}`, 200)
+  return `[${n}] ${a.cancel ? "忽略" : "提交"}没成功：${why}${status === "pending" ? `\n请重新回答：\n${formText(form, n)}` : ""}`
 }
 
 const targetID = () => state().target ?? state().last
@@ -766,6 +764,8 @@ async function slashOC(cmd, sessionID, n) {
     const r = await oc(`/api/session/${sid(sessionID)}/interrupt`, {})
     return r?.interrupted ? `已停止 [${n}]` : `[${n}] 没有在运行`
   }
+  // Compactions and commands would wait in the inbox behind the form, like a prompt.
+  if ((await formsOf(sessionID)).length) return `[${n}] 在等你回答问题，回答或发「${n} 忽略」`
   if (name === "compact") {
     await oc(`/api/session/${sid(sessionID)}/compact`, {})
     return `[${n}] 开始压缩上下文`
@@ -866,9 +866,8 @@ async function runCodex(cmd, threadId, n) {
   if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count)
   const t = cmd.text
   if (cmd.n != null && (YES.test(t) || NO.test(t))) return approveCodex(threadId, n, YES.test(t))
-  const answered = bridge().reply(threadId, t)
-  if (answered === "answered") return `已回答 [${n}]`
-  if (answered === "mismatch") return `[${n}] 有几个问题就回几行答案，按顺序`
+  const answered = bridge().reply(threadId, t, n)
+  if (answered) return answered
   if (noMedia(t)) return noMedia(t)
   const { text, images, note } = takeMedia(t)
   const opts = { images, model: state().codexModels?.[threadId] }
@@ -898,6 +897,7 @@ async function codexPush(threadId, kind, text) {
   const key = CODEX + threadId
   const n = numOf(key)
   const thread = await codexThread(threadId)
+  if (kind === "question") text = formText(questionForm(text), n, false)
   let msg = codexPushText(codexHead(n, "", thread, { base, short }), n, kind, text)
   const { files, big } = kind === "done" ? await replyImages(text, cleanDir(thread?.cwd)) : { files: [], big: [] }
   if (big.length) msg += `\n（图片太大没发：${big.join("、")}）`

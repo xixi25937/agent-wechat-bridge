@@ -6,6 +6,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import readline from "node:readline"
+import { formAction, questionForm } from "./form.js"
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
 export const PIPE = "\\\\.\\pipe\\codex-ipc"
@@ -285,24 +286,10 @@ function appServer([cmd, ...args], onMessage) {
   return s
 }
 
-export function questionText(questions) {
-  const lines = ["有问题问你："]
-  for (const q of questions ?? []) {
-    lines.push([q.header, q.question].filter(Boolean).join("："))
-    ;(q.options ?? []).forEach((o, i) => lines.push(`  ${i + 1}. ${o.label}`))
-  }
-  lines.push(questions?.length > 1 ? "回复「编号 答案」，每个问题一行，按顺序" : "回复「编号 答案」（可以回选项编号）")
-  return lines.join("\n")
-}
-
-// requestUserInput result for a WeChat reply, or null when the lines don't match the questions.
-export function questionAnswers(questions, text) {
-  const t = String(text ?? "").trim()
-  const parts = questions.length === 1 ? [t] : t.split(/\n|；|;/).map((s) => s.trim()).filter(Boolean)
-  if (!questions.length || parts.length !== questions.length || parts.some((p) => !p)) return null
-  const pick = (q, s) => q.options?.[Number(s) - 1]?.label ?? s
-  return { answers: Object.fromEntries(questions.map((q, i) => [q.id, { answers: [pick(q, parts[i])] }])) }
-}
+// requestUserInput result for the answers of questionForm(questions).
+export const questionResult = (answers) => ({
+  answers: Object.fromEntries(Object.entries(answers).map(([id, v]) => [id, { answers: [String(v)] }])),
+})
 
 // What an approval server request is for, one line.
 export function approvalSummary(req) {
@@ -348,7 +335,8 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
     if (m.id != null) {
       if (!held || !HELD.has(m.method)) return server?.refuse(m.id)
       held.push(m)
-      push(p.threadId, m.method === QUESTION ? "question" : "approval", m.method === QUESTION ? questionText(p.questions) : approvalSummary(m))
+      // A question is pushed as its questions array; index.js formats it with the thread's number.
+      push(p.threadId, m.method === QUESTION ? "question" : "approval", m.method === QUESTION ? p.questions ?? [] : approvalSummary(m))
       return
     }
     if (m.method === "turn/started" && held && p.turn?.id) turnIds.set(p.threadId, p.turn.id)
@@ -454,14 +442,17 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       for (const r of picked) answer(threadId, r, serverResponse(r, allow))
       return picked.length
     },
-    // "answered", "mismatch" (text doesn't fit the questions), or null when no question is waiting.
-    reply(threadId, text) {
+    // WeChat text for the oldest held question: one line per question at once, or one per message (progress stays
+    // on the held request). Returns the reply ("已回答 [n]" once answered), or null when no question is waiting.
+    reply(threadId, text, n) {
       const q = take(threadId, true)[0]
       if (!q) return null
-      const result = questionAnswers(q.params?.questions ?? [], text)
-      if (!result) return "mismatch"
-      answer(threadId, q, result)
-      return "answered"
+      const form = { id: q.id, ...questionForm(q.params?.questions) }
+      const a = formAction(form, q.progress, text, n, { cancel: false })
+      if (a.save) q.progress = a.save
+      if (a.reply) return a.reply
+      answer(threadId, q, questionResult(a.submit))
+      return `已回答 [${n}]`
     },
     stop() {
       clearTimeout(idle)

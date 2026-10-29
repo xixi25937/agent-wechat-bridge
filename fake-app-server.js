@@ -35,8 +35,12 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
         out({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: JSON.stringify({ input: p.input, model: p.model }) } } })
         return out({ method: "turn/completed", params: { threadId, turn: { id: "turn1", status: "completed", items: [] } } })
       }
-      const q = await ask("item/tool/requestUserInput", { threadId, turnId: "turn1", itemId: "i1", questions: [{ id: "q", question: "选哪个？", options: [{ label: "A" }] }] })
-      if (q.result?.answers?.q?.answers?.[0] !== "A") return
+      const questions = [
+        { id: "q", header: "选项", question: "选哪个？", isOther: false, options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
+        { id: "pw", header: "密码", question: "", isOther: false, isSecret: true, options: null },
+      ]
+      const q = await ask("item/tool/requestUserInput", { threadId, turnId: "turn1", itemId: "i1", isBlocking: true, questions })
+      if (JSON.stringify(q.result) !== JSON.stringify({ answers: { q: { answers: ["A"] }, pw: { answers: ["hunter2"] } } })) return
       const a = await ask("item/commandExecution/requestApproval", { threadId, turnId: "turn1", itemId: "i2", command: "git push", reason: "推送" })
       out({ method: "serverRequest/resolved", params: { threadId, requestId: sid } })
       out({ method: "item/completed", params: { threadId, turnId: "turn1", item: { type: "agentMessage", id: "m1", text: "好的" } } })
