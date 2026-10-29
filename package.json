@@ -31,7 +31,7 @@
   "bin": {
     "agent-wechat-bridge": "setup.js"
   },
-  "files": ["index.js", "codex.js", "codex-question.js", "codex-hook.js", "form.js", "md.js", "setup.js"],
+  "files": ["index.js", "codex.js", "codex-question.js", "codex-hook.js", "form.js", "md.js", "poll-lock.js", "setup.js"],
   "engines": {
     "node": ">=20.3"
   },
