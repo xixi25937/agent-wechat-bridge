@@ -8,7 +8,7 @@ import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { bridgeMarker, cleanDir, codexHead, desktopOwns } from "./codex.js"
-import { dropQuestion, noteQuestion, readQuestion, waitQuestion } from "./codex-question.js"
+import { asyncText, dropQuestion, noteQuestion, openAsks, readQuestion, waitQuestion } from "./codex-question.js"
 import { formText, questionForm } from "./form.js"
 
 export { codexHead }
@@ -70,7 +70,7 @@ export function remember(s, key, cwd, thread) {
   if (dir) (s.info ??= {})[key] = { dir }
 }
 
-async function onStop(p, m) {
+export async function onStop(p, m, { db } = {}) {
   // The turn is over, so a question the window showed is answered or gone.
   dropQuestion(m.PENDING_DIR, p.session_id)
   const thread = await threadInfo(p.session_id)
@@ -79,7 +79,12 @@ async function onStop(p, m) {
   const n = await m.assign(key)
   const reply = p.last_assistant_message ?? ""
   const { files, big } = await m.replyImages(reply, cleanDir(p.cwd))
-  let text = `${codexHead(n, p.cwd, thread, m)}\n${m.clip(reply, n) || NO_TEXT}`
+  // The desktop asks with request_user_input_async: the turn goes on and ends with a line like "已发送 3 个选项", so the
+  // question itself is only in the thread history.
+  const asks = await openAsks(p.session_id, db)
+  const tail = alive(m.state().pollerPid) ? "" : "\n（OpenCode 后台服务没在运行，微信回复收不到，请在电脑上回答）"
+  const body = [m.clip(reply, n) || (asks.length ? "" : NO_TEXT), ...asks.map((a) => asyncText(a, n))].filter(Boolean).join("\n")
+  let text = `${codexHead(n, p.cwd, thread, m)}\n${body}${asks.length ? tail : ""}`
   if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
   m.update((s) => remember(s, key, p.cwd, thread))
   console.error(`${new Date().toISOString()} Stop [${n}] ${await m.send(text)}`)

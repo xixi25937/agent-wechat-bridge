@@ -5,8 +5,9 @@ import path from "node:path"
 import { test } from "node:test"
 import { fakeDesktop } from "./fake-desktop.js"
 import {
-  answerRequest, desktopReply, dropQuestion, noteQuestion, pendingQuestions, readQuestion, waitQuestion, writeQuestion,
+  answerRequest, asyncAnswer, asyncText, desktopReply, dropQuestion, noteQuestion, openAsks, pendingQuestions, readQuestion, waitQuestion, writeQuestion,
 } from "./codex-question.js"
+import { agent, fakeHistory, sqlite, user } from "./fake-history.js"
 
 // Shapes of the desktop's conversation state: `requests` holds app-server ServerRequests (ToolRequestUserInputParams).
 const ask = (id, questions) => ({ method: "item/tool/requestUserInput", id, params: { threadId: "t1", turnId: "u1", itemId: "i1", questions } })
@@ -137,6 +138,67 @@ test("desktopReply: answered on the computer first, window closed", { skip: proc
   noteQuestion(dir, "t1", 4, [7])
   assert.match(await desktopReply("t1", "蓝", 4, "[4]", { dir, pipe: "\\\\.\\pipe\\wx-test-missing" }), /已经没有这个对话了/)
   fs.rmSync(dir, { recursive: true })
+})
+
+// --- async questions (request_user_input_async), ordinals and shapes as in a real thread ---
+const OPTS = [{ title: "再次测试", options: ["选项一", "选项二", "选项三"] }]
+const FREE = [{ title: "几月？", options: null }]
+const ASYNC_ITEMS = [
+  ["t1", 86, user("u1", "再来一次")],
+  ["t1", 92, agent("call_98dd6c80fb4e4aebb6345c686728f975", "再次测试\n- 选项一\n- 选项二\n- 选项三", OPTS)],
+  ["t1", 96, agent("m1", "已发送 3 个选项，请选择其中一个。")],
+  ["t2", 10, agent("call_other", "别的对话", FREE)],
+]
+const skipDb = { skip: !sqlite }
+
+test("openAsks: open until the thread's next user message", skipDb, async () => {
+  const open = [{ id: "call_98dd6c80fb4e4aebb6345c686728f975", questions: OPTS }]
+  assert.deepEqual(await openAsks("t1", fakeHistory(ASYNC_ITEMS)), open)
+  assert.deepEqual(await openAsks("t2", fakeHistory(ASYNC_ITEMS)), [{ id: "call_other", questions: FREE }])
+  // Answered in the window: the answer is the next user message. A new question after it is open again.
+  const answered = [...ASYNC_ITEMS, ["t1", 105, user("u2", "<send_user_message_question_reply>\n[]\n</send_user_message_question_reply>\n")]]
+  assert.deepEqual(await openAsks("t1", fakeHistory(answered)), [])
+  const again = [...answered, ["t1", 120, agent("call_next", "再问", FREE)]]
+  assert.deepEqual(await openAsks("t1", fakeHistory(again)), [{ id: "call_next", questions: FREE }])
+  assert.deepEqual(await openAsks("nobody", fakeHistory(ASYNC_ITEMS)), [])
+  // No db, unreadable db: no question, never a throw.
+  assert.deepEqual(await openAsks("t1", path.join(os.tmpdir(), "no-such-history.sqlite")), [])
+})
+
+test("asyncText: the whole question, numbered options, the reply hint", () => {
+  assert.equal(asyncText({ questions: OPTS }, 12), "有问题问你：\n再次测试\n  1. 选项一\n  2. 选项二\n  3. 选项三\n回复「12 答案」（可以回编号，也可以直接写答案）")
+  assert.equal(asyncText({ questions: FREE }, 3), "有问题问你：\n几月？\n回复「3 答案」")
+  const long = "长".repeat(500)
+  assert.ok(asyncText({ questions: [{ title: long, options: null }] }, 3).includes(long), "not cut at 300 characters")
+  assert.equal(asyncText({ questions: [...FREE, ...OPTS] }, 4).split("\n").filter((l) => /^问题 \d\/2：/.test(l)).length, 2)
+})
+
+test("asyncAnswer: options resolve to their text, sent as the window sends an answer", skipDb, async () => {
+  const db = fakeHistory(ASYNC_ITEMS)
+  // Byte for byte what the desktop recorded when the user picked 选项三 (thread_history_1.sqlite, userMessage).
+  const REAL =
+    '<send_user_message_question_reply>\n[{"questionItemId":"[\\"request_user_input_async\\",\\"call_98dd6c80fb4e4aebb6345c686728f975\\",0]","question":"再次测试","answer":"选项三"}]\n</send_user_message_question_reply>\n'
+  const a = (text) => asyncAnswer("t1", text, 12, "[12] Codex · proj", { db })
+  assert.deepEqual(await a("3"), { text: REAL })
+  assert.deepEqual(await a("选项三"), { text: REAL })
+  assert.deepEqual(await a("选项 三 "), { text: REAL.replace("选项三", "选项 三") }, "free text stays free text")
+  assert.match((await a("随便")).text, /"answer":"随便"/)
+  // Out of range is free text, like everywhere else; empty and skip are not answers.
+  assert.match((await a("9")).text, /"answer":"9"/)
+  assert.match((await a("-")).reply, /^\[12\] Codex · proj 这一题必须回答/)
+  // No open question (other thread without one, or answered): the caller sends the text as it is.
+  assert.equal(await asyncAnswer("nobody", "3", 12, "[12]", { db }), null)
+  assert.equal(await asyncAnswer("t1", "3", 12, "[12]", { db: fakeHistory([...ASYNC_ITEMS, ["t1", 105, user("u2", "好")]]) }), null)
+  assert.equal(await asyncAnswer("t1", "3", 12, "[12]", { db: path.join(os.tmpdir(), "no-such-history.sqlite") }), null)
+})
+
+test("asyncAnswer: several questions in one message, one line each", skipDb, async () => {
+  const db = fakeHistory([["t1", 5, agent("call_two", "两个问题", [...FREE, ...OPTS])]])
+  const a = (text) => asyncAnswer("t1", text, 4, "[4]", { db })
+  const r = await a("8月\n2")
+  const sent = JSON.parse(r.text.split("\n")[1])
+  assert.deepEqual(sent.map((s) => [JSON.parse(s.questionItemId)[2], s.question, s.answer]), [[0, "几月？", "8月"], [1, "再次测试", "选项二"]])
+  assert.match((await a("8月")).reply, /^\[4\] 有 2 个问题，要一次回完/)
 })
 
 test("desktopReply: a rejected or ignored answer is an error and keeps the progress", { skip: process.platform !== "win32" }, async () => {

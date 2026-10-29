@@ -6,8 +6,9 @@ import { test } from "node:test"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { readQuestion } from "./codex-question.js"
-import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, onQuestion, permissionSummary, remember, threadInfo } from "./codex-hook.js"
+import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, onQuestion, onStop, permissionSummary, remember, threadInfo } from "./codex-hook.js"
 import { fakeDesktop } from "./fake-desktop.js"
+import { agent, fakeHistory, sqlite, user } from "./fake-history.js"
 import { answerCodex, base, readPending, short } from "./index.js"
 
 test("codexHead", () => {
@@ -136,6 +137,31 @@ test("readPending drops stale records", () => {
   fs.writeFileSync(path.join(dir, "bridge-x.run"), "1")
   assert.deepEqual(readPending(dir).map((p) => p.id), ["new"])
   assert.ok(!fs.existsSync(path.join(dir, "old.json")))
+  fs.rmSync(dir, { recursive: true })
+})
+
+test("onStop: an async question is pushed after the final reply, and only while it is open", { skip: !sqlite }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-pending-"))
+  const sent = []
+  const m = {
+    PENDING_DIR: dir, base, short, clip: (t) => t, assign: async () => 12, update: () => {}, state: () => ({ pollerPid: process.pid }),
+    replyImages: async () => ({ files: [], big: [] }), send: async (t) => (sent.push(t), "ok"), sendImage: async () => {},
+  }
+  const p = { session_id: "st1", cwd: "C:\\a\\proj", last_assistant_message: "已发送 3 个选项，请选择其中一个。" }
+  const Q = [{ title: "再次测试", options: ["选项一", "选项二"] }]
+  const items = [["st1", 86, user("u1", "再来一次")], ["st1", 92, agent("call_1", "再次测试\n- 选项一\n- 选项二", Q)], ["st1", 96, agent("m1", p.last_assistant_message)]]
+  await onStop(p, m, { db: fakeHistory(items) })
+  assert.match(sent[0], /^\[12\] Codex · proj \/ .+\n已发送 3 个选项，请选择其中一个。\n有问题问你：\n再次测试\n  1\. 选项一\n  2\. 选项二\n回复「12 答案」/)
+  // The question is the whole reply: no 「完成（没有文字回复）」 line in front of it.
+  await onStop({ ...p, last_assistant_message: "" }, m, { db: fakeHistory(items) })
+  assert.match(sent[1], /^\[12\] Codex · proj \/ .+\n有问题问你：\n/)
+  // Answered since (the window's reply is a user message): an ordinary push.
+  await onStop(p, m, { db: fakeHistory([...items, ["st1", 105, user("u2", "选项二")]]) })
+  assert.ok(!sent[2].includes("有问题问你"))
+  assert.match(sent[2], /已发送 3 个选项/)
+  // The service that receives the replies isn't running: say so.
+  await onStop(p, { ...m, state: () => ({}) }, { db: fakeHistory(items) })
+  assert.match(sent[3], /微信回复收不到，请在电脑上回答）$/)
   fs.rmSync(dir, { recursive: true })
 })
 

@@ -2,9 +2,10 @@
 // WeChat and leaves a record; the plugin answers them through the desktop's IPC pipe. A file of its own, so a
 // hot-reloaded index.js still loads next to an older codex.js.
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { desktopSnapshot, ipcConnect, ownerOf, questionResult } from "./codex.js"
-import { formAction, questionForm } from "./form.js"
+import { fieldsOf, formAction, questionForm, step, stepText } from "./form.js"
 
 const QUESTION = "item/tool/requestUserInput"
 // A question can wait for the user a long time; the Stop hook and every answer remove the record sooner.
@@ -67,6 +68,75 @@ export async function waitQuestion(threadId, known = [], { pipe, tries = 30, gap
   } finally {
     ipc.close()
   }
+}
+
+// --- async questions: the desktop's request_user_input_async ---
+// Not a request waiting in the window: the tool returns at once, the model's turn ends, and the question is an
+// agentMessage item (`delivery: "async"`, `questions: [{ title, options: [string] | null }]`). The window sends the answer
+// as the next user message, wrapped in <send_user_message_question_reply>. So a question is open until the thread's next
+// userMessage, and nothing is stored: the history db is the state.
+
+const HISTORY = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "thread_history_1.sqlite")
+const OPEN_ASKS =
+  "select item_id as id, json_extract(item_json, '$.questions') as q from thread_items" +
+  " where thread_id = ? and item_type = 'agentMessage' and json_extract(item_json, '$.delivery') = 'async'" +
+  " and json_extract(item_json, '$.questions') is not null and rollout_ordinal >" +
+  " coalesce((select max(rollout_ordinal) from thread_items where thread_id = ? and item_type = 'userMessage'), -1)" +
+  " order by rollout_ordinal"
+
+// Async questions the user hasn't answered yet, oldest first: [{ id, questions }]. [] when the db can't be read
+// (old Node without node:sqlite, db locked or missing).
+export async function openAsks(threadId, db = HISTORY) {
+  try {
+    const { DatabaseSync } = await import("node:sqlite")
+    const conn = new DatabaseSync(db, { readOnly: true })
+    try {
+      return conn.prepare(OPEN_ASKS).all(threadId, threadId).map((r) => ({ id: r.id, questions: JSON.parse(r.q) })).filter((a) => a.questions.length)
+    } finally {
+      conn.close()
+    }
+  } catch {
+    return []
+  }
+}
+
+// Push text for one open question. The whole question is shown (the form text cuts at 300 characters).
+export function asyncText({ questions }, n) {
+  const many = questions.length > 1
+  const lines = ["有问题问你："]
+  questions.forEach((q, i) => {
+    lines.push(`${many ? `问题 ${i + 1}/${questions.length}：` : ""}${q.title}`)
+    ;(q.options ?? []).forEach((o, k) => lines.push(`  ${k + 1}. ${o}`))
+  })
+  lines.push(many ? `回复「${n} 答案」：一次回完，一行一个、按顺序` : `回复「${n} 答案」${questions[0].options?.length ? "（可以回编号，也可以直接写答案）" : ""}`)
+  return lines.join("\n")
+}
+
+// Options answer with their text; anything else is the answer itself, as the window's "other" would be.
+const asyncForm = (questions) => ({
+  fields: questions.map((q, i) => ({
+    key: String(i), type: "string", description: q.title, required: true,
+    options: (q.options ?? []).map((o) => ({ value: o, label: o })), custom: true,
+  })),
+})
+
+// The user message the window sends for an answer (byte for byte, as recorded in the history db).
+export const asyncReplyText = (ask, answers) =>
+  "<send_user_message_question_reply>\n" +
+  JSON.stringify(ask.questions.map((q, i) => ({ questionItemId: JSON.stringify(["request_user_input_async", ask.id, i]), question: q.title, answer: answers[i] }))) +
+  "\n</send_user_message_question_reply>\n"
+
+// A WeChat message to a thread with an open async question: { text } to send in the window's answer format, { reply }
+// to send back instead (nothing is sent), or null when no question is open. Several questions are answered in one
+// message, one line each (no progress is kept).
+export async function asyncAnswer(threadId, text, n, tag = `[${n}]`, { db } = {}) {
+  const ask = (await openAsks(threadId, db)).at(-1)
+  if (!ask) return null
+  const form = asyncForm(ask.questions)
+  const r = step(form, null, text)
+  if (r.error) return { reply: stepText(form, n, r, tag) }
+  if (r.next) return { reply: `${tag} 有 ${fieldsOf(form).length} 个问题，要一次回完：一行一个、按顺序` }
+  return { text: asyncReplyText(ask, ask.questions.map((_, i) => r.progress.answers[i])) }
 }
 
 // --- plugin side ---

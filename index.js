@@ -8,6 +8,8 @@ import {
   desktopOwns, desktopSend,
 } from "./codex.js"
 import { desktopReply, readQuestion } from "./codex-question.js"
+// Namespace import: a hot reload can pair this file with an older codex-question.js that lacks asyncAnswer.
+import * as asyncQuestion from "./codex-question.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
@@ -1333,17 +1335,21 @@ async function runCodex(cmd, threadId, n, tg) {
     (await desktopReply(threadId, t, n, tg, { dir: PENDING_DIR }).catch((e) => `${tg} 回答没有送达：${short(e?.message, 150)}`))
   if (answered) return answered
   if (noMedia(t)) return noMedia(t)
-  const { text, images, note } = takeMedia(t)
+  // An async question (request_user_input_async) in the thread: send the text as its answer, in the window's format.
+  const ask = await asyncQuestion.asyncAnswer?.(threadId, t, n, tg).catch((e) => (warn("codex async question:", e), null))
+  if (ask?.reply) return ask.reply
+  const { text, images, note } = takeMedia(ask?.text ?? t)
   const opts = { images, model: state().codexModels?.[threadId] }
+  const sent = ask ? "已作为回答发给" : "已发给"
   try {
     if (!bridge().running(threadId) && (await desktopSend(threadId, text, undefined, opts).catch((e) => (warn("codex desktop send:", e), false))))
-      return `已发给 ${tg}${note}（电脑上的 Codex 窗口里能看到）`
+      return `${sent} ${tg}${note}（电脑上的 Codex 窗口里能看到）`
     await bridge().send(threadId, text, opts)
   } catch (e) {
     if (e.message === BUSY) return `${tg} ${BUSY}`
     throw e
   }
-  return `已发给 ${tg}${note}（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
+  return `${sent} ${tg}${note}（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
 }
 
 // 「发」 / 「3 图」 with nothing buffered: say so instead of sending the word to the AI.
