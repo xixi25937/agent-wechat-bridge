@@ -12,6 +12,7 @@ import { desktopReply, readQuestion } from "./codex-question.js"
 import * as asyncQuestion from "./codex-question.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
 import { md, numbered, ul } from "./md.js"
+import { pollLock } from "./poll-lock.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set([
@@ -1514,15 +1515,28 @@ async function poll(signal) {
   }
 }
 
-const POLLS = process.env.WECHAT_NOTIFY_POLL === "1" || process.argv.includes("--service")
+// WECHAT_NOTIFY_POLL: "0" never polls, "1" is eligible in any process, otherwise only the `--service` process is.
+// Eligible is not enough: only the process that holds DIR/poll.lock polls (see poll-lock.js).
+const POLL_ENV = process.env.WECHAT_NOTIFY_POLL
+const POLLS = POLL_ENV === "1" || (POLL_ENV !== "0" && process.argv.includes("--service"))
+
+function stopPoller() {
+  g.poller?.abort()
+  g.poller = null
+}
 
 function startPoller() {
   update((s) => (s.pollerPid = process.pid))
-  g.poller?.abort()
+  stopPoller()
   const c = new AbortController()
   c.gen = GEN
   g.poller = c
   poll(c.signal).catch((e) => warn("poller stopped:", e))
+}
+
+function stopLock(keep) {
+  g.lock?.stop(keep)
+  g.lock = null
 }
 
 export default {
@@ -1532,10 +1546,15 @@ export default {
     g.ctxs.add(ctx)
     // Other `opencode serve` processes (TUI etc.) load this plugin too; only the desktop service polls WeChat.
     // One poller per process; a hot-reloaded module replaces the old one.
-    if (!POLLS) {
-      g.poller?.abort()
-      g.poller = null
-    } else if (g.poller?.gen !== GEN) startPoller()
+    // A reloaded (or newly evaluated) module replaces the old lock and poller; the file stays, and this pid takes it again.
+    if (!POLLS) (stopLock(), stopPoller())
+    else if (g.lock?.gen !== GEN) {
+      stopLock(true)
+      stopPoller()
+      g.lock = pollLock(DIR, { onHeld: startPoller, onLost: stopPoller })
+      g.lock.gen = GEN
+      g.lock.start()
+    }
     // Hot reload: the old module's app-server would keep running old code.
     if (g.bridge && g.bridge.gen !== GEN) (g.bridge.stop(), (g.bridge = null))
     const handle = async (event) => {
@@ -1583,8 +1602,8 @@ export default {
       controller.abort()
       g.ctxs.delete(ctx)
       if (!g.ctxs.size) {
-        g.poller?.abort()
-        g.poller = null
+        stopLock()
+        stopPoller()
         g.bridge?.stop()
         g.bridge = null
       }
