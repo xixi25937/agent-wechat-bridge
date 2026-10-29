@@ -9,7 +9,7 @@ const qform = {
   title: "Questions",
   metadata: { kind: "question" },
   fields: [
-    { key: "q0", type: "string", title: "主控形式", description: "“两个主控”是指哪种？", options: opt("插两块地猛星核心板 (Recommended)", "两颗 MSPM0G3507 直接焊"), custom: true },
+    { key: "q0", type: "string", title: "页面颜色", description: "你喜欢哪种？", options: opt("浅色 (Recommended)", "深色"), custom: true },
     { key: "q1", type: "string", title: "用哪个工程", description: "我在哪里画？", options: opt("新建工程", "就用当前工程"), custom: true },
     { key: "q2", type: "string", title: "另一个 agent", description: "停了吗？", options: opt("已经停了", "还在跑"), custom: true },
   ],
@@ -21,9 +21,9 @@ test("formText lists every question", () => {
     t,
     [
       "有问题问你：",
-      "问题 1/3：主控形式：“两个主控”是指哪种？（可跳过，也可以直接写答案）",
-      "  1. 插两块地猛星核心板 (Recommended)",
-      "  2. 两颗 MSPM0G3507 直接焊",
+      "问题 1/3：页面颜色：你喜欢哪种？（可跳过，也可以直接写答案）",
+      "  1. 浅色 (Recommended)",
+      "  2. 深色",
       "问题 2/3：用哪个工程：我在哪里画？（可跳过，也可以直接写答案）",
       "  1. 新建工程",
       "  2. 就用当前工程",
@@ -41,27 +41,27 @@ test("formText lists every question", () => {
 test("one message, one line per question", () => {
   // What the user actually sent to [7], as one message.
   assert.deepEqual(formAction(qform, null, "1\n就用当前工程\n已经停了", 7), {
-    submit: { q0: "插两块地猛星核心板 (Recommended)", q1: "就用当前工程", q2: "已经停了" },
+    submit: { q0: "浅色 (Recommended)", q1: "就用当前工程", q2: "已经停了" },
   })
   // Numbered lines in any order; label match ignores case and the (Recommended) suffix; free text is kept.
-  assert.deepEqual(formAction(qform, null, "3. 还在跑\n1. 插两块地猛星核心板\n2：另一个自己停了，用这个", 7).submit, {
-    q0: "插两块地猛星核心板 (Recommended)", q1: "另一个自己停了，用这个", q2: "还在跑",
+  assert.deepEqual(formAction(qform, null, "3. 还在跑\n1. 浅色\n2：另一个自己停了，用这个", 7).submit, {
+    q0: "浅色 (Recommended)", q1: "另一个自己停了，用这个", q2: "还在跑",
   })
-  assert.deepEqual(formAction(qform, null, "2\n-\n跳过", 7).submit, { q0: "两颗 MSPM0G3507 直接焊" })
+  assert.deepEqual(formAction(qform, null, "2\n-\n跳过", 7).submit, { q0: "深色" })
   assert.match(formAction(qform, null, "1\n2\n1\n2", 7).reply, /^\[7\] 还剩 3 个问题，你回了 4 行/)
 })
 
 test("step by step", () => {
   // The two messages the user sent: the first is question 1, the second answers question 2 as free text.
   const a = formAction(qform, null, "1", 7)
-  assert.deepEqual(a.save, { id: "frm_1", done: ["q0"], answers: { q0: "插两块地猛星核心板 (Recommended)" } })
+  assert.deepEqual(a.save, { id: "frm_1", done: ["q0"], answers: { q0: "浅色 (Recommended)" } })
   assert.match(a.reply, /^\[7\] 已记下 1\/3，下一个：\n问题 2\/3：用哪个工程/)
   const b = formAction(qform, a.save, "就用这个工程，另一个自己停了", 7)
-  assert.deepEqual(b.save.answers, { q0: "插两块地猛星核心板 (Recommended)", q1: "就用这个工程，另一个自己停了" })
+  assert.deepEqual(b.save.answers, { q0: "浅色 (Recommended)", q1: "就用这个工程，另一个自己停了" })
   assert.match(b.reply, /^\[7\] 已记下 2\/3，下一个：\n问题 3\/3/)
   // Two lines can finish what is left.
   const c = formAction(qform, a.save, "2\n1", 7)
-  assert.deepEqual(c.submit, { q0: "插两块地猛星核心板 (Recommended)", q1: "就用当前工程", q2: "已经停了" })
+  assert.deepEqual(c.submit, { q0: "浅色 (Recommended)", q1: "就用当前工程", q2: "已经停了" })
   assert.deepEqual(formAction(qform, b.save, "-", 7), { submit: b.save.answers })
   // Progress of another form is ignored.
   assert.match(formAction(qform, { ...a.save, id: "frm_old" }, "1", 7).reply, /已记下 1\/3/)
@@ -74,10 +74,10 @@ test("cancel, and nothing turns into a prompt", () => {
   // 「7 y」 with no permission pending is not taken as an answer.
   assert.equal(formAction(qform, null, "y", 7, { decision: true }).reply, "[7] 没有待批准的请求\n[7] 在等你回答问题，回答或发「7 忽略」")
   // With a tag: the reply starts with it, and the 「N 忽略」 hint line after it says just [7]; typed numbers stay plain.
-  const tg = "[7] OpenCode · PCBAI-design"
+  const tg = "[7] OpenCode · todo-app"
   assert.equal(formAction(qform, null, "y", 7, { decision: true, tag: tg }).reply, `${tg} 没有待批准的请求\n[7] 在等你回答问题，回答或发「7 忽略」`)
   assert.equal(formAction(qform, null, "忽略", 7, { numbered: false, tag: tg }).reply, `要忽略 ${tg} 的问题请发「7 忽略」`)
-  assert.match(formAction(qform, null, "1", 7, { tag: tg }).reply, /^\[7\] OpenCode · PCBAI-design 已记下 1\/3，下一个：\n.*\n回复「7 答案」$/s)
+  assert.match(formAction(qform, null, "1", 7, { tag: tg }).reply, /^\[7\] OpenCode · todo-app 已记下 1\/3，下一个：\n.*\n回复「7 答案」$/s)
   assert.equal(formAction(qform, null, "忽略", 4, { cancel: false, tag: "[4] Codex · proj" }).reply, "[4] Codex · proj 这个提问没法忽略，回答它，或发「4 /stop」停止这一轮")
   const strict = { id: "f", fields: [{ key: "c", type: "string", required: true, options: opt("红", "蓝") }] }
   const r = formAction(strict, null, "绿", 3)

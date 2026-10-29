@@ -154,7 +154,7 @@ export function stepText(form, n, r, tag = `[${n}]`) {
 
 // What a WeChat message does to a pending form; never a prompt. `numbered`: the message had 「N 」 in front;
 // `decision`: it was 「N y/n」 with no permission pending. `cancel`: hint 「N 忽略」 (OpenCode only).
-// `tag`: how replies name the conversation ("[7] OpenCode · PCB"); the line appended after another reply that already
+// `tag`: how replies name the conversation ("[7] OpenCode · todo-app"); the line appended after another reply that already
 // starts with it says just "[7]".
 // Returns { cancel }, { reply } (nothing changes), { save, reply } (progress), or { submit: answer }.
 export function formAction(form, progress, text, n, { numbered = true, decision = false, cancel = true, tag = `[${n}]` } = {}) {

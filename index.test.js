@@ -91,7 +91,7 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("3个文件"), { type: "text", text: "3个文件" })
   assert.deepEqual(parseCommand("目录"), { type: "dirs" })
   assert.deepEqual(parseCommand("目录 2"), { type: "cd", arg: "2" })
-  assert.deepEqual(parseCommand("文件夹 马原"), { type: "cd", arg: "马原" })
+  assert.deepEqual(parseCommand("文件夹 读书笔记"), { type: "cd", arg: "读书笔记" })
   assert.deepEqual(parseCommand("新对话"), { type: "new", text: "" })
   assert.deepEqual(parseCommand("新对话 帮我看下 README"), { type: "new", text: "帮我看下 README" })
   assert.deepEqual(parseCommand("新对话的想法"), { type: "text", text: "新对话的想法" })
@@ -119,7 +119,7 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("列表 帮助"), multi("list", "help"))
   assert.deepEqual(parseCommand("帮助\n列表"), multi("help", "list"))
   assert.deepEqual(parseCommand("帮助，列表。"), multi("help", "list"))
-  assert.deepEqual(parseCommand("目录 马原"), { type: "cd", arg: "马原" })
+  assert.deepEqual(parseCommand("目录 读书笔记"), { type: "cd", arg: "读书笔记" })
   assert.deepEqual(parseCommand("5 帮我列表一下文件"), { type: "text", n: 5, text: "帮我列表一下文件" })
   assert.deepEqual(parseCommand("列表里第二个是什么"), { type: "text", text: "列表里第二个是什么" })
   assert.deepEqual(parseCommand("3 y"), { type: "text", n: 3, text: "y" })
@@ -130,7 +130,7 @@ test("imagePaths", () => {
   const dir = "C:\\proj"
   assert.deepEqual(imagePaths("截图在 C:\\a\\b\\x.png。", dir), ["C:\\a\\b\\x.png"])
   assert.deepEqual(imagePaths("C:/a/y.JPG, done", dir), ["C:\\a\\y.JPG"])
-  assert.deepEqual(imagePaths("截图在D:\\马原\\x.png", dir), ["D:\\马原\\x.png"])
+  assert.deepEqual(imagePaths("截图在D:\\读书笔记\\x.png", dir), ["D:\\读书笔记\\x.png"])
   assert.deepEqual(imagePaths("见 file:///C:/a%20b/z.webp", dir), ["C:\\a b\\z.webp"])
   assert.deepEqual(imagePaths("![图](C:\\a\\m.gif) 和 [链接](<C:\\a b\\n.jpeg>)", dir), ["C:\\a\\m.gif", "C:\\a b\\n.jpeg"])
   assert.deepEqual(imagePaths("文件 `C:\\My Pics\\q.png` 好了", dir), ["C:\\My Pics\\q.png"])
@@ -187,18 +187,18 @@ test("historyLines", () => {
 })
 
 test("pickDir", () => {
-  const dirs = ["C:\\a\\11", "C:\\a\\马原", "C:\\a\\PPT模板", "codex:C:\\b\\11", "codex:C:\\b\\proj"]
-  assert.equal(pickDir(dirs, "2"), "C:\\a\\马原")
+  const dirs = ["C:\\a\\11", "C:\\a\\读书笔记", "C:\\a\\PPT模板", "codex:C:\\b\\11", "codex:C:\\b\\proj"]
+  assert.equal(pickDir(dirs, "2"), "C:\\a\\读书笔记")
   assert.equal(pickDir(dirs, "9"), undefined)
   assert.equal(pickDir(dirs, "ppt"), "C:\\a\\PPT模板")
-  assert.equal(pickDir(dirs, "马原"), "C:\\a\\马原")
+  assert.equal(pickDir(dirs, "读书笔记"), "C:\\a\\读书笔记")
   assert.equal(pickDir(dirs, "4"), "codex:C:\\b\\11")
   assert.equal(pickDir(dirs, "Codex · 11"), "codex:C:\\b\\11")
   assert.equal(pickDir(dirs, "codex 11"), "codex:C:\\b\\11")
   assert.equal(pickDir(dirs, "proj"), "codex:C:\\b\\proj")
-  assert.equal(pickDir(dirs, "codex 马原"), undefined)
+  assert.equal(pickDir(dirs, "codex 读书笔记"), undefined)
   assert.equal(dirLabel("codex:C:\\b\\proj"), "Codex · proj")
-  assert.equal(dirLabel("C:\\a\\马原"), "马原")
+  assert.equal(dirLabel("C:\\a\\读书笔记"), "读书笔记")
 })
 
 test("codexPushText", () => {

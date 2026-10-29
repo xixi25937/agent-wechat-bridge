@@ -24,8 +24,8 @@ test("tag: cache first, lookup only when it is missing", async () => {
   assert.deepEqual(state().info.ses_a, { dir: "C:\\w\\ttool" })
   assert.equal(await tag("ses_a", undefined, async () => assert.fail("cached")), "[1] OpenCode · ttool")
   // Nothing cached: one lookup, then cached.
-  assert.equal(await tag("ses_b", undefined, find("C:\\w\\PCBAI-design")), "[2] OpenCode · PCBAI-design")
-  assert.equal(await tag("ses_b", undefined, find("other")), "[2] OpenCode · PCBAI-design")
+  assert.equal(await tag("ses_b", undefined, find("C:\\w\\todo-app")), "[2] OpenCode · todo-app")
+  assert.equal(await tag("ses_b", undefined, find("other")), "[2] OpenCode · todo-app")
   assert.deepEqual(lookups, ["ses_b"])
   // The agent comes from the key prefix.
   assert.equal(await tag("codex:t1", undefined, find("C:\\w\\proj")), "[3] Codex · proj")
