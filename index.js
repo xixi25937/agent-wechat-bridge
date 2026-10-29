@@ -42,7 +42,7 @@ const STATUS = { succeeded: "完成", failed: "出错", interrupted: "中断" }
 const HELP = [
   "用法：",
   "3 内容 → 发给 [3] 号对话",
-  "直接发内容 → 发给你上次用编号指定的对话（回复里会标明发给了几号）",
+  "直接发内容 → 发给你上次用编号指定的对话（回复里会标明发给了哪个对话）",
   "[3] 有问题等你回答时：「3 答案」；几个问题可以一行一个一次回完，也可以一条一个；「-」跳过可选的，「3 忽略」不回答",
   "3 y / 3 n → 批准一次 / 拒绝 [3] 的权限请求",
   "3 → 再看一次 [3] 的最后回复",
@@ -54,7 +54,7 @@ const HELP = [
   "发图片/文件 → 先存着，下一条文字（或「3 内容」）带上它们一起发；不用说明就回「发」或「3 图」（10 分钟内有效）",
   "实时 关 / 实时 开 → 关掉 / 打开回复过程中的推送（约 15 秒一条）；「3 实时 关」只管 [3]，「实时」看状态",
   "3 撤回 → 撤回你发给 [3] 的最后一条消息和之后的回复（要再发「3 撤回 确认」）；不带编号就是当前对话，也认 /unsend",
-  "Codex 对话标着「Codex ·」，用法相同",
+  "编号后面是 agent 和目录，如 [3] OpenCode · ttool、[5] Codex · proj；两种对话用法相同",
   "/ 命令见下一条",
 ].join("\n")
 const SLASH_HELP = [
@@ -64,9 +64,9 @@ const SLASH_HELP = [
   "/compact → 压缩上下文",
 ].join("\n")
 
-export function slashHelpText(n, commands) {
+export function slashHelpText(t, commands) {
   const lines = [SLASH_HELP]
-  if (n != null) lines[0] = lines[0].replace("当前对话", `当前对话 [${n}]`)
+  if (t) lines[0] = lines[0].replace("当前对话", `当前对话 ${t}`)
   if (commands?.length) {
     lines.push("", "OpenCode 自带命令：")
     for (const c of commands) lines.push(`/${c.name}${c.description ? ` → ${short(c.description, 50)}` : ""}`)
@@ -78,11 +78,11 @@ export function slashHelpText(n, commands) {
 async function slashHelp() {
   const sessionID = targetID()
   if (!sessionID) return SLASH_HELP
-  const n = numOf(sessionID)
-  if (sessionID.startsWith(CODEX)) return slashHelpText(n) + "\n（Codex 对话只支持上面这三个）"
+  const t = await tag(sessionID)
+  if (sessionID.startsWith(CODEX)) return slashHelpText(t) + "\n（Codex 对话只支持上面这三个）"
   const session = (await oc(`/api/session/${sid(sessionID)}`)).data
   const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
-  return slashHelpText(n, toArr(await oc(`/api/command?${loc}`)))
+  return slashHelpText(t, toArr(await oc(`/api/command?${loc}`)))
 }
 const IMG = /\.(png|jpe?g|gif|webp)$/i
 const MAX_IMAGES = 4
@@ -117,8 +117,8 @@ export function clip(text, n, max = MAX_CHARS) {
 }
 
 // One WeChat message per chunk of about `size` characters, cut at a paragraph or line break when one is in the
-// second half of the chunk. Chunks are numbered "(1/3)": on the first line of the first, and after the "[N]" tag
-// of the text on the others.
+// second half of the chunk. Chunks are numbered "(1/3)": on the first line of the first (which carries the full
+// "[N] OpenCode · 目录" tag), and after the short "[N]" on the others.
 export function splitText(text, size = CHUNK_CHARS) {
   let rest = String(text ?? "")
   if (rest.length <= size) return [rest]
@@ -138,8 +138,31 @@ export function splitText(text, size = CHUNK_CHARS) {
   return parts.map((p, i) => (i ? `${tag ? tag + " " : ""}(${i + 1}/${k})\n${p}` : p.replace(/^.*/, (l) => `${l} (1/${k})`)))
 }
 
-export const head = (n, session, fallbackDir) =>
-  `[${n}] ${base(session?.location?.directory ?? fallbackDir)} / ${short(session?.title, 40) || "未命名会话"}`
+const AGENT = (key) => (key.startsWith(CODEX) ? "Codex" : "OpenCode")
+
+// "[5] OpenCode · ttool": the tag every message uses where it names a conversation. No folder, no " · 目录".
+export const tagText = (n, agent, dir) => `[${n}] ${agent}${dir ? ` · ${base(dir)}` : ""}`
+
+// The same from the state `s`, for a key that has a number; the folder is whatever tag() cached.
+export const tagIn = (s, key, n = s.nums[key]) => tagText(n, AGENT(key), s.info?.[key]?.dir)
+
+// Cached in the state file (`info`), so a message naming a conversation needs no API call. Dropped with the number.
+const remember = (key, dir) => dir && state().info?.[key]?.dir !== dir && update((s) => ((s.info ??= {})[key] = { dir }))
+
+const findDir = async (key) =>
+  key.startsWith(CODEX) ? cleanDir((await codexThread(key.slice(CODEX.length)))?.cwd) : (await oc(`/api/session/${sid(key)}`)).data?.location?.directory
+
+// Tag of a conversation by key. `dir`: its folder when the caller has it (cached); otherwise the cache, and only
+// when that is empty `find(key)` looks it up. A failed lookup leaves just "[N] OpenCode" / "[N] Codex".
+export async function tag(key, dir, find = findDir) {
+  await assign(key)
+  remember(key, dir)
+  if (!state().info?.[key]?.dir) remember(key, await find(key).catch(() => ""))
+  return tagIn(state(), key)
+}
+
+export const head = (n, session, fallbackDir) => `${ocTag(n, session, fallbackDir)} / ${short(session?.title, 40) || "未命名会话"}`
+const ocTag = (n, session, fallbackDir) => tagText(n, "OpenCode", session?.location?.directory ?? fallbackDir)
 
 export function sessionIDOf(event) {
   return event?.data?.sessionID ?? event?.data?.form?.sessionID
@@ -189,8 +212,8 @@ export function codexUnsendPlan(turns) {
   return null
 }
 
-export const unsendAsk = (n, p, running) =>
-  `[${n}] 将撤回${p.kind === "inbox" ? "还在排队的" : ""}「${short(p.text, 30)}」${p.replies ? `及之后的 ${p.replies} 条回复` : ""}` +
+export const unsendAsk = (n, p, running, t = `[${n}]`) =>
+  `${t} 将撤回${p.kind === "inbox" ? "还在排队的" : ""}「${short(p.text, 30)}」${p.replies ? `及之后的 ${p.replies} 条回复` : ""}` +
   `${running ? "（会先停止正在运行的回复）" : ""}，确认发「${n} 撤回 确认」（2 分钟内有效）`
 
 // "shell ×3、edit" for a Map of tool name → calls.
@@ -198,7 +221,8 @@ const used = (tools) => [...tools].map(([k, v]) => (v > 1 ? `${k} ×${v}` : k)).
 
 // One WeChat message per user / assistant message, oldest first, plus a closing line. `msgs` is newest first.
 // Tool calls of tool-only assistant messages are folded into the next assistant text of the same turn.
-export function historyLines(msgs, n, count) {
+// Only the first message carries the full tag `full`; the rest start with the short "[N]".
+export function historyLines(msgs, n, count, full = `[${n}]`) {
   const items = []
   let tools = new Map()
   for (const m of [...(msgs ?? [])].reverse()) {
@@ -207,18 +231,18 @@ export function historyLines(msgs, n, count) {
     if (m.type === "user") {
       tools = new Map()
       const t = userText(m)
-      if (t) items.push(`[${n}] 你：${clip(t)}`)
+      if (t) items.push(`你：${clip(t)}`)
     } else if (m.type === "assistant") {
       for (const c of parts) if (c.type === "tool") tools.set(c.name, (tools.get(c.name) ?? 0) + 1)
       if (!text) continue
       const u = used(tools)
-      items.push(`[${n}] AI：${clip(text)}${u ? `\n（调用了 ${u}）` : ""}`)
+      items.push(`AI：${clip(text)}${u ? `\n（调用了 ${u}）` : ""}`)
       tools = new Map()
     }
   }
   const out = items.slice(-count)
-  if (!out.length) return [`[${n}] 还没有消息`]
-  return [...out, `[${n}] 以上是最近 ${out.length} 条${out.length < count ? "（只找到这么多）" : ""}`]
+  if (!out.length) return [`${full} 还没有消息`]
+  return [...out.map((x, i) => `${i ? `[${n}]` : full} ${x}`), `[${n}] 以上是最近 ${out.length} 条${out.length < count ? "（只找到这么多）" : ""}`]
 }
 
 // Returns the push text, or null when this event should not notify. `live`: see doneText.
@@ -228,7 +252,7 @@ export function format(event, session, n, reply, live) {
   const h = hd + "\n"
   switch (event.type) {
     case "session.execution.succeeded":
-      return session?.parentID ? null : doneText(hd, n, reply, live)
+      return session?.parentID ? null : doneText(hd, n, reply, live, ocTag(n, session, event.location?.directory))
     case "session.execution.failed":
       return h + "出错：" + short(d.error?.message || d.error?.type || "未知错误", 300)
     case "permission.asked": {
@@ -243,9 +267,9 @@ export function format(event, session, n, reply, live) {
 
 // Live progress (see takeLive): `live` is { body, pushed }, the text not pushed yet and whether any of the run was.
 // A run that pushed progress ends with only what wasn't pushed, or one line when nothing is left; any other run
-// ends with its last reply, as without progress.
-export const doneText = (h, n, reply, live) =>
-  !live?.pushed ? `${h}\n${clip(reply, n) || "完成（没有文字回复）"}` : live.body ? `${h}\n${clip(live.body, n)}` : `[${n}] 完成`
+// ends with its last reply, as without progress. `t`: the conversation's tag, for the one-line ending.
+export const doneText = (h, n, reply, live, t = `[${n}]`) =>
+  !live?.pushed ? `${h}\n${clip(reply, n) || "完成（没有文字回复）"}` : live.body ? `${h}\n${clip(live.body, n)}` : `${t} 完成`
 
 // Errors, approvals and questions carry the pending progress first (after the header line), so order is kept.
 export const withPre = (msg, live) => (live?.body ? msg.replace("\n", `\n${clip(live.body)}\n\n`) : msg)
@@ -268,14 +292,14 @@ export const liveOn = (s, key) => s.live?.[key] ?? s.live?.["*"] ?? true
 export function liveCmd(s, key, n, on) {
   const word = (v) => (v ? "开" : "关")
   if (on == null) {
-    if (key !== "*") return `[${n}] 实时推送：${word(liveOn(s, key))}`
+    if (key !== "*") return `${tagIn(s, key, n)} 实时推送：${word(liveOn(s, key))}`
     const all = liveOn(s, "*")
-    const other = Object.entries(s.live ?? {}).filter(([k, v]) => k !== "*" && v !== all && s.nums[k]).map(([k]) => `[${s.nums[k]}]`)
+    const other = Object.entries(s.live ?? {}).filter(([k, v]) => k !== "*" && v !== all && s.nums[k]).map(([k]) => tagIn(s, k))
     return `实时推送：${word(all)}${other.length ? `（${other.join("、")} ${word(!all)}）` : ""}\n「实时 关」/「实时 开」切换所有对话，「编号 实时 关」只切换一个`
   }
   if (key === "*") s.live = { "*": on }
   else (s.live ??= {})[key] = on
-  return `${key === "*" ? "所有对话的" : `[${n}] 的`}实时推送已${on ? "打开" : "关闭"}${on ? "" : "，回复完成时照常推送"}`
+  return `${key === "*" ? "所有对话的" : `${tagIn(s, key, n)} 的`}实时推送已${on ? "打开" : "关闭"}${on ? "" : "，回复完成时照常推送"}`
 }
 
 const KEYWORDS = [
@@ -620,6 +644,7 @@ async function pruneNow() {
       delete s.nums[k]
       delete s.used[k]
       delete s.live?.[k]
+      delete s.info?.[k]
       if (k.startsWith(CODEX)) delete s.codexModels?.[k.slice(CODEX.length)]
     }
   })
@@ -966,19 +991,19 @@ async function newSession(text) {
     const cwd = dirPath(dir)
     const m = takeMedia(text)
     const id = await bridge().create(cwd, m.text, { images: m.images })
-    const n = await assign(CODEX + id)
+    const t = await tag(CODEX + id, cwd)
     update((s) => (s.last = s.target = CODEX + id))
-    return `已在 Codex · ${base(cwd)} 新建 [${n}]，已发出${m.note}（在后台运行，桌面端重新打开这个对话能看到）`
+    return `已新建 ${t}，已发出${m.note}（在后台运行，桌面端重新打开这个对话能看到）`
   }
   // Reuse the folder's latest model: the server default may not be usable (it failed once with gpt-5.5).
   const model = toArr(await oc(sessionsURL(1, dir)).catch(() => []))[0]?.model
   const session = (await oc("/api/session", { location: { directory: dir }, ...(model && { model }) })).data
-  const n = await assign(session.id)
+  const t = await tag(session.id, session.location?.directory ?? dir)
   update((s) => (s.last = s.target = session.id))
   // Without text the media stays buffered for the next message, which goes to this new session.
   const m = text ? takeMedia(text) : null
   if (m) await prompt(session.id, m.text, m.images)
-  return `已在 ${base(dir)} 新建 [${n}]${m ? `，已发出${m.note}` : "，接着直接发内容就行"}`
+  return `已新建 ${t}${m ? `，已发出${m.note}` : "，接着直接发内容就行"}`
 }
 
 export async function run(cmd) {
@@ -1010,6 +1035,8 @@ export async function run(cmd) {
   if (cmd.type === "live") {
     const key = cmd.n == null ? "*" : sessionOf(cmd.n)
     if (!key) return noNum(cmd.n)
+    // liveCmd runs inside update() and only reads the cache, so fill it first (the status lists conversations too).
+    for (const k of key === "*" ? Object.keys(state().live ?? {}).filter((k) => k !== "*" && state().nums[k]) : [key]) await tag(k)
     let reply
     update((s) => (reply = liveCmd(s, key, cmd.n, cmd.on)))
     return reply
@@ -1019,9 +1046,10 @@ export async function run(cmd) {
   if (!sessionID) return cmd.n == null ? HELP : noNum(cmd.n)
   if (cmd.n != null && state().target !== sessionID) update((s) => (s.target = sessionID))
   const n = numOf(sessionID)
-  if (cmd.type === "unsend") return sessionID.startsWith(CODEX) ? unsendCodex(cmd, sessionID.slice(CODEX.length), n) : unsendOC(cmd, sessionID, n)
-  if (cmd.type === "slash") return sessionID.startsWith(CODEX) ? slashCodex(cmd, sessionID.slice(CODEX.length), n) : slashOC(cmd, sessionID, n)
-  if (sessionID.startsWith(CODEX)) return runCodex(cmd, sessionID.slice(CODEX.length), n)
+  const tg = await tag(sessionID)
+  if (cmd.type === "unsend") return sessionID.startsWith(CODEX) ? unsendCodex(cmd, sessionID.slice(CODEX.length), n, tg) : unsendOC(cmd, sessionID, n, tg)
+  if (cmd.type === "slash") return sessionID.startsWith(CODEX) ? slashCodex(cmd, sessionID.slice(CODEX.length), tg) : slashOC(cmd, sessionID, n, tg)
+  if (sessionID.startsWith(CODEX)) return runCodex(cmd, sessionID.slice(CODEX.length), n, tg)
   if (cmd.type === "show") {
     const session = (await oc(`/api/session/${sid(sessionID)}`)).data
     return `${head(n, session)}\n${clip(await lastReply(sessionID, false), n) || "（还没有回复）"}`
@@ -1029,7 +1057,7 @@ export async function run(cmd) {
   if (cmd.type === "history") {
     // Tool-only assistant messages are skipped, so fetch extra.
     const limit = Math.min(100, cmd.count * 4 + 10)
-    return historyLines((await oc(`/api/session/${sid(sessionID)}/message?limit=${limit}&order=desc`)).data, n, cmd.count)
+    return historyLines((await oc(`/api/session/${sid(sessionID)}/message?limit=${limit}&order=desc`)).data, n, cmd.count, tg)
   }
   const t = cmd.text
   // Approvals need an explicit number, so a casual "好" never approves a request you didn't see.
@@ -1038,17 +1066,17 @@ export async function run(cmd) {
   if (decision && perms.length) {
     await oc(`/api/session/${sid(sessionID)}/permission/${sid(perms[0].id)}/reply`, { decision })
     // A reject also rejects every other pending request of the session.
-    if (decision === "reject") return `已拒绝 [${n}]`
-    return `已批准 [${n}]${perms.length > 1 ? `，还有 ${perms.length - 1} 个待批准` : ""}`
+    if (decision === "reject") return `已拒绝 ${tg}`
+    return `已批准 ${tg}${perms.length > 1 ? `，还有 ${perms.length - 1} 个待批准` : ""}`
   }
   // A prompt sent while a form is pending only waits in the inbox and the session stays blocked, so never send one.
   const forms = await formsOf(sessionID)
-  if (forms.length) return answerForm(sessionID, n, forms[0], t, { numbered: cmd.n != null, decision: !!decision })
-  if (decision) return `[${n}] 没有待批准的请求`
+  if (forms.length) return answerForm(sessionID, n, tg, forms[0], t, { numbered: cmd.n != null, decision: !!decision })
+  if (decision) return `${tg} 没有待批准的请求`
   if (noMedia(t)) return noMedia(t)
   const { text, images, note } = takeMedia(t)
   await prompt(sessionID, text, images)
-  return `已发给 [${n}]${note}`
+  return `已发给 ${tg}${note}`
 }
 
 // Pending forms of a session; drops saved progress once none is pending.
@@ -1060,8 +1088,8 @@ async function formsOf(sessionID) {
 
 // One WeChat message against a pending form: progress is kept in the state file until the last answer, which is
 // submitted with every answer in one reply. The result is read back, so a rejected answer is reported.
-async function answerForm(sessionID, n, form, text, opts) {
-  const a = formAction(form, state().forms?.[sessionID], text, n, opts)
+async function answerForm(sessionID, n, tg, form, text, opts) {
+  const a = formAction(form, state().forms?.[sessionID], text, n, { ...opts, tag: tg })
   if (a.save) update((s) => ((s.forms ??= {})[sessionID] = a.save))
   if (a.reply) return a.reply
   const url = `/api/session/${sid(sessionID)}/form/${sid(form.id)}`
@@ -1069,29 +1097,29 @@ async function answerForm(sessionID, n, form, text, opts) {
   await (a.cancel ? oc(url, undefined, "DELETE") : oc(`${url}/reply`, { answer: a.submit })).catch((e) => (err = e.message))
   const status = (await oc(url).catch(() => null))?.data?.state?.status
   update((s) => s.forms && delete s.forms[sessionID])
-  if (status === (a.cancel ? "cancelled" : "answered")) return a.cancel ? `已忽略 [${n}] 的问题` : `已回答 [${n}]`
-  if (status && status !== "pending") return `[${n}] 的问题已经在电脑上处理了`
+  if (status === (a.cancel ? "cancelled" : "answered")) return a.cancel ? `已忽略 ${tg} 的问题` : `已回答 ${tg}`
+  if (status && status !== "pending") return `${tg} 的问题已经在电脑上处理了`
   const why = short(err || `问题的状态是 ${status ?? "未知"}`, 200)
-  return `[${n}] ${a.cancel ? "忽略" : "提交"}没成功：${why}${status === "pending" ? `\n请重新回答：\n${formText(form, n)}` : ""}`
+  return `${tg} ${a.cancel ? "忽略" : "提交"}没成功：${why}${status === "pending" ? `\n请重新回答：\n${formText(form, n)}` : ""}`
 }
 
 // 「N 撤回」 asks first and remembers what it would take back; 「N 撤回 确认」 within UNSEND_MS does it, if that is still
 // the newest message. `plan()` resolves to an unsendPlan, `ask(p)` to the question, `act(p)` to the reply after doing it.
-async function unsend(cmd, key, n, plan, ask, act) {
+async function unsend(cmd, key, n, tg, plan, ask, act) {
   const p = await plan()
-  if (!p) return `[${n}] 没有可以撤回的消息`
+  if (!p) return `${tg} 没有可以撤回的消息`
   if (!cmd.confirm) {
     update((s) => (s.unsend = { key, id: p.id, at: Date.now() }))
     return ask(p)
   }
   const saved = state().unsend
   if (saved) update((s) => delete s.unsend)
-  if (saved?.key !== key || Date.now() - saved.at > UNSEND_MS) return `[${n}] 没有待确认的撤回（2 分钟内有效），先发「${n} 撤回」`
-  if (saved.id !== p.id) return `[${n}] 最后一条消息变了，没有撤回；要撤回就重新发「${n} 撤回」`
+  if (saved?.key !== key || Date.now() - saved.at > UNSEND_MS) return `${tg} 没有待确认的撤回（2 分钟内有效），先发「${n} 撤回」`
+  if (saved.id !== p.id) return `${tg} 最后一条消息变了，没有撤回；要撤回就重新发「${n} 撤回」`
   return act(p)
 }
 
-const undone = (n, p) => `已撤回 [${n}]「${short(p.text, 30)}」${p.replies ? `及之后的 ${p.replies} 条回复` : ""}`
+const undone = (tg, p) => `已撤回 ${tg}「${short(p.text, 30)}」${p.replies ? `及之后的 ${p.replies} 条回复` : ""}`
 
 // What a committed OpenCode revert did to files: its stage result lists the restored files, and has no snapshot
 // in a folder OpenCode doesn't snapshot (seen with a folder that isn't a git repo: files stay as they are).
@@ -1101,20 +1129,20 @@ export function revertFiles(r) {
   return r?.snapshot ? "这几轮没有改文件" : "改过的文件没有还原（这个文件夹没有快照，通常是因为它不是 git 仓库）"
 }
 
-async function unsendOC(cmd, sessionID, n) {
+async function unsendOC(cmd, sessionID, n, tg) {
   const url = `/api/session/${sid(sessionID)}`
-  if ((await oc(url)).data?.revert) return `[${n}] 电脑上有一个撤回还没完成，先在电脑上处理`
+  if ((await oc(url)).data?.revert) return `${tg} 电脑上有一个撤回还没完成，先在电脑上处理`
   const msgs = async () => toArr(await oc(`${url}/message?limit=50&order=desc`))
   const inbox = async () => toArr(await oc(`${url}/inbox`))
   const running = async () => !!(await oc("/api/session/active")).data?.[sessionID]
   const plan = async () => unsendPlan(await msgs(), await inbox())
-  return unsend(cmd, sessionID, n, plan, async (p) => unsendAsk(n, p, p.kind === "revert" && (await running())), async (p) => {
+  return unsend(cmd, sessionID, n, tg, plan, async (p) => unsendAsk(n, p, p.kind === "revert" && (await running()), tg), async (p) => {
     if (p.kind === "inbox") {
       // Cancelling an item that was delivered meanwhile is a no-op.
       await oc(`${url}/inbox/${sid(p.id)}`, undefined, "DELETE")
-      if ((await inbox()).some((i) => i.id === p.id)) return `[${n}] 没撤回成功，请在电脑上处理`
-      if ((await msgs()).some((m) => m.id === p.id)) return `[${n}] 这条已经发给 AI 了，没有撤回；要撤回就再发「${n} 撤回」`
-      return `已撤回 [${n}] 还在排队的「${short(p.text, 30)}」`
+      if ((await inbox()).some((i) => i.id === p.id)) return `${tg} 没撤回成功，请在电脑上处理`
+      if ((await msgs()).some((m) => m.id === p.id)) return `${tg} 这条已经发给 AI 了，没有撤回；要撤回就再发「${n} 撤回」`
+      return `已撤回 ${tg} 还在排队的「${short(p.text, 30)}」`
     }
     if (await running()) {
       await oc(`${url}/interrupt`, {})
@@ -1122,23 +1150,23 @@ async function unsendOC(cmd, sessionID, n) {
     }
     const r = (await oc(`${url}/revert/stage`, { messageID: p.id, files: true })).data
     await oc(`${url}/revert/commit`, {})
-    return `${undone(n, p)}；${revertFiles(r)}`
+    return `${undone(tg, p)}；${revertFiles(r)}`
   })
 }
 
 // Codex: thread/revert on the plugin's app-server, so not for a thread a window or terminal has open.
-async function unsendCodex(cmd, threadId, n) {
-  if (bridge().running(threadId)) return `[${n}] 正在运行，先发「${n} /stop」再撤回`
-  if (await desktopOwns(threadId).catch(() => false)) return `[${n}] 在电脑上的 Codex 窗口里打开着，请在窗口里操作`
+async function unsendCodex(cmd, threadId, n, tg) {
+  if (bridge().running(threadId)) return `${tg} 正在运行，先发「${n} /stop」再撤回`
+  if (await desktopOwns(threadId).catch(() => false)) return `${tg} 在电脑上的 Codex 窗口里打开着，请在窗口里操作`
   const plan = async () => codexUnsendPlan(await bridge().turns(threadId, 10))
-  return unsend(cmd, CODEX + threadId, n, plan, (p) => unsendAsk(n, p), async (p) => {
+  return unsend(cmd, CODEX + threadId, n, tg, plan, (p) => unsendAsk(n, p, false, tg), async (p) => {
     try {
       await bridge().revert(threadId, p.id)
     } catch (e) {
-      if (e.message === BUSY) return `[${n}] ${BUSY}`
+      if (e.message === BUSY) return `${tg} ${BUSY}`
       throw e
     }
-    return `${undone(n, p)}；Codex 只撤回对话记录，改过的文件不会还原`
+    return `${undone(tg, p)}；Codex 只撤回对话记录，改过的文件不会还原`
   })
 }
 
@@ -1167,20 +1195,20 @@ export function chunkLines(lines, max = CHUNK_CHARS) {
 }
 
 // Model list, or a switch to models[pick]. `current` is the label of the model in use.
-function modelReply(n, models, current, arg, apply, note) {
-  if (!models.length) return `[${n}] 没有可用的模型`
+function modelReply(tg, models, current, arg, apply, note) {
+  if (!models.length) return `${tg} 没有可用的模型`
   const footer = "回复「/model 编号」或「/model 名字」切换"
-  if (!arg) return chunkLines([`[${n}] 可用模型（共 ${models.length} 个）：`, ...modelLines(models, current), footer])
+  if (!arg) return chunkLines([`${tg} 可用模型（共 ${models.length} 个）：`, ...modelLines(models, current), footer])
   const found = pickModel(models, arg)
-  if (!found.length) return `[${n}] 没找到模型「${arg}」，发「/model」查看`
+  if (!found.length) return `${tg} 没找到模型「${arg}」，发「/model」查看`
   if (found.length > 1) {
     const lines = modelLines(models, current).filter((_, i) => found.includes(models[i]))
-    return chunkLines([`[${n}] 有 ${found.length} 个匹配「${arg}」，回「/model 编号」选一个：`, ...lines.slice(0, 30)])
+    return chunkLines([`${tg} 有 ${found.length} 个匹配「${arg}」，回「/model 编号」选一个：`, ...lines.slice(0, 30)])
   }
-  return apply(found[0]).then(() => `已把 [${n}] 切到 ${found[0].label}${note ?? ""}`)
+  return apply(found[0]).then(() => `已把 ${tg} 切到 ${found[0].label}${note ?? ""}`)
 }
 
-async function slashOC(cmd, sessionID, n) {
+async function slashOC(cmd, sessionID, n, tg) {
   const name = cmd.name.toLowerCase()
   const session = (await oc(`/api/session/${sid(sessionID)}`)).data
   const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
@@ -1190,17 +1218,17 @@ async function slashOC(cmd, sessionID, n) {
       .map((m) => ({ id: m.id, providerID: m.providerID, label: `${m.providerID}/${m.id}`, name: m.name, image: m.capabilities?.input?.includes("image") }))
       .sort((a, b) => a.label.localeCompare(b.label))
     const cur = session?.model && `${session.model.providerID}/${session.model.id}`
-    return modelReply(n, models, cur, cmd.args, (m) => oc(`/api/session/${sid(sessionID)}/model`, { model: { id: m.id, providerID: m.providerID } }), "（这个对话之后都用它，桌面端也是）")
+    return modelReply(tg, models, cur, cmd.args, (m) => oc(`/api/session/${sid(sessionID)}/model`, { model: { id: m.id, providerID: m.providerID } }), "（这个对话之后都用它，桌面端也是）")
   }
   if (name === "stop") {
     const r = await oc(`/api/session/${sid(sessionID)}/interrupt`, {})
-    return r?.interrupted ? `已停止 [${n}]` : `[${n}] 没有在运行`
+    return r?.interrupted ? `已停止 ${tg}` : `${tg} 没有在运行`
   }
   // Compactions and commands would wait in the inbox behind the form, like a prompt.
-  if ((await formsOf(sessionID)).length) return `[${n}] 在等你回答问题，回答或发「${n} 忽略」`
+  if ((await formsOf(sessionID)).length) return `${tg} 在等你回答问题，回答或发「${n} 忽略」`
   if (name === "compact") {
     await oc(`/api/session/${sid(sessionID)}/compact`, {})
-    return `[${n}] 开始压缩上下文`
+    return `${tg} 开始压缩上下文`
   }
   const cmds = toArr(await oc(`/api/command?${loc}`)).map((c) => c.name)
   const known = cmds.find((c) => c.toLowerCase() === name)
@@ -1211,34 +1239,34 @@ async function slashOC(cmd, sessionID, n) {
     text,
     ...(images.length && { files: images.map((p) => ({ uri: pathToFileURL(p).href, name: path.basename(p) })) }),
   })
-  return `已在 [${n}] 运行 /${known}${note}`
+  return `已在 ${tg} 运行 /${known}${note}`
 }
 
-async function slashCodex(cmd, threadId, n) {
+async function slashCodex(cmd, threadId, tg) {
   const name = cmd.name.toLowerCase()
   if (name === "model") {
     const models = (await bridge().models())
       .filter((m) => !m.hidden)
       .map((m) => ({ id: m.model, label: m.model, name: m.displayName, image: m.inputModalities?.includes("image") ?? true }))
     const cur = state().codexModels?.[threadId] ?? (await codexThread(threadId))?.model
-    return modelReply(n, models, cur, cmd.args, async (m) => update((s) => ((s.codexModels ??= {})[threadId] = m.id)),
+    return modelReply(tg, models, cur, cmd.args, async (m) => update((s) => ((s.codexModels ??= {})[threadId] = m.id)),
       "（从微信发出的每一轮都带上它，下一轮生效；Codex 会把它记成这个对话之后的模型）")
   }
   if (name === "stop") {
-    if (await bridge().interrupt(threadId)) return `已停止 [${n}]`
+    if (await bridge().interrupt(threadId)) return `已停止 ${tg}`
     const r = await desktopInterrupt(threadId).catch((e) => (warn("codex desktop stop:", e), null))
-    if (r) return `已停止 [${n}]（电脑上的 Codex 窗口）`
-    return r === "" ? `[${n}] 没有在运行` : `[${n}] 没有在运行（在终端里跑的只能在电脑上停）`
+    if (r) return `已停止 ${tg}（电脑上的 Codex 窗口）`
+    return r === "" ? `${tg} 没有在运行` : `${tg} 没有在运行（在终端里跑的只能在电脑上停）`
   }
   if (name === "compact") {
-    if (await desktopCompact(threadId).catch((e) => (warn("codex desktop compact:", e), false))) return `[${n}] 开始压缩上下文（电脑上的 Codex 窗口）`
+    if (await desktopCompact(threadId).catch((e) => (warn("codex desktop compact:", e), false))) return `${tg} 开始压缩上下文（电脑上的 Codex 窗口）`
     try {
       await bridge().compact(threadId)
     } catch (e) {
-      if (e.message === BUSY) return `[${n}] ${BUSY}`
+      if (e.message === BUSY) return `${tg} ${BUSY}`
       throw e
     }
-    return `[${n}] 开始压缩上下文，完成后推送`
+    return `${tg} 开始压缩上下文，完成后推送`
   }
   return `不认识的命令 /${cmd.name}，发「帮助」查看（Codex 对话支持 /model /stop /compact）`
 }
@@ -1271,7 +1299,7 @@ export function answerCodex(pending, n, decision, dir = PENDING_DIR) {
 }
 
 // 「N y」/「N n」 for a Codex thread: our own turn, a waiting terminal hook, or the desktop window.
-async function approveCodex(threadId, n, allow) {
+async function approveCodex(threadId, n, tg, allow) {
   const verb = allow ? "已批准" : "已拒绝"
   const mine = readPending().filter((p) => p.threadId === threadId)
   let count = bridge().approve(threadId, allow)
@@ -1280,38 +1308,38 @@ async function approveCodex(threadId, n, allow) {
   if (count) {
     // Desktop and bridge records only exist to route the answer; the terminal hook removes its own.
     dropPending(mine.filter((p) => p.mode !== "wait").slice(0, allow ? 1 : undefined))
-    return `${verb} [${n}]`
+    return `${verb} ${tg}`
   }
   if (mine.length) {
     dropPending(mine.filter((p) => p.mode !== "wait" || p.done))
     return "已经在电脑上处理了"
   }
-  return `[${n}] 没有待批准的请求`
+  return `${tg} 没有待批准的请求`
 }
 
-async function runCodex(cmd, threadId, n) {
+async function runCodex(cmd, threadId, n, tg) {
   const head = async () => codexHead(n, "", await codexThread(threadId), { base, short })
   if (cmd.type === "show") {
     const reply = replyText(codexMsgs(await bridge().turns(threadId, 3)), false)
     return `${await head()}\n${clip(reply, n) || "（还没有回复）"}`
   }
-  if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count)
+  if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count, tg)
   const t = cmd.text
-  if (cmd.n != null && (YES.test(t) || NO.test(t))) return approveCodex(threadId, n, YES.test(t))
-  const answered = bridge().reply(threadId, t, n)
+  if (cmd.n != null && (YES.test(t) || NO.test(t))) return approveCodex(threadId, n, tg, YES.test(t))
+  const answered = bridge().reply(threadId, t, n, tg)
   if (answered) return answered
   if (noMedia(t)) return noMedia(t)
   const { text, images, note } = takeMedia(t)
   const opts = { images, model: state().codexModels?.[threadId] }
   try {
     if (!bridge().running(threadId) && (await desktopSend(threadId, text, undefined, opts).catch((e) => (warn("codex desktop send:", e), false))))
-      return `已发给 [${n}]${note}（电脑上的 Codex 窗口里能看到）`
+      return `已发给 ${tg}${note}（电脑上的 Codex 窗口里能看到）`
     await bridge().send(threadId, text, opts)
   } catch (e) {
-    if (e.message === BUSY) return `[${n}] ${BUSY}`
+    if (e.message === BUSY) return `${tg} ${BUSY}`
     throw e
   }
-  return `已发给 [${n}]${note}（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
+  return `已发给 ${tg}${note}（在后台运行，回复完成会推送；桌面端重新打开这个对话能看到）`
 }
 
 // 「发」 / 「3 图」 with nothing buffered: say so instead of sending the word to the AI.
@@ -1328,7 +1356,11 @@ export function codexPushText(head, n, kind, text) {
 // Called synchronously in the order the app-server reports, so progress bookkeeping keeps that order.
 function codexPush(threadId, kind, text) {
   const key = CODEX + threadId
-  const info = async () => ({ head: codexHead(await assign(key), "", await codexThread(threadId), { base, short }) })
+  const info = async () => {
+    const thread = await codexThread(threadId)
+    remember(key, cleanDir(thread?.cwd))
+    return { head: codexHead(await assign(key), "", thread, { base, short }) }
+  }
   if (kind === "text") return addText(key, text, info)
   if (kind === "tool") return addTool(key, text, info)
   const live = takeLive(key, kind !== "approval" && kind !== "question", liveOn(state(), key))
@@ -1339,9 +1371,10 @@ async function codexSend(threadId, kind, text, live) {
   const key = CODEX + threadId
   const n = await assign(key)
   const thread = await codexThread(threadId)
+  remember(key, cleanDir(thread?.cwd))
   if (kind === "question") text = formText(questionForm(text), n, false)
   const h = codexHead(n, "", thread, { base, short })
-  let msg = kind === "done" ? doneText(h, n, text, live) : withPre(codexPushText(h, n, kind, text), live)
+  let msg = kind === "done" ? doneText(h, n, text, live, tagIn(state(), key, n)) : withPre(codexPushText(h, n, kind, text), live)
   const { files, big } = kind === "done" ? await replyImages(text, cleanDir(thread?.cwd)) : { files: [], big: [] }
   if (big.length) msg += `\n（图片太大没发：${big.join("、")}）`
   await push(key, msg)
@@ -1385,7 +1418,7 @@ async function bufferMedia(items) {
     }
   }
   const id = targetID()
-  return mediaAck(liveMedia(g.media), id && `[${numOf(id)}]`, failed)
+  return mediaAck(liveMedia(g.media), id && (await tag(id)), failed)
 }
 
 // Handles one polled message. `out` sends each reply (exported with it so a check can run without WeChat).
@@ -1487,7 +1520,9 @@ export default {
       const getSession = () => ctx.session.get({ sessionID }).catch(() => undefined)
       const info = async () => {
         const s = await getSession()
-        return s?.parentID ? { child: true } : { head: head(await assign(sessionID), s, event.location?.directory) }
+        if (s?.parentID) return { child: true }
+        remember(sessionID, s?.location?.directory ?? event.location?.directory)
+        return { head: head(await assign(sessionID), s, event.location?.directory) }
       }
       if (event.type === "session.text.ended") return addText(sessionID, event.data?.text, info)
       if (event.type === "session.tool.input.started") return addTool(sessionID, event.data?.name, info)
@@ -1500,6 +1535,7 @@ export default {
       if (event.type === "session.execution.succeeded" && session?.parentID) return
       const reply =
         event.type === "session.execution.succeeded" ? await lastReply(sessionID).catch((e) => (warn(e), "")) : ""
+      remember(sessionID, session?.location?.directory ?? event.location?.directory)
       let text = format(event, session, await assign(sessionID), reply, live)
       if (!text) return
       if (event.type !== "session.execution.succeeded") text = withPre(text, live)

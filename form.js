@@ -144,28 +144,30 @@ export function step(form, progress, text) {
 }
 
 // WeChat text for a step that didn't finish the form: the error and the question again, or the next question.
-export function stepText(form, n, r) {
+export function stepText(form, n, r, tag = `[${n}]`) {
   const all = fieldsOf(form, r.progress?.answers)
   const ask = (f) => fieldLines(f, all.indexOf(f) + 1, all.length)
-  if (r.error) return `[${n}] ${r.error}${r.field ? `\n${ask(r.field)}` : ""}`
+  if (r.error) return `${tag} ${r.error}${r.field ? `\n${ask(r.field)}` : ""}`
   const k = all.filter((f) => r.progress.done.includes(f.key)).length
-  return `[${n}] 已记下 ${k}/${all.length}，下一个：\n${ask(r.next)}\n回复「${n} 答案」`
+  return `${tag} 已记下 ${k}/${all.length}，下一个：\n${ask(r.next)}\n回复「${n} 答案」`
 }
 
 // What a WeChat message does to a pending form; never a prompt. `numbered`: the message had 「N 」 in front;
 // `decision`: it was 「N y/n」 with no permission pending. `cancel`: hint 「N 忽略」 (OpenCode only).
+// `tag`: how replies name the conversation ("[7] OpenCode · PCB"); the line appended after another reply that already
+// starts with it says just "[7]".
 // Returns { cancel }, { reply } (nothing changes), { save, reply } (progress), or { submit: answer }.
-export function formAction(form, progress, text, n, { numbered = true, decision = false, cancel = true } = {}) {
+export function formAction(form, progress, text, n, { numbered = true, decision = false, cancel = true, tag = `[${n}]` } = {}) {
   const wait = cancel ? `\n[${n}] 在等你回答问题，回答或发「${n} 忽略」` : ""
   const p = progress?.id === form.id ? progress : null
   if (CANCEL.test(text.trim())) {
-    if (!cancel) return { reply: `[${n}] 这个提问没法忽略，回答它，或发「${n} /stop」停止这一轮` }
-    return numbered ? { cancel: true } : { reply: `要忽略 [${n}] 的问题请发「${n} 忽略」` }
+    if (!cancel) return { reply: `${tag} 这个提问没法忽略，回答它，或发「${n} /stop」停止这一轮` }
+    return numbered ? { cancel: true } : { reply: `要忽略 ${tag} 的问题请发「${n} 忽略」` }
   }
   const cur = todo(form, { done: p?.done ?? [], answers: p?.answers ?? {} })[0]
-  if (decision && cur?.type !== "boolean") return { reply: `[${n}] 没有待批准的请求${wait}` }
+  if (decision && cur?.type !== "boolean") return { reply: `${tag} 没有待批准的请求${wait}` }
   const r = step(form, p, text)
-  if (r.error) return { reply: stepText(form, n, r) + wait }
-  if (r.next) return { save: { id: form.id, ...r.progress }, reply: stepText(form, n, r) }
+  if (r.error) return { reply: stepText(form, n, r, tag) + wait }
+  if (r.next) return { save: { id: form.id, ...r.progress }, reply: stepText(form, n, r, tag) }
   return { submit: r.progress.answers }
 }

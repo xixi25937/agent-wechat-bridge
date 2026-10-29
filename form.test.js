@@ -73,6 +73,12 @@ test("cancel, and nothing turns into a prompt", () => {
   assert.match(formAction(qform, null, "忽略", 7, { numbered: false }).reply, /发「7 忽略」/)
   // 「7 y」 with no permission pending is not taken as an answer.
   assert.equal(formAction(qform, null, "y", 7, { decision: true }).reply, "[7] 没有待批准的请求\n[7] 在等你回答问题，回答或发「7 忽略」")
+  // With a tag: the reply starts with it, and the 「N 忽略」 hint line after it says just [7]; typed numbers stay plain.
+  const tg = "[7] OpenCode · PCBAI-design"
+  assert.equal(formAction(qform, null, "y", 7, { decision: true, tag: tg }).reply, `${tg} 没有待批准的请求\n[7] 在等你回答问题，回答或发「7 忽略」`)
+  assert.equal(formAction(qform, null, "忽略", 7, { numbered: false, tag: tg }).reply, `要忽略 ${tg} 的问题请发「7 忽略」`)
+  assert.match(formAction(qform, null, "1", 7, { tag: tg }).reply, /^\[7\] OpenCode · PCBAI-design 已记下 1\/3，下一个：\n.*\n回复「7 答案」$/s)
+  assert.equal(formAction(qform, null, "忽略", 4, { cancel: false, tag: "[4] Codex · proj" }).reply, "[4] Codex · proj 这个提问没法忽略，回答它，或发「4 /stop」停止这一轮")
   const strict = { id: "f", fields: [{ key: "c", type: "string", required: true, options: opt("红", "蓝") }] }
   const r = formAction(strict, null, "绿", 3)
   assert.equal(r.reply, "[3] 「绿」不是选项，回编号或选项文字\nc\n  1. 红\n  2. 蓝\n[3] 在等你回答问题，回答或发「3 忽略」")

@@ -61,6 +61,13 @@ const alive = (pid) => {
   }
 }
 
+// Marks `key` as the latest conversation and caches its folder (state `info`), so the plugin's replies can name it.
+export function remember(s, key, cwd, thread) {
+  s.last = key
+  const dir = cleanDir(cwd || thread?.cwd)
+  if (dir) (s.info ??= {})[key] = { dir }
+}
+
 async function onStop(p, m) {
   const thread = await threadInfo(p.session_id)
   if (isSubagent(thread)) return
@@ -70,7 +77,7 @@ async function onStop(p, m) {
   const { files, big } = await m.replyImages(reply, cleanDir(p.cwd))
   let text = `${codexHead(n, p.cwd, thread, m)}\n${m.clip(reply, n) || NO_TEXT}`
   if (big.length) text += `\n（图片太大没发：${big.join("、")}）`
-  m.update((s) => (s.last = key))
+  m.update((s) => remember(s, key, p.cwd, thread))
   console.error(`${new Date().toISOString()} Stop [${n}] ${await m.send(text)}`)
   for (const f of files) await m.sendImage(f).catch((e) => console.error("[codex-hook] image:", m.short(e?.message, 150)))
 }
@@ -95,7 +102,7 @@ export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
     : how === "wait"
       ? `回复「${n} y」批准，「${n} n」拒绝（${waitS} 秒内没回复就在电脑上处理）`
       : `回复「${n} y」批准，「${n} n」拒绝（电脑上也可以直接点）`
-  m.update((s) => (s.last = key))
+  m.update((s) => remember(s, key, p.cwd, thread))
   const summary = permissionSummary(p, m.short)
   const sent = await m.send(`${codexHead(n, p.cwd, thread, m)}\n等你批准：${summary}\n${tail}`)
   if (!listening || sent === "error") return ""

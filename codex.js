@@ -461,15 +461,16 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
     },
     // WeChat text for the oldest held question: one line per question at once, or one per message (progress stays
     // on the held request). Returns the reply ("已回答 [n]" once answered), or null when no question is waiting.
-    reply(threadId, text, n) {
+    // `tag`: how the reply names the conversation, e.g. "[4] Codex · proj".
+    reply(threadId, text, n, tag = `[${n}]`) {
       const q = take(threadId, true)[0]
       if (!q) return null
       const form = { id: q.id, ...questionForm(q.params?.questions) }
-      const a = formAction(form, q.progress, text, n, { cancel: false })
+      const a = formAction(form, q.progress, text, n, { cancel: false, tag })
       if (a.save) q.progress = a.save
       if (a.reply) return a.reply
       answer(threadId, q, questionResult(a.submit))
-      return `已回答 [${n}]`
+      return `已回答 ${tag}`
     },
     stop() {
       clearTimeout(idle)

@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, permissionSummary, threadInfo } from "./codex-hook.js"
+import { approvalMode, codexHead, decisionOutput, isSubagent, onPermission, permissionSummary, remember, threadInfo } from "./codex-hook.js"
 import { answerCodex, base, readPending, short } from "./index.js"
 
 test("codexHead", () => {
@@ -12,6 +12,17 @@ test("codexHead", () => {
   assert.equal(h("C:\\a\\b", { name: null, title: "第一句话" }), "[7] Codex · b / 第一句话")
   assert.equal(h("", { cwd: "\\\\?\\D:\\x" }), "[7] Codex · x / 未命名会话")
   assert.equal(h("C:\\a\\b", null), "[7] Codex · b / 未命名会话")
+})
+
+test("remember: latest conversation and its folder go to the state", () => {
+  const s = {}
+  remember(s, "codex:t", "\\\\?\\C:\\a\\proj", null)
+  assert.deepEqual(s, { last: "codex:t", info: { "codex:t": { dir: "C:\\a\\proj" } } })
+  remember(s, "codex:u", "", { cwd: "D:\\x" })
+  assert.equal(s.info["codex:u"].dir, "D:\\x", "the thread's folder when the payload has none")
+  remember(s, "codex:v", "", null)
+  assert.equal(s.last, "codex:v")
+  assert.equal(s.info["codex:v"], undefined, "no folder known: nothing cached")
 })
 
 test("isSubagent", () => {

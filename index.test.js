@@ -12,23 +12,26 @@ const session = { id: "s1", title: "重构登录模块", location: { directory: 
 const ok = { type: "session.execution.succeeded", data: { sessionID: "s1" } }
 
 test("format", () => {
-  assert.equal(format(ok, session, 3, "改好了"), "[3] 22 / 重构登录模块\n改好了")
-  assert.equal(format(ok, session, 3, ""), "[3] 22 / 重构登录模块\n完成（没有文字回复）")
+  assert.equal(format(ok, session, 3, "改好了"), "[3] OpenCode · 22 / 重构登录模块\n改好了")
+  assert.equal(format(ok, session, 3, ""), "[3] OpenCode · 22 / 重构登录模块\n完成（没有文字回复）")
   assert.equal(format(ok, { ...session, parentID: "p" }, 3, "x"), null)
-  assert.equal(format({ ...ok, location: { directory: "/a/b" } }, undefined, 1, "x"), "[1] b / 未命名会话\nx")
+  assert.equal(format({ ...ok, location: { directory: "/a/b" } }, undefined, 1, "x"), "[1] OpenCode · b / 未命名会话\nx")
+  assert.equal(format(ok, undefined, 1, "x"), "[1] OpenCode / 未命名会话\nx", "no folder known: just the agent")
   assert.equal(
     format({ type: "session.execution.failed", data: { error: { type: "x", message: "rate\nlimited" } } }, session, 3),
-    "[3] 22 / 重构登录模块\n出错：rate limited",
+    "[3] OpenCode · 22 / 重构登录模块\n出错：rate limited",
   )
   assert.equal(
     format({ type: "permission.asked", data: { action: "shell", resources: ["git push"] } }, session, 3),
-    "[3] 22 / 重构登录模块\n等你批准：shell git push\n回复「3 y」批准一次，「3 n」拒绝",
+    "[3] OpenCode · 22 / 重构登录模块\n等你批准：shell git push\n回复「3 y」批准一次，「3 n」拒绝",
   )
+  // The one-line ending of a run whose progress was all pushed carries the tag, without the title.
+  assert.equal(format(ok, session, 3, "x", { body: "", pushed: true }), "[3] OpenCode · 22 完成")
   const fields = [{ key: "db", type: "string", title: "选数据库", options: [{ value: "pg", label: "Postgres" }] }]
   const form = { type: "form.created", data: { form: { sessionID: "s1", title: "用哪个数据库？", fields } } }
   assert.equal(
     format(form, session, 3),
-    "[3] 22 / 重构登录模块\n有问题问你：用哪个数据库？\n选数据库（可跳过）\n  1. Postgres\n回复「3 答案」（可以回编号）\n不想回答发「3 忽略」",
+    "[3] OpenCode · 22 / 重构登录模块\n有问题问你：用哪个数据库？\n选数据库（可跳过）\n  1. Postgres\n回复「3 答案」（可以回编号）\n不想回答发「3 忽略」",
   )
   assert.equal(sessionIDOf(form), "s1")
 })
@@ -41,12 +44,12 @@ test("clip", () => {
 })
 
 test("splitText", () => {
-  assert.deepEqual(splitText("[3] a / b\nhi"), ["[3] a / b\nhi"])
-  // Paragraph breaks win, then line breaks; numbering goes on the header line and after the [N] tag.
+  assert.deepEqual(splitText("[3] OpenCode · a / b\nhi"), ["[3] OpenCode · a / b\nhi"])
+  // Paragraph breaks win, then line breaks; numbering goes on the header line (full tag) and after the short [N] on the rest.
   const para = "x".repeat(700)
-  const parts = splitText(`[3] 22 / 标题\n${[para, para, para, para].join("\n\n")}`, 1800)
+  const parts = splitText(`[3] OpenCode · 22 / 标题\n${[para, para, para, para].join("\n\n")}`, 1800)
   assert.equal(parts.length, 2)
-  assert.ok(parts[0].startsWith("[3] 22 / 标题 (1/2)\n"))
+  assert.ok(parts[0].startsWith("[3] OpenCode · 22 / 标题 (1/2)\n"))
   assert.ok(parts[0].endsWith(para) && !parts[0].endsWith("\n"))
   assert.equal(parts[1], `[3] (2/2)\n${para}\n\n${para}`)
   const lines = Array.from({ length: 50 }, (_, i) => `第 ${i} 行 ${"y".repeat(60)}`).join("\n")
@@ -76,8 +79,8 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("/list"), { type: "list" })
   assert.deepEqual(parseCommand("帮助"), { type: "help" })
   assert.deepEqual(parseCommand("/"), { type: "help" })
-  const sh = slashHelpText(7, [{ name: "review", description: "review changes" }, { name: "init" }])
-  assert.ok(sh.includes("当前对话 [7]") && sh.includes("/model") && sh.includes("/stop") && sh.includes("/compact"))
+  const sh = slashHelpText("[7] OpenCode · ttool", [{ name: "review", description: "review changes" }, { name: "init" }])
+  assert.ok(sh.includes("当前对话 [7] OpenCode · ttool") && sh.includes("/model") && sh.includes("/stop") && sh.includes("/compact"))
   assert.ok(sh.includes("/review → review changes") && sh.includes("\n/init"))
   assert.ok(!slashHelpText(undefined).includes("自带命令"))
   assert.deepEqual(parseCommand("／"), { type: "help" })
@@ -165,6 +168,7 @@ test("historyLines", () => {
     user(" "),
     user("在吗"),
   ]
+  // Without a tag: plain "[N]" everywhere.
   assert.deepEqual(historyLines(msgs, 5, 10), [
     "[5] 你：在吗",
     "[5] AI：你好",
@@ -172,8 +176,10 @@ test("historyLines", () => {
     "[5] AI：改好了\n（调用了 shell ×2、read）",
     "[5] 以上是最近 4 条（只找到这么多）",
   ])
-  assert.deepEqual(historyLines(msgs, 5, 2), ["[5] 你：改一下", "[5] AI：改好了\n（调用了 shell ×2、read）", "[5] 以上是最近 2 条"])
-  assert.deepEqual(historyLines([], 5, 3), ["[5] 还没有消息"])
+  // With one: the first message carries the full tag, the rest the short one.
+  const full = "[5] OpenCode · ttool"
+  assert.deepEqual(historyLines(msgs, 5, 2, full), [`${full} 你：改一下`, "[5] AI：改好了\n（调用了 shell ×2、read）", "[5] 以上是最近 2 条"])
+  assert.deepEqual(historyLines([], 5, 3, full), [`${full} 还没有消息`])
   const many = []
   for (let i = 9; i >= 0; i--) many.push({ type: "assistant", content: [{ type: "text", text: `答${i}` }] }, { type: "user", text: `问${i}` })
   for (const c of [1, 2, 3, 4]) assert.equal(historyLines(many, 5, c).length, c + 1)
@@ -401,16 +407,17 @@ test("实时 command", () => {
   assert.deepEqual(parseCommand("5 实时关掉了吗"), { type: "text", n: 5, text: "实时关掉了吗" })
   const s = { nums: { a: 1, b: 2 } }
   assert.equal(liveOn(s, "a"), true, "on by default")
-  assert.match(liveCmd(s, "a", 1, false), /\[1\] 的实时推送已关闭/)
+  s.info = { a: { dir: "C:\\x\\ttool" } }
+  assert.match(liveCmd(s, "a", 1, false), /^\[1\] OpenCode · ttool 的实时推送已关闭/)
   assert.equal(liveOn(s, "a"), false)
   assert.equal(liveOn(s, "b"), true)
-  assert.match(liveCmd(s, "*", undefined), /^实时推送：开（\[1\] 关）/)
+  assert.match(liveCmd(s, "*", undefined), /^实时推送：开（\[1\] OpenCode · ttool 关）/)
   liveCmd(s, "*", undefined, false)
   assert.deepEqual(s.live, { "*": false }, "the global switch clears per-conversation ones")
   assert.equal(liveOn(s, "a"), false)
   liveCmd(s, "b", 2, true)
   assert.equal(liveOn(s, "b"), true)
-  assert.equal(liveCmd(s, "b", 2), "[2] 实时推送：开")
+  assert.equal(liveCmd(s, "b", 2), "[2] OpenCode 实时推送：开", "no folder cached: just the agent")
 })
 
 test("lowestFree hands out the lowest unused number", () => {
@@ -475,6 +482,7 @@ test("撤回 command and plan", () => {
   const long = { kind: "revert", text: "一二三四五六七八九十".repeat(4), replies: 2 }
   assert.equal(unsendAsk(3, long, true), "[3] 将撤回「一二三四五六七八九十一二三四五六七八九十一二三四五六七八九…」及之后的 2 条回复（会先停止正在运行的回复），确认发「3 撤回 确认」（2 分钟内有效）")
   assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }), "[3] 将撤回还在排队的「排队中」，确认发「3 撤回 确认」（2 分钟内有效）")
+  assert.equal(unsendAsk(3, { kind: "inbox", text: "排队中", replies: 0 }, false, "[3] Codex · proj"), "[3] Codex · proj 将撤回还在排队的「排队中」，确认发「3 撤回 确认」（2 分钟内有效）", "the number to type stays plain")
   assert.equal(revertFiles({ files: [{ file: "C:\\x\\b.txt" }, { file: "keep.txt" }], snapshot: "s" }), "改过的 2 个文件也还原了：b.txt、keep.txt")
   assert.equal(revertFiles({ files: [], snapshot: "s" }), "这几轮没有改文件")
   assert.match(revertFiles({ files: [] }), /没有还原/)
