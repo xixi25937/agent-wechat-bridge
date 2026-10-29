@@ -3,7 +3,7 @@ import { getEventListeners } from "node:events"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
-  PAIR_MS, aesKeyOf, chunkLines, clip, codexPushText, dirLabel, eventKey, extOf, format, historyLines, imagePaths, inboundMedia,
+  PAIR_MS, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, eventKey, extOf, format, historyLines, imagePaths, inboundMedia,
   inboundText, liveMedia, mediaAck, mergeLines, modelLines, parseCommand, pickDir, pickModel, replyText, sessionIDOf, shouldSend, sleep, withMedia,
 } from "./index.js"
 
@@ -52,6 +52,12 @@ test("parseCommand", () => {
   assert.deepEqual(parseCommand("列表"), { type: "list" })
   assert.deepEqual(parseCommand("/list"), { type: "list" })
   assert.deepEqual(parseCommand("帮助"), { type: "help" })
+  assert.deepEqual(parseCommand("/"), { type: "help" })
+  const sh = slashHelpText(7, [{ name: "review", description: "review changes" }, { name: "init" }])
+  assert.ok(sh.includes("当前对话 [7]") && sh.includes("/model") && sh.includes("/stop") && sh.includes("/compact"))
+  assert.ok(sh.includes("/review → review changes") && sh.includes("\n/init"))
+  assert.ok(!slashHelpText(undefined).includes("自带命令"))
+  assert.deepEqual(parseCommand("／"), { type: "help" })
   assert.deepEqual(parseCommand(" 3 "), { type: "show", n: 3 })
   assert.deepEqual(parseCommand("3 继续改\n第二行"), { type: "text", n: 3, text: "继续改\n第二行" })
   assert.deepEqual(parseCommand("3：y"), { type: "text", n: 3, text: "y" })

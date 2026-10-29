@@ -36,11 +36,36 @@ const HELP = [
   "新对话 内容 → 在选中的文件夹里开新对话（标着 Codex 的文件夹开 Codex 对话）",
   "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
   "发图片/文件 → 先存着，下一条文字（或「3 内容」）带上它们一起发；不用说明就回「发」或「3 图」（10 分钟内有效）",
-  "/model → 列出模型；/model 3 或 /model 名字 → 切换对话的模型（也可以「3 /model …」）",
-  "/stop → 停止正在运行的回复；/compact → 压缩上下文",
-  "其他 /命令 → OpenCode 自己的命令（比如 /review）",
   "Codex 对话标着「Codex ·」，用法相同",
+  "/ 命令见下一条",
 ].join("\n")
+const SLASH_HELP = [
+  "/ 命令（发给当前对话，也可以「3 /命令」指定）：",
+  "/model → 列出模型；/model 3 或 /model 名字 → 切换模型",
+  "/stop → 停止正在运行的回复",
+  "/compact → 压缩上下文",
+].join("\n")
+
+export function slashHelpText(n, commands) {
+  const lines = [SLASH_HELP]
+  if (n != null) lines[0] = lines[0].replace("当前对话", `当前对话 [${n}]`)
+  if (commands?.length) {
+    lines.push("", "OpenCode 自带命令：")
+    for (const c of commands) lines.push(`/${c.name}${c.description ? ` → ${short(c.description, 50)}` : ""}`)
+  }
+  return lines.join("\n")
+}
+
+// The slash list for the current target: OpenCode commands depend on the session's folder (plugins, skills).
+async function slashHelp() {
+  const sessionID = targetID()
+  if (!sessionID) return SLASH_HELP
+  const n = numOf(sessionID)
+  if (sessionID.startsWith(CODEX)) return slashHelpText(n) + "\n（Codex 对话只支持上面这三个）"
+  const session = (await oc(`/api/session/${sid(sessionID)}`)).data
+  const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
+  return slashHelpText(n, toArr(await oc(`/api/command?${loc}`)))
+}
 const IMG = /\.(png|jpe?g|gif|webp)$/i
 const MAX_IMAGES = 4
 const IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -133,7 +158,7 @@ export function format(event, session, n, reply) {
 
 const KEYWORDS = [
   ["list", /^(列表|\/?list|\/ls)$/i],
-  ["help", /^(帮助|\/?help|\?|？)$/i],
+  ["help", /^(帮助|\/?help|\?|？|\/|／)$/i],
   ["dirs", /^(目录|文件夹|\/?dirs?)$/i],
 ]
 const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img"])
@@ -630,7 +655,7 @@ export async function run(cmd) {
     for (const c of cmd.cmds) out.push(await run(c))
     return out.flat()
   }
-  if (cmd.type === "help") return HELP
+  if (cmd.type === "help") return [HELP, await slashHelp().catch((e) => (warn("help:", e), SLASH_HELP))]
   if (cmd.type === "list") return listSessions()
   if (cmd.type === "dirs") {
     const dirs = await listDirs()
