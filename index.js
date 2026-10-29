@@ -4,7 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import {
-  BUSY, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
+  BUSY, bridgeMarker, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
   desktopOwns, desktopSend,
 } from "./codex.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
@@ -47,7 +47,7 @@ const HELP = [
   "3 y / 3 n → 批准一次 / 拒绝 [3] 的权限请求",
   "3 → 再看一次 [3] 的最后回复",
   "3 历史 10 → [3] 最近 10 条消息（默认 5，最多 20）",
-  "列表 → 最近的对话和编号",
+  "列表 → 最近的对话和编号（对话 24 小时没用，编号就回收给别的对话）",
   "目录 → 列出文件夹；目录 2 → 选中第 2 个文件夹并列出它的对话",
   "新对话 内容 → 在选中的文件夹里开新对话（标着 Codex 的文件夹开 Codex 对话）",
   "图 路径 → 把电脑上的图片发过来（相对路径按选中的文件夹算）",
@@ -509,10 +509,127 @@ export function lowestFree(nums) {
   while (used.has(n)) n++
   return n
 }
-export function numOf(sessionID) {
-  return state().nums[sessionID] ?? update((s) => (s.nums[sessionID] ??= lowestFree(s.nums))).nums[sessionID]
+
+// A number is kept while its conversation is in use: `used[key]` (ms) is when it was last pushed, addressed or listed,
+// and prune() releases the numbers of conversations that are gone or unused for KEEP_MS.
+export const KEEP_MS = 24 * 60 * 60_000
+const PRUNE_MS = 10 * 60_000
+// numOf refreshes `used` at most this often, so listing ten conversations isn't ten writes.
+const TOUCH_MS = 60_000
+const noNum = (n) => `没有 [${n}]（编号会在对话 ${KEEP_MS / 3_600_000} 小时没用后回收），发「列表」查看`
+
+// Every call counts as a use of the conversation.
+export function numOf(key) {
+  const { nums, used } = state()
+  if (nums[key] != null && Date.now() - (used?.[key] ?? 0) < TOUCH_MS) return nums[key]
+  return update((s) => {
+    s.nums[key] ??= lowestFree(s.nums)
+    s.used = { ...s.used, [key]: Date.now() }
+  }).nums[key]
 }
-const sessionOf = (n) => Object.entries(state().nums).find(([, v]) => v === n)?.[0]
+const sessionOf = (n) => {
+  const key = Object.entries(state().nums).find(([, v]) => v === n)?.[0]
+  if (key) numOf(key)
+  return key
+}
+
+// Keys whose numbers to release: the conversation is gone (`exists(key)` false) or unused for KEEP_MS. Never the
+// target or last conversation, one with a saved form, or one `busy(key)` (running, or waiting for a permission,
+// an answer or an approval). A key without a `used` entry counts as used now.
+export function prunable(s, now, { exists = () => true, busy = () => false } = {}) {
+  return Object.keys(s.nums ?? {}).filter((key) => {
+    if (key === s.target || key === s.last || s.forms?.[key] || busy(key)) return false
+    return !exists(key) || now - (s.used?.[key] ?? now) >= KEEP_MS
+  })
+}
+
+// Ids of the Codex threads that aren't archived, or null when the state db can't be read (or lists none), so a failed
+// read isn't taken as "all gone". Kept here, not in codex.js: a hot reload that keeps an older codex.js must still load.
+async function codexAliveIds() {
+  try {
+    const { DatabaseSync } = await import("node:sqlite")
+    const db = new DatabaseSync(path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "state_5.sqlite"), { readOnly: true })
+    try {
+      const rows = db.prepare("select id from threads where archived = 0").all()
+      return rows.length ? new Set(rows.map((r) => r.id)) : null
+    } finally {
+      db.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+// Asks OpenCode, the Codex state db and the approval files about the numbered conversations that could be released:
+// { gone, busy } as sets of keys. One whose state can't be read counts as busy, so it is kept.
+async function probe(s, now) {
+  const gone = new Set()
+  const busy = new Set()
+  const keys = Object.keys(s.nums).filter((k) => k !== s.target && k !== s.last && !s.forms?.[k])
+  const stale = (k) => now - (s.used?.[k] ?? now) >= KEEP_MS
+  let up = true
+  const running = await oc("/api/session/active").then((r) => r.data ?? {}, () => ((up = false), {}))
+  // Waiting for a permission or an answer only matters to a conversation about to be released for age. A 404 there is
+  // a session whose folder is gone (LocationNotFoundError): nothing can be waiting in it. Any other error counts as waiting.
+  const asks = (k, x) => oc(`/api/session/${sid(k)}/${x}`).then((r) => toArr(r).length > 0, (e) => e.status !== 404)
+  const waiting = async (k) => (await Promise.all([asks(k, "permission"), asks(k, "form")])).some(Boolean)
+  for (const k of keys.filter((k) => !k.startsWith(CODEX))) {
+    if (up) {
+      try {
+        await oc(`/api/session/${sid(k)}`)
+      } catch (e) {
+        // Only the server's own "Session not found" counts: a 404 from a wrong route has no such body.
+        if (e.status === 404 && e.message.includes("Session not found")) {
+          gone.add(k)
+          continue
+        }
+        up = false
+      }
+    }
+    if (!up || running[k] || (stale(k) && (await waiting(k)))) busy.add(k)
+  }
+  const pending = readPending()
+  const alive = await codexAliveIds()
+  for (const k of keys.filter((k) => k.startsWith(CODEX))) {
+    const id = k.slice(CODEX.length)
+    if (alive && !alive.has(id)) gone.add(k)
+    if (g.bridge?.running(id) || fs.existsSync(bridgeMarker(PENDING_DIR, id)) || pending.some((p) => p.threadId === id)) busy.add(k)
+  }
+  return { gone, busy }
+}
+
+// At most every PRUNE_MS (across processes: `prunedAt` is in the state file). The API calls come first; the state
+// is then changed in one read-modify-write.
+// ponytail: the plugin and the Codex hook processes can both prune or number in the same instant, and one write can
+// then undo the other's (a released number comes back, or a new mapping is lost; the next prune or message fixes it).
+export function prune() {
+  return (g.pruning ??= pruneNow()
+    .catch((e) => warn("prune:", e))
+    .finally(() => (g.pruning = null)))
+}
+
+async function pruneNow() {
+  const now = Date.now()
+  if (now - (state().prunedAt ?? 0) < PRUNE_MS) return
+  const { gone, busy } = await probe(state(), now)
+  update((s) => {
+    s.prunedAt = now
+    // Keys from before `used` existed start their 24 hours now.
+    for (const k of Object.keys(s.nums)) (s.used ??= {})[k] ??= now
+    for (const k of prunable(s, now, { exists: (k) => !gone.has(k), busy: (k) => busy.has(k) })) {
+      delete s.nums[k]
+      delete s.used[k]
+      delete s.live?.[k]
+      if (k.startsWith(CODEX)) delete s.codexModels?.[k.slice(CODEX.length)]
+    }
+  })
+}
+
+// numOf for a conversation that may not have a number yet: prunes first, so a freed number is handed out again.
+export async function assign(key) {
+  if (!state().nums[key]) await prune()
+  return numOf(key)
+}
 
 async function ilink(endpoint, body, signal = AbortSignal.timeout(15000)) {
   const account = readJson(path.join(DIR, "account.json"))
@@ -702,7 +819,7 @@ async function oc(pathname, body, method = body ? "POST" : "GET") {
     try {
       msg = JSON.parse(t).message ?? t
     } catch {}
-    throw new Error(`OpenCode 接口返回 ${res.status} ${short(msg, 200)}`)
+    throw Object.assign(new Error(`OpenCode 接口返回 ${res.status} ${short(msg, 200)}`), { status: res.status })
   }
   return res.status === 204 ? undefined : res.json()
 }
@@ -794,6 +911,7 @@ const codexLine = (t) => ({
 
 // `dir` is an OpenCode folder, or `codex:<folder>` for one listing only Codex threads.
 async function listSessions(dir) {
+  await prune()
   if (dir?.startsWith(CODEX)) {
     const lines = (await codexThreads({ cwd: dir.slice(CODEX.length) })).map((t) => codexLine(t).line)
     return lines.length ? lines.join("\n") : "没有对话"
@@ -848,14 +966,14 @@ async function newSession(text) {
     const cwd = dirPath(dir)
     const m = takeMedia(text)
     const id = await bridge().create(cwd, m.text, { images: m.images })
-    const n = numOf(CODEX + id)
+    const n = await assign(CODEX + id)
     update((s) => (s.last = s.target = CODEX + id))
     return `已在 Codex · ${base(cwd)} 新建 [${n}]，已发出${m.note}（在后台运行，桌面端重新打开这个对话能看到）`
   }
   // Reuse the folder's latest model: the server default may not be usable (it failed once with gpt-5.5).
   const model = toArr(await oc(sessionsURL(1, dir)).catch(() => []))[0]?.model
   const session = (await oc("/api/session", { location: { directory: dir }, ...(model && { model }) })).data
-  const n = numOf(session.id)
+  const n = await assign(session.id)
   update((s) => (s.last = s.target = session.id))
   // Without text the media stays buffered for the next message, which goes to this new session.
   const m = text ? takeMedia(text) : null
@@ -891,14 +1009,14 @@ export async function run(cmd) {
   if (cmd.type === "text" && !cmd.text) return HELP
   if (cmd.type === "live") {
     const key = cmd.n == null ? "*" : sessionOf(cmd.n)
-    if (!key) return `没有 [${cmd.n}]，发「列表」查看`
+    if (!key) return noNum(cmd.n)
     let reply
     update((s) => (reply = liveCmd(s, key, cmd.n, cmd.on)))
     return reply
   }
   // Unnumbered text goes to the session the user last picked, not the last push: other sessions push all the time.
   const sessionID = cmd.n == null ? targetID() : sessionOf(cmd.n)
-  if (!sessionID) return cmd.n == null ? HELP : `没有 [${cmd.n}]，发「列表」查看`
+  if (!sessionID) return cmd.n == null ? HELP : noNum(cmd.n)
   if (cmd.n != null && state().target !== sessionID) update((s) => (s.target = sessionID))
   const n = numOf(sessionID)
   if (cmd.type === "unsend") return sessionID.startsWith(CODEX) ? unsendCodex(cmd, sessionID.slice(CODEX.length), n) : unsendOC(cmd, sessionID, n)
@@ -1210,7 +1328,7 @@ export function codexPushText(head, n, kind, text) {
 // Called synchronously in the order the app-server reports, so progress bookkeeping keeps that order.
 function codexPush(threadId, kind, text) {
   const key = CODEX + threadId
-  const info = async () => ({ head: codexHead(numOf(key), "", await codexThread(threadId), { base, short }) })
+  const info = async () => ({ head: codexHead(await assign(key), "", await codexThread(threadId), { base, short }) })
   if (kind === "text") return addText(key, text, info)
   if (kind === "tool") return addTool(key, text, info)
   const live = takeLive(key, kind !== "approval" && kind !== "question", liveOn(state(), key))
@@ -1219,7 +1337,7 @@ function codexPush(threadId, kind, text) {
 
 async function codexSend(threadId, kind, text, live) {
   const key = CODEX + threadId
-  const n = numOf(key)
+  const n = await assign(key)
   const thread = await codexThread(threadId)
   if (kind === "question") text = formText(questionForm(text), n, false)
   const h = codexHead(n, "", thread, { base, short })
@@ -1369,7 +1487,7 @@ export default {
       const getSession = () => ctx.session.get({ sessionID }).catch(() => undefined)
       const info = async () => {
         const s = await getSession()
-        return s?.parentID ? { child: true } : { head: head(numOf(sessionID), s, event.location?.directory) }
+        return s?.parentID ? { child: true } : { head: head(await assign(sessionID), s, event.location?.directory) }
       }
       if (event.type === "session.text.ended") return addText(sessionID, event.data?.text, info)
       if (event.type === "session.tool.input.started") return addTool(sessionID, event.data?.name, info)
@@ -1382,7 +1500,7 @@ export default {
       if (event.type === "session.execution.succeeded" && session?.parentID) return
       const reply =
         event.type === "session.execution.succeeded" ? await lastReply(sessionID).catch((e) => (warn(e), "")) : ""
-      let text = format(event, session, numOf(sessionID), reply, live)
+      let text = format(event, session, await assign(sessionID), reply, live)
       if (!text) return
       if (event.type !== "session.execution.succeeded") text = withPre(text, live)
       const { files, big } = await replyImages(reply, session?.location?.directory ?? event.location?.directory)

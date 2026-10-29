@@ -65,7 +65,7 @@ async function onStop(p, m) {
   const thread = await threadInfo(p.session_id)
   if (isSubagent(thread)) return
   const key = `codex:${p.session_id}`
-  const n = m.numOf(key)
+  const n = await m.assign(key)
   const reply = p.last_assistant_message ?? ""
   const { files, big } = await m.replyImages(reply, cleanDir(p.cwd))
   let text = `${codexHead(n, p.cwd, thread, m)}\n${m.clip(reply, n) || NO_TEXT}`
@@ -86,7 +86,7 @@ export async function approvalMode(threadId, pendingDir, owns = desktopOwns) {
 export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
   const thread = await threadInfo(p.session_id)
   const key = `codex:${p.session_id}`
-  const n = m.numOf(key)
+  const n = await m.assign(key)
   const listening = alive(m.state().pollerPid)
   const how = listening ? (mode ?? (await approvalMode(p.session_id, m.PENDING_DIR))) : null
   if (how === "bridge") return ""

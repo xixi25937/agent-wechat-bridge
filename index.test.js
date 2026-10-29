@@ -3,9 +3,9 @@ import { getEventListeners } from "node:events"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
-  PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, doneText, eventKey, extOf, format, historyLines,
+  KEEP_MS, PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, doneText, eventKey, extOf, format, historyLines,
   imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, lowestFree, liveOn, mediaAck, mergeLines, modelLines, parseCommand, pickDir,
-  pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk, unsendPlan, withMedia, withPre,
+  prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk, unsendPlan, withMedia, withPre,
 } from "./index.js"
 
 const session = { id: "s1", title: "重构登录模块", location: { directory: "C:\\Users\\me\\22" } }
@@ -423,6 +423,26 @@ test("lowestFree hands out the lowest unused number", () => {
   assert.deepEqual([nums.a, nums.b, nums.c], [2, 4, 5], "existing numbers stay")
   delete nums.x
   assert.equal(lowestFree(nums), 1, "a removed key frees its number")
+})
+
+test("prunable releases gone and unused conversations, never protected ones", () => {
+  const H = 3_600_000
+  const now = 1000 * H
+  const s = {
+    nums: { fresh: 1, old: 2, gone: 3, target: 4, last: 5, form: 6, busyOld: 7, busyGone: 8, noUsed: 9 },
+    used: { fresh: now - 23 * H, old: now - 25 * H, gone: now, target: now - 99 * H, last: now - 99 * H, form: now - 99 * H, busyOld: now - 99 * H, busyGone: now - 99 * H },
+    target: "target",
+    last: "last",
+    forms: { form: { answers: {} } },
+  }
+  const opts = { exists: (k) => k !== "gone" && k !== "busyGone", busy: (k) => k.startsWith("busy") }
+  // old: 25 h unused. gone: used just now but deleted. Kept: fresh, noUsed (no entry = used now), target / last / form /
+  // busyOld / busyGone (protected, even though old or gone).
+  assert.deepEqual(prunable(s, now, opts), ["old", "gone"])
+  assert.deepEqual(prunable(s, now), ["old", "busyOld", "busyGone"], "defaults: all exist and none is busy; target / last / form stay")
+  assert.deepEqual(prunable({ nums: { a: 1, b: 2 }, used: { a: now - KEEP_MS, b: now - KEEP_MS + 1 } }, now), ["a"], "24 h is the limit")
+  assert.deepEqual(prunable({ nums: { a: 1, b: 2 } }, now), [], "state from before `used` existed loses nothing")
+  assert.deepEqual(prunable({}, now), [])
 })
 
 test("撤回 command and plan", () => {

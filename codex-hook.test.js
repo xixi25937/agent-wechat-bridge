@@ -59,7 +59,7 @@ test("pending handshake", () => {
 test("onPermission terminal: short wait, answer or timeout", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-pending-"))
   const sent = []
-  const m = { PENDING_DIR: dir, base, short, numOf: () => 5, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
+  const m = { PENDING_DIR: dir, base, short, assign: async () => 5, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
   const p = { session_id: "t", cwd: "C:\\a\\proj", tool_name: "Bash", tool_input: { command: "git push" } }
   // Timeout: no decision, no extra push, the record stays as done so a late 「5 y」 says the computer handled it.
   assert.equal(await onPermission(p, m, { waitS: 0.05, mode: "wait" }), "")
@@ -85,7 +85,7 @@ test("onPermission terminal: short wait, answer or timeout", async () => {
 test("onPermission desktop and bridge return at once", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-pending-"))
   const sent = []
-  const m = { PENDING_DIR: dir, base, short, numOf: () => 6, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
+  const m = { PENDING_DIR: dir, base, short, assign: async () => 6, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
   const p = { session_id: "d", cwd: "C:\\a\\proj", tool_name: "Bash", tool_input: { command: "ls" } }
   const t0 = Date.now()
   assert.equal(await onPermission(p, m, { waitS: 30, mode: "desktop" }), "")
@@ -99,7 +99,7 @@ test("onPermission desktop and bridge return at once", async () => {
 
 test("onPermission bridge: silent, the plugin pushes", async () => {
   const sent = []
-  const m = { PENDING_DIR: os.tmpdir(), base, short, numOf: () => 7, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
+  const m = { PENDING_DIR: os.tmpdir(), base, short, assign: async () => 7, update: () => {}, state: () => ({ pollerPid: process.pid }), send: async (t) => (sent.push(t), "ok") }
   assert.equal(await onPermission({ session_id: "b", tool_name: "Bash", tool_input: {} }, m, { mode: "bridge" }), "")
   assert.deepEqual(sent, [])
 })
