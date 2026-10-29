@@ -1,4 +1,4 @@
-import assert from "node:assert/strict"
+﻿import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
@@ -63,6 +63,16 @@ test("pollLock reports held/lost and releases on stop", async () => {
     assert.deepEqual(ev, ["held", "lost"])
     l.stop()
     assert.equal(readLock(dir).pid, process.pid + 1, "stop leaves someone else's lock")
+    fs.rmSync(lockFile(dir))
+    const l2 = pollLock(dir, { onHeld: () => ev.push("held2") })
+    l2.start()
+    l2.stop(true)
+    assert.equal(readLock(dir).pid, process.pid, "stop(true) keeps the file for a reloaded successor")
+    const l3 = pollLock(dir, { onHeld: () => ev.push("held3") })
+    l3.start()
+    assert.deepEqual(ev.slice(2), ["held2", "held3"], "same pid takes its own lock again")
+    l3.stop()
+    assert.equal(fs.existsSync(lockFile(dir)), false, "stop() releases")
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -108,3 +118,37 @@ for (const ignorePid of [false, true]) {
     }
   })
 }
+
+// index.js wiring: which processes take the lock. No account.json in the temp dir, so a poller that starts only logs an error.
+test("index.js takes poll.lock only when eligible", async () => {
+  const dir = tmp()
+  const url = pathToFileURL(path.join(import.meta.dirname, "index.js")).href
+  const code = `import fs from "node:fs"
+    const m = await import(${JSON.stringify(url)})
+    const ctx = { event: { subscribe: async function* () { await new Promise(() => {}) } } }
+    const stop = m.default.setup(ctx)
+    await new Promise((r) => setTimeout(r, 300))
+    const file = process.env.WECHAT_NOTIFY_DIR + "/poll.lock"
+    const held = fs.existsSync(file) && JSON.parse(fs.readFileSync(file, "utf8")).pid === process.pid
+    stop()
+    console.log(JSON.stringify({ held, releasedOnDispose: !fs.existsSync(file) }))
+    process.exit(0)`
+  const run = (poll, ...argv) =>
+    new Promise((resolve) => {
+      const env = { ...process.env, WECHAT_NOTIFY_DIR: dir }
+      delete env.WECHAT_NOTIFY_POLL
+      if (poll != null) env.WECHAT_NOTIFY_POLL = poll
+      const p = spawn(process.execPath, ["--input-type=module", "-e", code, "--", ...argv], { env, stdio: ["ignore", "pipe", "ignore"] })
+      let out = ""
+      p.stdout.on("data", (d) => (out += d))
+      p.on("close", () => resolve(JSON.parse(out.trim().split("\n").pop())))
+    })
+  try {
+    assert.equal((await run(null)).held, false, "default: not eligible")
+    assert.equal((await run("0", "--service")).held, false, "=0 never polls, even with --service")
+    assert.equal((await run(null, "--service")).held, true, "--service is eligible")
+    assert.deepEqual(await run("1"), { held: true, releasedOnDispose: true }, "=1 is eligible anywhere; dispose releases")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

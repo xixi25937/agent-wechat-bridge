@@ -140,12 +140,14 @@ export function pollLock(dir, { onHeld, onLost, beatMs = BEAT_MS, staleMs = STAL
       for (const [sig, fn] of sigs) if (!process.listenerCount(sig)) process.on(sig, fn)
       tick()
     },
-    stop() {
+    // keep: leave the lock file for a successor in this same process (hot reload) to take over.
+    stop(keep) {
       stopped = true
       clearTimeout(timer)
       process.removeListener("exit", bye)
       for (const [sig, fn] of sigs) process.removeListener(sig, fn)
-      if (held) (held = false, bye())
+      if (held && !keep) bye()
+      held = false
     },
   }
 }
