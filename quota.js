@@ -15,6 +15,8 @@ export const OUTBOX_TTL = 24 * 60 * 60_000
 export const HIGH = "high"
 export const LOW = "low"
 export const FLUSH = "flush"
+// A reply to the user's own message: HIGH, and the only kind that still goes out while the bridge is paused.
+export const REPLY = "reply"
 
 export const left = (s) => Math.max(0, QUOTA - (s.sent ?? 0))
 
@@ -22,6 +24,7 @@ export const left = (s) => Math.max(0, QUOTA - (s.sent ?? 0))
 //   { act: "send" }              go ahead, the caller takes the sends
 //   { act: "queue", notice }     HIGH, budget gone: keep it in the outbox; `notice`: the last send is free, tell the user
 //   { act: "skip" } / "stop"     LOW is dropped / an outbox flush ends, both for now
+// Anything but LOW and FLUSH (HIGH, REPLY) is decided as HIGH.
 export function decide(s, prio, n = 1) {
   const l = left(s)
   if (prio === LOW) return { act: l >= RESERVE + n ? "send" : "skip" }

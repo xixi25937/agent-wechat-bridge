@@ -17,7 +17,7 @@ import {
 import { md, numbered, ul } from "./md.js"
 import { pollLock, readLock } from "./poll-lock.js"
 import {
-  FLUSH, HIGH, LOW, QUOTA, RESERVE, alive, decide, enqueue, expire, foldOffer, groups, left, liveMs, lostNote, mergeTexts, noticeText, quotaText, skipNote,
+  FLUSH, HIGH, LOW, QUOTA, REPLY, RESERVE, alive, decide, enqueue, expire, foldOffer, groups, left, liveMs, lostNote, mergeTexts, noticeText, quotaText, skipNote,
 } from "./quota.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
@@ -59,13 +59,14 @@ export const HELP = md(
   section("文件", ["每轮结束后列出这轮的文件", "3 文件 1 3 → 发第 1、3 个", "3 文件 全部 → 全部发来", "文件 路径 → 发电脑上的文件", "文件提示 关 / 开 → 关 / 开"]),
   section("撤回", ["3 撤回 → 撤回 [3] 最后一条", "再发「3 撤回 确认」才执行", "不带编号就是当前对话", "也认 /unsend"]),
   section("实时推送", ["实时 关 / 实时 开 → 关 / 开", "回复过程中约 15 秒推一条", "3 实时 关 → 只关 [3]", "实时 → 看状态"]),
+  section("暂停服务", ["/stop → 暂停推送和微信命令", "/start → 恢复", "暂停时只认 /start 帮助 额度", "3 /stop → 只停 [3] 的回复"]),
   section("其他", ["编号后是 agent 和目录", "例：[3] OpenCode · ttool", "OpenCode 和 Codex 用法一样", "额度 → 看微信发送额度", "/ 命令 → 见下一条"]),
 )
 
 export function slashHelpText(t, commands) {
   return md(
     `【/ 命令】发给当前对话${t ? ` ${t}` : ""}`,
-    ul(["/model → 列出模型", "/model 3 → 切到第 3 个", "/model 名字 → 按名字切换", "/stop → 停止正在运行的回复", "/compact → 压缩上下文", "「3 /stop」指定对话"]),
+    ul(["/model → 列出模型", "/model 3 → 切到第 3 个", "/model 名字 → 按名字切换", "3 /stop → 停止 [3] 的回复", "/stop 不带编号 → 暂停服务", "/compact → 压缩上下文", "「3 /compact」指定对话"]),
     commands?.length && md("【OpenCode 自带命令】", ul(commands.map((c) => `/${c.name}${c.description ? ` → ${short(c.description, 50)}` : ""}`))),
   )
 }
@@ -75,7 +76,7 @@ async function slashHelp() {
   const sessionID = targetID()
   if (!sessionID) return SLASH_HELP
   const t = await tag(sessionID)
-  if (sessionID.startsWith(CODEX)) return md(slashHelpText(t), "（Codex 对话只支持 /model、/stop、/compact）")
+  if (sessionID.startsWith(CODEX)) return md(slashHelpText(t), "（Codex 对话只支持 /model、N /stop、/compact）")
   const session = (await oc(`/api/session/${sid(sessionID)}`)).data
   const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
   return slashHelpText(t, toArr(await oc(`/api/command?${loc}`)))
@@ -328,6 +329,10 @@ const KEYWORDS = [
   ["dirs", /^(目录|文件夹|\/?dirs?)$/i],
   ["quota", /^(额度|\/quota)$/i],
 ]
+export const PAUSED_TEXT = "已暂停：不再推送，也不执行微信命令。发 /start 恢复"
+// What a paused bridge still hears: 「/start」, 「帮助」, 「额度」 (and 「/stop」 again, to confirm).
+const HEARD_PAUSED = new Set(["resume", "pause", "help", "quota"])
+export const heardWhilePaused = (cmd) => !!cmd && (cmd.type === "multi" ? cmd.cmds.every(heardWhilePaused) : HEARD_PAUSED.has(cmd.type))
 const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img", "live", "unsend", "file", "files", "quota"])
 // What 「文件 …」 treats as a path rather than chat: a separator, or an extension with a letter ("v1.2" is not one).
 const PATHISH = /[\\/]|\.\w*[a-z]\w*$/i
@@ -335,6 +340,11 @@ const keyword = (w) => KEYWORDS.find(([, re]) => re.test(w) || re.test(w.replace
 
 export function parseCommand(text) {
   const t = String(text ?? "").trim()
+  // Pause / resume the whole bridge. Without a number only: "3 /stop" stops conversation 3's reply (the slash rule below).
+  // 「开始」 may also be an answer to the agent, so it resumes only while paused (`soft`, see inbound).
+  if (/^(?:\/stop|停止服务)[。.！!]*$/i.test(t)) return { type: "pause" }
+  if (/^(?:\/start|启动服务)[。.！!]*$/i.test(t)) return { type: "resume" }
+  if (/^开始[。.！!]*$/.test(t)) return { type: "resume", soft: true }
   // "列表。", "10 帮助", "帮助 列表": only no-arg keywords (an optional session number is ignored) run as commands.
   const words = t.replace(/^\d{1,4}[\s:：,，]+/, "").split(/[\s,，、]+/).filter(Boolean)
   const kws = words.map(keyword)
@@ -548,6 +558,9 @@ const GEN = {}
 if (!(g.progress instanceof Map)) g.progress = new Map()
 // State lives on disk and is re-read every time: several OpenCode server processes load this plugin and share it.
 export const state = () => ({ nums: {}, ...readJson(STATE_FILE) })
+// Whether the bridge is paused (WeChat 「/stop」, until 「/start」): kept in the state file so it holds across restarts and
+// for the Codex hook processes, which check it before they wait for WeChat.
+export const paused = () => !!state().paused
 
 // The plugin, the daemon and the Codex hooks all write the state (send count, outbox), so a read-modify-write holds
 // DIR/state.lock (created exclusively; a lock older than LOCK_STALE_MS is a crashed holder's). It gives up after
@@ -793,6 +806,7 @@ const spent = (json) => Number(json.ret) === -2 && !/invalid arg/i.test(json.err
 const RETRY_MS = Number(process.env.WECHAT_NOTIFY_RETRY_MS) || 2000
 const QUEUED = "queued"
 const SKIPPED = "skipped"
+const PAUSED = "paused"
 const textItems = (text) => [{ type: 1, text_item: { text } }]
 const gap = () => new Promise((r) => setTimeout(r, CHUNK_GAP_MS))
 
@@ -828,6 +842,8 @@ async function post(items) {
 function claim(prio, n, entry) {
   let d
   update((s) => {
+    // Paused (see run, "pause"): nothing is pushed and nothing is queued, only replies to the user's own messages go out.
+    if (s.paused && prio !== REPLY) return void (d = { act: "drop" })
     d = decide(s, prio, n)
     if (d.act === "send") s.sent = (s.sent ?? 0) + n
     else if (d.act === "queue") {
@@ -839,7 +855,7 @@ function claim(prio, n, entry) {
 }
 const refund = (n) => update((s) => (s.sent = Math.max(0, (s.sent ?? 0) - n)))
 // iLink said the allowance is spent although we counted fewer: believe iLink, and keep `entry` for the next token.
-const exhaust = (entry) => update((s) => (entry && enqueue(s, entry), (s.sent = QUOTA)))
+const exhaust = (entry) => update((s) => (entry && !s.paused && enqueue(s, entry), (s.sent = QUOTA)))
 
 // The one message that says the allowance is out, in the send claim() kept free.
 async function notice(k) {
@@ -853,8 +869,9 @@ async function notice(k) {
 
 // A high-priority message in one send: sent, or QUEUED in the outbox when the allowance is gone. `build` makes the items
 // (an upload for a file), only after the send is claimed.
-async function sendHigh(entry, build = async () => textItems(entry.text)) {
-  const d = claim(HIGH, 1, entry)
+async function sendHigh(entry, build = async () => textItems(entry.text), prio = HIGH) {
+  const d = claim(prio, 1, entry)
+  if (d.act === "drop") return PAUSED
   if (d.act === "queue") return (d.notice && (await notice(d.k)), QUEUED)
   let status
   try {
@@ -870,7 +887,9 @@ async function sendHigh(entry, build = async () => textItems(entry.text)) {
 
 // A low-priority message (progress, file offer): all its chunks or none, SKIPPED when too little of the allowance is left.
 async function sendLow(chunks) {
-  if (claim(LOW, chunks.length).act !== "send") return SKIPPED
+  const d = claim(LOW, chunks.length)
+  if (d.act === "drop") return PAUSED
+  if (d.act !== "send") return SKIPPED
   let status
   for (const [i, c] of chunks.entries()) {
     if (i) await gap()
@@ -887,7 +906,9 @@ async function sendLow(chunks) {
 
 // Sends a text (or the chunks splitText made), one chunk after another. Never throws; returns a short status string
 // without secrets: "queued" when any part went to the outbox, "skipped" for a low-priority message that was dropped,
-// "error" on a failure. A failed chunk stops the rest, so a later chunk never arrives without it.
+// "paused" when the bridge is paused (nothing sent, nothing queued), "error" on a failure. A failed chunk stops the
+// rest, so a later chunk never arrives without it. `prio` REPLY: an answer to the user's own message, which goes out
+// while paused too.
 export async function send(text, prio = HIGH) {
   const chunks = Array.isArray(text) ? text : splitText(text)
   try {
@@ -896,7 +917,8 @@ export async function send(text, prio = HIGH) {
     let queued = false
     for (const [i, c] of chunks.entries()) {
       if (i && status !== QUEUED) await gap()
-      status = await sendHigh({ text: c })
+      status = await sendHigh({ text: c }, undefined, prio)
+      if (status === PAUSED) return PAUSED
       queued ||= status === QUEUED
     }
     return queued ? QUEUED : chunks.length > 1 ? `${status} ×${chunks.length}` : status
@@ -971,7 +993,7 @@ export async function sendImage(file) {
     steps = up.steps
     return [up.item]
   })
-  return status === QUEUED ? status : [...steps, `sendmessage ${status}`].join(", ")
+  return status === QUEUED || status === PAUSED ? status : [...steps, `sendmessage ${status}`].join(", ")
 }
 
 // null when `file` is a sendable file, else the reason.
@@ -1049,7 +1071,7 @@ export async function sendFile(file) {
     steps = up.steps
     return [up.item]
   })
-  return status === QUEUED ? status : [...steps, `sendmessage ${status}`].join(", ")
+  return status === QUEUED || status === PAUSED ? status : [...steps, `sendmessage ${status}`].join(", ")
 }
 
 // Image paths mentioned in a reply (see mentionedPaths in files.js).
@@ -1160,8 +1182,8 @@ export function takeLive(key, end, on = true) {
 
 async function flushLive(key, e) {
   e.timer = null
-  // Off: the text waits for the final push of this run.
-  if (g.progress.get(key) !== e || !liveOn(state(), key)) return
+  // Off, or paused: the text waits for the final push of this run.
+  if (g.progress.get(key) !== e || !liveOn(state(), key) || paused()) return
   const { head: h, child } = await e.info()
   if (child) return void Object.assign(e, { child: true, texts: [], tools: new Map() })
   if (g.progress.get(key) !== e) return
@@ -1281,7 +1303,14 @@ export async function run(cmd) {
   }
   if (cmd.type === "help") return [HELP, await slashHelp().catch((e) => (warn("help:", e), SLASH_HELP))]
   if (cmd.type === "list") return listSessions()
-  if (cmd.type === "quota") return quotaText(state())
+  if (cmd.type === "quota") return quotaText(state()) + (paused() ? "（已暂停）" : "")
+  if (cmd.type === "pause") return (update((s) => (s.paused = true)), PAUSED_TEXT)
+  if (cmd.type === "resume") {
+    const was = paused()
+    update((s) => delete s.paused)
+    const k = alive(state().outbox).length
+    return was ? `已恢复${k ? `，队列里 ${k} 条，接着补发` : ""}` : "没有暂停，一直在运行"
+  }
   if (cmd.type === "dirs") {
     return dirsText(await listDirs())
   }
@@ -1787,7 +1816,7 @@ async function bufferMedia(items) {
 }
 
 // Handles one polled message. `out` sends each reply (exported with it so a check can run without WeChat).
-export async function inbound(msg, floor, out = send) {
+export async function inbound(msg, floor, out = (t) => send(t, REPLY)) {
   const account = readJson(path.join(DIR, "account.json"))
   const text = inboundText(msg, account?.userId)
   const media = inboundMedia(msg, account?.userId)
@@ -1803,17 +1832,25 @@ export async function inbound(msg, floor, out = send) {
   if (g.handled.has(key)) return
   g.handled.add(key)
   if (g.handled.size > 200) g.handled.delete(g.handled.values().next().value)
+  let cmd = text == null ? null : parseCommand(text)
+  const wasPaused = paused()
+  // 「开始」 is a command only while paused; otherwise it is a message for the agent like any other.
+  if (cmd?.soft && !wasPaused) cmd = { type: "text", text: text.trim() }
+  // Paused: only /start, 帮助 and 额度 are heard. Nothing else runs, and media is not even saved.
+  if (wasPaused && !heardWhilePaused(cmd)) return
   // What could not be sent while the allowance was out goes first, before this message's own reply.
   await flushOutbox()
   // A photo and its caption arrive as separate messages: media waits in g.media for the next text.
   const ack = media.length ? await bufferMedia(media) : ""
-  const reply = text == null ? ack : await run(parseCommand(text)).catch((e) => `出错了：${short(e?.message, 150)}`)
+  const reply = text == null ? ack : await run(cmd).catch((e) => `出错了：${short(e?.message, 150)}`)
   // run() returns a string, or an array: replies that fit one message are sent as one (each message costs one of the
   // ~10 sends), the rest one at a time, spaced out so WeChat doesn't throttle.
   for (const [i, r] of mergeTexts([reply].flat().filter(Boolean), CHUNK_CHARS).entries()) {
     if (i) await new Promise((resolve) => setTimeout(resolve, 300))
     await out(r)
   }
+  // 「/start」: what queued up before the pause goes out now, after the 「已恢复」.
+  if (wasPaused && !paused()) await flushOutbox()
 }
 
 // Removes its abort listener when the timer fires; otherwise every sleep leaves one on the long-lived poller signal.

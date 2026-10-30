@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import http from "node:http"
 import os from "node:os"
@@ -153,4 +153,132 @@ test("e2e: the final reply is one message; the file offer rides in its last chun
   assert.equal(got.length, 2, "text and offer in one send")
   assert.ok(got[1].startsWith("[1] 最终 G\n\n") && got[1].includes("report.pdf"), got[1])
   assert.equal(getState().sent, 2)
+})
+
+// --- /stop and /start ---
+
+const queued = (...t) => t.map((x, i) => ({ id: `q${i}`, at: Date.now(), text: x }))
+const pending = path.join(home, "codex-pending")
+// Async: the fake iLink lives in this process, so a blocking spawn would starve it.
+const hookRun = (args, payload) =>
+  new Promise((resolve) => {
+    const c = spawn(process.execPath, [hook, ...args], { env: { ...process.env, CODEX_WECHAT_APPROVAL_TIMEOUT: "2" } })
+    const r = { stdout: "", stderr: "" }
+    c.stdout.on("data", (d) => (r.stdout += d))
+    c.stderr.on("data", (d) => (r.stderr += d))
+    c.on("close", (status) => resolve({ ...r, status }))
+    c.stdin.end(payload ? JSON.stringify(payload) : "")
+  })
+const replies = async (ctx, body) => {
+  const out = []
+  await ix.inbound(fromUser(ctx, body), () => 0, async (t) => void out.push(t))
+  return out
+}
+
+test("paused: nothing is pushed or queued by any process, and the flag lives in the state file", async () => {
+  setState({ nums: {}, contextToken: "ctxP", paused: true, outbox: queued("排队的 Q1", "排队的 Q2") })
+  const before = accepted.length
+  assert.equal(await ix.send("推送"), "paused")
+  assert.equal(await ix.send("进度", LOW), "paused")
+  const uploads = calls.filter((c) => c === "/ilink/bot/getuploadurl").length
+  assert.equal(await ix.sendFile(report), "paused")
+  assert.equal(await ix.pushFinal("codex:p1", "[1] 最终", { images: [], reply: "写好了 report.pdf", dir: proj, edited: [] }), "paused")
+  assert.equal(calls.filter((c) => c === "/ilink/bot/getuploadurl").length, uploads)
+  assert.equal(accepted.length, before)
+  const s = getState()
+  assert.equal(s.sent ?? 0, 0, "nothing was counted")
+  assert.deepEqual(s.outbox.map((e) => e.text), ["排队的 Q1", "排队的 Q2"], "dropped, not queued; what was queued before stays")
+  // Another process reads the same flag.
+  const other = spawnSync(process.execPath, ["-e", "import('./index.js').then((m) => console.log(m.paused()))"], { env: process.env, encoding: "utf-8", cwd: path.dirname(hook) })
+  assert.equal(other.stdout.trim(), "true")
+})
+
+test("paused: the Codex hooks do not wait for WeChat and send nothing", async () => {
+  const before = accepted.length
+  const perm = { session_id: "t-perm", cwd: proj, tool_name: "Bash", tool_input: { command: "ls" } }
+  let t0 = Date.now()
+  let r = await hookRun(["PermissionRequest"], perm)
+  assert.equal(r.status, 0)
+  assert.equal(r.stdout, "", "no decision: Codex shows its own prompt")
+  assert.ok(Date.now() - t0 < 1800, `returned at once, not after the 2 s wait (${Date.now() - t0} ms)`)
+  assert.equal(accepted.length, before)
+  assert.ok(!fs.existsSync(pending) || fs.readdirSync(pending).length === 0, "no approval record waits for an answer")
+  // Stop and the question hook return before they start anything.
+  r = await hookRun(["Stop"], { session_id: "t-stop", cwd: proj, last_assistant_message: "不该推的回复" })
+  assert.equal(r.status, 0)
+  r = await hookRun(["PreToolUse"], { session_id: "t-q", cwd: proj, tool_name: "request_user_input", tool_input: {} })
+  assert.equal(r.status, 0)
+  assert.ok(!fs.existsSync(path.join(home, "codex-hook.log")), "no detached sender was started")
+  // A sender that was already running when the pause came.
+  const payload = path.join(tmp, "late.json")
+  fs.writeFileSync(payload, JSON.stringify({ session_id: "t-late", cwd: proj, last_assistant_message: "来不及的回复" }))
+  r = await hookRun(["stop-send", payload])
+  assert.equal(r.stderr, "")
+  assert.equal(accepted.length, before)
+  assert.equal(getState().outbox.length, 2, "and nothing was queued")
+  // Control: the same approval request without the pause does push and wait.
+  const s = getState()
+  delete s.paused
+  s.pollerPid = process.pid
+  setState(s)
+  t0 = Date.now()
+  r = await hookRun(["PermissionRequest"], perm)
+  assert.equal(r.stdout, "")
+  assert.ok(Date.now() - t0 >= 1900, "it waited for an answer")
+  assert.equal(accepted.length, before + 1, `and pushed the request: ${r.stderr} ${Date.now() - t0} ms`)
+  assert.ok(texts("ctxP").at(-1).includes("等你批准"))
+  assert.equal(fs.readdirSync(pending).filter((f) => f.endsWith(".json")).length, 1)
+})
+
+test("paused: commands are ignored except /start, 帮助 and 额度", async () => {
+  setState({ nums: {}, contextToken: "ctxP2", paused: true, outbox: queued("排队的 Q1", "排队的 Q2") })
+  const before = accepted.length
+  for (const t of ["列表", "3 内容", "3 /stop", "/model", "目录", "3 y", "你好", "开始吧", "实时 关", "图 a.png", "文件", "新对话 hi"]) {
+    assert.deepEqual(await replies("ctxP2", t), [], t)
+  }
+  const image = { ...fromUser("ctxP2", ""), item_list: [{ type: 2, image_item: { media: { encrypt_query_param: "x" }, aes_key: "00" } }] }
+  await ix.inbound(image, () => 0, async () => assert.fail("media is ignored while paused"))
+  assert.equal(accepted.length, before)
+  assert.equal(getState().paused, true)
+  assert.deepEqual(await replies("ctxP2", "额度"), ["已用 0/10，队列里 2 条（已暂停）"])
+  const help = (await replies("ctxP2", "帮助")).join("\n\n")
+  assert.ok(help.includes("暂停服务") && help.includes("/start"))
+  assert.equal(getState().outbox.length, 2, "no flush while paused")
+  // A repeated /stop just confirms.
+  assert.deepEqual(await replies("ctxP2", "/stop"), [ix.PAUSED_TEXT])
+})
+
+test("/stop pauses and persists, /start resumes and sends what queued up before; 3 /stop and 开始 keep their old meaning while running", async () => {
+  setState({ nums: {}, contextToken: "ctxS" })
+  // A numbered /stop is the conversation's: no pause, and no PAUSED_TEXT.
+  const numbered = await replies("ctxS", "3 /stop")
+  assert.ok(!numbered.includes(ix.PAUSED_TEXT) && getState().paused === undefined, JSON.stringify(numbered))
+  // 「开始」 while running is an ordinary message for the agent.
+  const word = await replies("ctxS", "开始")
+  assert.ok(word.length && !word.some((t) => /已恢复|没有暂停/.test(t)), JSON.stringify(word))
+  // /stop: the confirmation itself is sent (it answers the user), then the bridge is quiet.
+  const n0 = accepted.length
+  await ix.inbound(fromUser("ctxS", "/stop"), () => 0)
+  assert.equal(texts("ctxS").at(-1), ix.PAUSED_TEXT)
+  assert.equal(accepted.length, n0 + 1)
+  assert.equal(getState().paused, true)
+  assert.equal(await ix.send("x"), "paused")
+  // What was queued before the pause stays; /start reports it and sends it after the 「已恢复」.
+  const s = getState()
+  s.outbox = queued("排队的 Q1", "排队的 Q2")
+  setState(s)
+  await ix.inbound(fromUser("ctxS2", "/start"), () => 0)
+  const got = texts("ctxS2")
+  assert.equal(got[0], "已恢复，队列里 2 条，接着补发")
+  assert.equal(got.length, 2, "the two queued texts went out as one message")
+  assert.ok(got[1].includes("排队的 Q1") && got[1].includes("排队的 Q2"))
+  assert.equal(getState().paused, undefined)
+  assert.equal(getState().outbox, undefined)
+  assert.match(await ix.send("又能推了"), /ret=0/)
+  // /start while running changes nothing; 「开始」 while paused resumes.
+  assert.deepEqual(await replies("ctxS3", "/start"), ["没有暂停，一直在运行"])
+  await replies("ctxS3", "停止服务")
+  assert.equal(getState().paused, true)
+  assert.deepEqual(await replies("ctxS3", "开始"), ["已恢复"])
+  assert.equal(getState().paused, undefined)
 })

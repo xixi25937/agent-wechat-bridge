@@ -75,6 +75,8 @@ export function remember(s, key, cwd, thread) {
 export async function onStop(p, m, { db } = {}) {
   // The turn is over, so a question the window showed is answered or gone.
   dropQuestion(m.PENDING_DIR, p.session_id)
+  // Paused from WeChat (/stop): nothing is pushed, and nothing waits in the outbox.
+  if (m.paused?.()) return
   const thread = await threadInfo(p.session_id)
   if (isSubagent(thread)) return
   const key = `codex:${p.session_id}`
@@ -112,6 +114,8 @@ export async function approvalMode(threadId, pendingDir, owns = desktopOwns) {
 }
 
 export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
+  // Paused from WeChat (/stop): no message and no waiting, Codex shows its own prompt right away.
+  if (m.paused?.()) return ""
   const thread = await threadInfo(p.session_id)
   const key = `codex:${p.session_id}`
   const n = await m.assign(key)
@@ -156,6 +160,7 @@ export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
 // detached child waits for the question in the window's state and pushes what the window shows. Returns the log line.
 export async function onQuestion(p, m, opts) {
   const id = p.session_id
+  if (m.paused?.()) return "paused"
   const thread = await threadInfo(id)
   if (isSubagent(thread)) return ""
   const found = await waitQuestion(id, readQuestion(m.PENDING_DIR, id)?.requestIds, opts)
@@ -198,14 +203,14 @@ async function main() {
     else if (event === "question-send") console.error(`${new Date().toISOString()} Question ${await onQuestion(p, await import("./index.js"))}`)
     else if ((event || p.hook_event_name) === "Stop") {
       // A turn started from WeChat: the plugin pushes the reply itself. Checked here, before the turn ends.
-      const { PENDING_DIR } = await import("./index.js")
-      if (fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) return process.exit(0)
+      const { PENDING_DIR, paused } = await import("./index.js")
+      if (paused?.() || fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) return process.exit(0)
       // Codex waits for Stop hooks before ending the turn, so send from a detached process and return at once.
       await detach("stop-send", raw)
     } else if ((event || p.hook_event_name) === "PreToolUse") {
       // A bridge turn's questions are pushed by the plugin itself.
-      const { PENDING_DIR } = await import("./index.js")
-      if (p.tool_name === "request_user_input" && !fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) await detach("question-send", raw)
+      const { PENDING_DIR, paused } = await import("./index.js")
+      if (p.tool_name === "request_user_input" && !paused?.() && !fs.existsSync(bridgeMarker(PENDING_DIR, p.session_id))) await detach("question-send", raw)
     } else if ((event || p.hook_event_name) === "PermissionRequest") out = await onPermission(p, await import("./index.js"))
   } catch (e) {
     console.error("[codex-hook]", String(e?.message ?? e).slice(0, 200))

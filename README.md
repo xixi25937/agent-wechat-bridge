@@ -13,7 +13,8 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 - **Push**: the final reply of each turn, live progress (merged, at most one message per 15 s, one per 60 s once half the send quota is used), and errors arrive as `[3] OpenCode · project / title` followed by the text. Images mentioned in a reply are sent too.
 - **Approve**: permission requests arrive with the action to run. Reply `3 y` or `3 n`. For Codex desktop you can answer on the PC or in WeChat, whichever comes first.
 - **Answer questions**: the agent's question tool shows the options in WeChat. Answer with an option number, an option's text or free text, all at once or one by one.
-- **Control**: `3 your message` continues conversation 3 (OpenCode or Codex, shared numbering), `3` shows its last reply, and `3 历史` reads back recent messages. Also `/model`, `/stop`, `/compact`, undo, and starting a new conversation in a folder you pick.
+- **Control**: `3 your message` continues conversation 3 (OpenCode or Codex, shared numbering), `3` shows its last reply, and `3 历史` reads back recent messages. Also `/model`, `3 /stop` (stop conversation 3's running reply), `/compact`, undo, and starting a new conversation in a folder you pick.
+- **Pause**: `/stop` (no number) pauses the whole bridge: no pushes from the plugin, the daemon or the Codex hooks, no WeChat commands, and Codex permission requests are left to the PC. `/start` resumes. See [Pause and resume](#pause-and-resume).
 - **Send images and files** from WeChat into a conversation.
 - **Files on request**: after each turn the bot lists the files the agent mentioned or changed (images still send themselves; likely secrets such as `.env` or `*.pem` are never listed). Nothing is sent until you pick: `3 文件 1 3` sends the 1st and 3rd of conversation 3, `3 文件 全部` sends all, `文件 path` sends any file on the PC. `文件提示 关` turns the lists off. Details in [文件](#文件).
 
@@ -33,6 +34,21 @@ Images mentioned in a reply are sent automatically. Other files (pdf, py, docx, 
 - `文件提示 关` / `文件提示 开` (or `/files off` / `/files on`) turns the offers off or on. Default on.
 
 An offer is kept in the state file for 24 hours or until the next one for that conversation. The same works for OpenCode (tool calls and `GET /api/session/{id}/diff`) and Codex (`fileChange` items). Files go out as iLink `file_item` messages (upload `media_type` 3). Details in [文件](#文件).
+
+### Pause and resume
+
+Send `/stop` (also `停止服务`) without a number to pause the bridge; it answers `已暂停：不再推送，也不执行微信命令。发 /start 恢复`. While paused:
+
+- Nothing is pushed by any process (plugin, daemon, Codex hooks), and nothing is queued: pushes are dropped. Live progress stops too.
+- WeChat commands are ignored. Only `/start` (also `开始`, `启动服务`), `帮助`, `额度` and another `/stop` are answered. Images and files you send are not saved.
+- The Codex `PermissionRequest` hook returns no decision at once instead of waiting for WeChat, so approvals stay on the computer.
+- The poller keeps running, so `/start` arrives.
+
+`/start` answers `已恢复` (plus `队列里 k 条，接着补发` if the outbox holds anything from before the pause, which is then sent). It answers `没有暂停，一直在运行` when nothing was paused. `开始` is a command only while paused; otherwise it goes to the agent like any other text. The flag is the `paused` key in the state file, so it survives restarts.
+
+The bridge runs by default. To start quiet, send `/stop` once after connecting the bot, and `/start` when you want it.
+
+Changed in 0.4.0: `/stop` without a number used to stop the target conversation's running reply. That is now `3 /stop` (with the number); without it `/stop` pauses the bridge.
 
 ## Quick start
 
@@ -71,7 +87,7 @@ An offer is kept in the state file for 24 hours or until the next one for that c
 
 - Needs Node.js 20.3 or newer, and OpenCode 2.x (V2 plugin API) if you use OpenCode. Reading Codex session titles needs Node 22.5 or newer.
 - Developed and used on Windows. Other platforms are untested (the macOS and Linux autostart entries are unit-tested only).
-- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `文件`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/file`, `/files`, `/help`, `/quota`), and `/model`, `3 /stop`, `/compact` work as written.
+- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `文件`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/file`, `/files`, `/help`, `/quota`), and `/model`, `3 /stop`, `/compact` work as written (`/stop` without a number pauses the bridge, `/start` resumes it).
 - Only messages from the WeChat account that logged in the bot are handled. Anyone who controls that account, or can read `~/.cli-bridge`, can run commands and approve permissions through your agents. Keep the phone and those files safe.
 - WeChat limits bots (from third-party implementations, not official documentation): about 10 bot messages after each message you send (`ret=-2 prepare failed` after that), and a `context_token` that expires after about 24 hours. Sending the bot any message resets both. The bridge keeps one shared count of the 10 in the state file (plugin, daemon and Codex hooks all add to it) and reserves the last 3 sends for approvals, questions, errors, final replies and command replies: live progress and file offers are skipped when fewer than 4 remain. The file offer rides in the last chunk of the final reply when it fits, command replies produced together go out as one message, and live progress slows from every 15 s to every 60 s once 5 are used. What cannot be sent once the 10 are gone (text, images, files) waits in an outbox in the state file (20 items, 24 hours), one send is kept for the notice `额度用完了：还有 k 条没发，回任意一句话就补发`, and your next message flushes the outbox in order before it is handled. `额度` (or `/quota`) replies `已用 x/10，队列里 k 条`. One text message is cut into chunks of 3500 characters: a real 4516-character `sendmessage` returned `ret=0` (verified by the API, not on the phone yet); if your phone shows a cut message, set `WECHAT_NOTIFY_CHUNK=1800`. Two text items in one `sendmessage` are rejected (`ret=-2 invalid arguments`), so merging only joins texts into one item.
 - WeChat commands are executed by whichever process holds the poll lock: the OpenCode background service, or the daemon. Without OpenCode running, the daemon still handles Codex; replies about OpenCode conversations say OpenCode isn't running. Do not run cli-chat-bridge's `wechat-opencode` daemon at the same time; both would fight over the same bot's messages.
@@ -84,7 +100,7 @@ License: MIT. Tests: `npm test` (no network, nothing is sent to WeChat).
 
 给编程 Agent 用的微信桥：用微信 ClawBot（iLink bot API）接收回复、批准权限、发消息。只用 Node 标准库，没有依赖。
 
-微信里还能发图片和文件给对话、用 `/model` `/stop` `/compact` 等斜杠命令（见「在微信里回复」）。
+微信里还能发图片和文件给对话、用 `/model` `3 /stop` `/compact` 等斜杠命令（见「在微信里回复」）。不带编号的 `/stop` 是暂停整个服务，`/start` 恢复（见「暂停和恢复」）。
 
 | | 推送回复/出错 | 微信里批准 | 微信里发消息、看历史 | 微信里回答提问 |
 | --- | --- | --- | --- | --- |
@@ -201,13 +217,13 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 
 每个对话有一个编号（回收规则见下），推送的第一段是 `[编号] OpenCode · 项目目录名 / 会话标题`（Codex 对话是 `[编号] Codex · 目录 / 标题`），空一行后是内容：
 
-- 回复过程中（实时推送，只推顶层会话）：AI 每说完一段话（`session.text.ended`）就记下来，同一个对话最多 15 秒推一条，把这段时间说完的几段合在一起，末尾附上这段时间调用的工具，比如「（调用了 shell ×3、edit）」。思考过程、工具输出和空段落不推。第一条在第一段话说完 15 秒后才推，所以 15 秒内结束的回复照旧只有一条推送。
+- 回复过程中（实时推送，只推顶层会话）：AI 每说完一段话（`session.text.ended`）就记下来，同一个对话最多 15 秒推一条（用掉一半额度后改成 60 秒），把这段时间说完的几段合在一起，末尾附上这段时间调用的工具，比如「（调用了 shell ×3、edit）」。思考过程、工具输出和空段落不推。第一条在第一段话说完 15 秒后才推，所以 15 秒内结束的回复照旧只有一条推送。
 - 回复完成（只推顶层会话，子代理不推）：AI 这一轮的最终回复。推过实时进度的话，只推还没推过的部分；全都推过了就只推一行「[3] OpenCode · ttool 完成」。
 - 出错：错误信息
 - 请求权限：要做的操作，以及「3 y / 3 n」提示（各自一段）
 - 提问/表单：问题、字段和选项
 
-出错、权限、提问立刻推送，前面带上还没推出去的实时进度。被中断（`/stop`、桌面端停止）的回复不推。
+出错、权限、提问立刻推送，前面带上还没推出去的实时进度。被中断（`3 /stop`、桌面端停止）的回复不推。暂停服务期间什么都不推（见「暂停和恢复」）。
 
 **排版**：微信客户端把机器人发的文字当 Markdown 显示（在真实客户端上试过）：单个换行显示成空格，行尾加两个空格也不换行，空一行才是新段落，`- ` 开头的行显示成紧凑的列表。所以插件自己拼的每条消息都只用这两种写法：段落之间空一行，列表每项一行 `- `。选项的编号写在项里（`- 1 浅色`），不用 `1.` 有序列表（没验证过会不会显示）；不用粗体、标题、表格。AI 写的文字（最终回复、实时进度、历史里的消息正文）原样发出，不改动；插件加的标题、「（调用了 …）」、「…（还有 N 字）」、提示各占一段，和正文之间空一行。排版函数在 `md.js`（`md` 拼段落，`ul` / `numbered` 拼列表）。
 
@@ -265,7 +281,9 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 | `文件提示 关` / `文件提示 开` | 关 / 开每轮结束后的文件清单，也认 `/files off` / `/files on`，默认开 |
 | 发图片 / 文件 | 先存起来（见下面「从微信发图片和文件」），下一条文字带上它们一起发 |
 | `/model` | 列出可用模型并编号（`- 1 服务商/模型`），标出当前对话在用的那个。`/model 3`、`/model 名字片段` 切换（匹配到多个会让你选） |
-| `/stop` | 停止对话正在运行的回复 |
+| `3 /stop` | 停止 [3] 正在运行的回复。必须带编号：不带编号的 `/stop` 是下面的暂停服务（0.4.0 起，以前不带编号是停当前对话） |
+| `/stop` / `停止服务` | 暂停整个服务：不再推送，也不执行微信命令，只认 `/start`、`帮助`、`额度`（见「暂停和恢复」） |
+| `/start` / `开始` / `启动服务` | 恢复服务。`开始` 只在暂停时算命令，运行中和别的文字一样发给对话 |
 | `/compact` | 压缩对话上下文 |
 | `/review 内容` 等 | OpenCode 自己的命令（`init`、`review`、技能命令等，按对话所在文件夹列出）。不认识的 `/xxx` 回「不认识的命令」，不会当成文字发给 AI |
 | `帮助` | 显示用法（分成「发消息」「看对话」「批准和回答」等几节，一条命令一行） |
@@ -329,14 +347,29 @@ AI 用提问工具问你（桌面端显示「1/3 个问题」那种），推送�
 …
 ```
 
-斜杠命令都作用在「发给谁」的那个对话上：带编号（`3 /model`、`3 /stop`）就是 [3]，不带就是上一次指定的对话。插件自己的 `/list` `/help` `/new` `/cd` `/img` `/history` `/ls` `/dirs` 优先；写错格式的（比如 `/img 好看吗`）显示帮助。`/usr/bin 是什么` 这种斜杠后面紧跟路径的照常是普通文字。
+斜杠命令都作用在「发给谁」的那个对话上：带编号（`3 /model`、`3 /stop`）就是 [3]，不带就是上一次指定的对话（`/stop` 除外：不带编号是暂停服务，见「暂停和恢复」）。插件自己的 `/list` `/help` `/new` `/cd` `/img` `/history` `/ls` `/dirs` 优先；写错格式的（比如 `/img 好看吗`）显示帮助。`/usr/bin 是什么` 这种斜杠后面紧跟路径的照常是普通文字。
 
 - `/model`（OpenCode）：列表来自 `GET /api/model`，只列启用的服务商里没废弃的模型，标「不看图」的模型收不到图片。切换用 `POST /api/session/{id}/model`，是真正改这个对话的模型，桌面端也跟着变。
 - `/model`（Codex）：列表来自 app-server 的 `model/list`。Codex 没有单独改对话模型的接口，插件把选择记在状态文件里（`codexModels`），之后从微信发出的每一轮都在 `turn/start` 里带上 `model`；Codex 会把它记成这个对话之后的模型，所以电脑上接着用也是它。
-- `/stop`：OpenCode 用 `POST /api/session/{id}/interrupt`。Codex：插件后台跑的回复用 `turn/interrupt`；桌面窗口打开着的对话通过桌面端管道停止（等于点停止按钮）；终端里跑的只能在电脑上停。
+- `3 /stop`：OpenCode 用 `POST /api/session/{id}/interrupt`。Codex：插件后台跑的回复用 `turn/interrupt`；桌面窗口打开着的对话通过桌面端管道停止（等于点停止按钮）；终端里跑的只能在电脑上停。
 - `/compact`：OpenCode 用 `POST /api/session/{id}/compact`。Codex：桌面窗口打开着就交给窗口，否则插件用 `thread/compact/start` 在后台压缩，完成后推送「上下文已压缩」。Codex 对话不支持其他斜杠命令。
 
 Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「从微信控制 Codex」。
+
+### 暂停和恢复
+
+不带编号的 `/stop`（也认 `停止服务`）暂停整个服务，回「已暂停：不再推送，也不执行微信命令。发 /start 恢复」。暂停期间：
+
+- 插件、后台程序和 Codex hook 都不推送，推送直接丢掉，不进发件箱；实时进度也停。
+- 微信命令一律不执行，只回应 `/start`（也认 `开始`、`启动服务`）、`帮助`、`额度` 和再发一次的 `/stop`；发来的图片和文件也不保存。
+- Codex 的 `PermissionRequest` hook 立刻返回「没有决定」，不等微信，权限在电脑上批。
+- 接收微信消息的进程照常运行，所以 `/start` 收得到。
+
+`/start` 回「已恢复」；发件箱里有暂停之前就排着的消息时再加「，队列里 k 条，接着补发」，随后补发。没暂停时发 `/start` 回「没有暂停，一直在运行」。`开始` 只在暂停时算恢复命令，运行中它和别的文字一样发给对话。状态存在状态文件的 `paused` 里，重启后还在。
+
+默认是运行的（和以前一样）。想「连上微信后先不推送，要用再开」：连上机器人之后发一次 `/stop`，需要时发 `/start`。
+
+0.4.0 的改动：不带编号的 `/stop` 以前是停止当前对话正在运行的回复，现在是暂停服务；要停某个对话的回复发 `3 /stop`（带编号）。
 
 ## 图片
 

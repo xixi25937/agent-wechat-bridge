@@ -3,9 +3,9 @@ import { getEventListeners } from "node:events"
 import crypto from "node:crypto"
 import { test } from "node:test"
 import {
-  HELP, KEEP_MS, PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, dirsText, doneText, eventKey, extOf, format,
+  HELP, KEEP_MS, PAIR_MS, PAUSED_TEXT, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, dirsText, doneText, eventKey, extOf, format,
   historyLines, imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, listMessages, listText, lowestFree, liveOn, mediaAck, mergeLines,
-  modelLines, withSkip, parseCommand, pickDir, prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk,
+  heardWhilePaused, modelLines, withSkip, parseCommand, pickDir, prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk,
   unsendPlan, withMedia, withPre,
 } from "./index.js"
 import { looseBreaks } from "./md.js"
@@ -157,11 +157,11 @@ test("帮助: titled sections of one-line bullets", () => {
     if (i % 2) assert.ok(b.split("\n").every((l) => l.startsWith("- ") && em(l.slice(2)) <= 18), b)
     else assert.match(b, /^【[^】]+】$/)
   })
-  assert.deepEqual(blocks.filter((_, i) => i % 2 === 0).map((t) => t.slice(1, -1)), ["发消息", "看对话", "批准和回答", "文件夹和新对话", "图片", "文件", "撤回", "实时推送", "其他"])
+  assert.deepEqual(blocks.filter((_, i) => i % 2 === 0).map((t) => t.slice(1, -1)), ["发消息", "看对话", "批准和回答", "文件夹和新对话", "图片", "文件", "撤回", "实时推送", "暂停服务", "其他"])
   assert.ok(slashHelpText("[7] OpenCode", [{ name: "init" }]).split("\n").every((l) => !l.startsWith("- ") || em(l.slice(2)) <= 18))
   // Nothing Markdown could pick up: emphasis, headings, quotes, code.
   assert.ok(!/[*_`#>]/.test(HELP) && !/[*_`#>]/.test(slashHelpText("[7] OpenCode · ttool")))
-  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend", "文件 路径", "文件提示", "额度"]) assert.ok(HELP.includes(c), c)
+  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend", "文件 路径", "文件提示", "额度", "/stop", "/start", "3 /stop"]) assert.ok(HELP.includes(c), c)
 })
 
 test("imagePaths", () => {
@@ -625,4 +625,27 @@ test("default chunk size is 3500 and splitText follows it", () => {
   const parts = splitText(`[3] h\n\n${clip("z".repeat(9000), 3)}`)
   assert.equal(parts.length, 3, "a capped 8000-character reply is three sends, not five")
   assert.ok(parts.every((p) => p.length <= 3500 + 20))
+})
+
+test("/stop and /start pause and resume the whole bridge; 3 /stop still stops conversation 3", () => {
+  for (const t of ["/stop", "/STOP", "  /stop ", "停止服务", "停止服务。", "/stop!"]) assert.deepEqual(parseCommand(t), { type: "pause" }, t)
+  for (const t of ["/start", "/Start", "启动服务", "启动服务！"]) assert.deepEqual(parseCommand(t), { type: "resume" }, t)
+  // 「开始」 alone is also something one says to an agent: a command only while paused (inbound decides).
+  for (const t of ["开始", "开始。"]) assert.deepEqual(parseCommand(t), { type: "resume", soft: true }, t)
+  // With a number it is the conversation's own command, as before.
+  assert.deepEqual(parseCommand("3 /stop"), { type: "slash", n: 3, name: "stop", args: "" })
+  assert.deepEqual(parseCommand("12 /stop"), { type: "slash", n: 12, name: "stop", args: "" })
+  assert.deepEqual(parseCommand("3 /start"), { type: "slash", n: 3, name: "start", args: "" }, "no meaning for a conversation")
+  // Chat that merely contains the words stays chat.
+  assert.deepEqual(parseCommand("停止服务器"), { type: "text", text: "停止服务器" })
+  assert.deepEqual(parseCommand("开始吧"), { type: "text", text: "开始吧" })
+  assert.deepEqual(parseCommand("3 开始"), { type: "text", n: 3, text: "开始" })
+  assert.deepEqual(parseCommand("3 停止服务"), { type: "text", n: 3, text: "停止服务" })
+  // Paused, the bridge hears /start, 帮助, 额度 and a repeated /stop; nothing else, not even media (no command).
+  for (const t of ["/start", "启动服务", "帮助", "/help", "额度", "/quota", "帮助 额度", "/stop", "10 帮助"]) assert.ok(heardWhilePaused(parseCommand(t)), t)
+  for (const t of ["列表", "3 y", "3 内容", "3 /stop", "/model", "目录", "图 a.png", "文件", "实时 关", "3", "帮助 列表"]) assert.ok(!heardWhilePaused(parseCommand(t)), t)
+  assert.ok(!heardWhilePaused(null))
+  assert.equal(PAUSED_TEXT, "已暂停：不再推送，也不执行微信命令。发 /start 恢复")
+  // The slash help says which /stop is which.
+  assert.ok(slashHelpText("").includes("3 /stop → 停止 [3] 的回复") && slashHelpText("").includes("/stop 不带编号 → 暂停服务"))
 })

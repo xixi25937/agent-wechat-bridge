@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import {
-  FLUSH, HIGH, LOW, OUTBOX_MAX, OUTBOX_TTL, QUOTA, RESERVE, alive, decide, enqueue, expire, foldOffer, groups, left, liveMs, mergeTexts, noticeText, quotaText,
+  FLUSH, HIGH, LOW, OUTBOX_MAX, OUTBOX_TTL, QUOTA, REPLY, RESERVE, alive, decide, enqueue, expire, foldOffer, groups, left, liveMs, mergeTexts, noticeText, quotaText,
   skipNote,
 } from "./quota.js"
 
@@ -22,6 +22,8 @@ test("budget: 10 sends, the last 3 are for approvals, errors, final and command 
   assert.equal(act(6, LOW, 2), "skip")
   // High priority goes on to the last-but-one send.
   for (const sent of [0, 6, 7, 8]) assert.equal(act(sent, HIGH), "send", `sent ${sent}`)
+  // A reply to the user's own message is budgeted like a high-priority one (index.js alone lets it through a pause).
+  for (const sent of [0, 8, 9, 10]) assert.deepEqual(decide(at(sent), REPLY), decide(at(sent), HIGH), `sent ${sent}`)
 })
 
 test("budget: the last slot is kept for the notice, once", () => {
