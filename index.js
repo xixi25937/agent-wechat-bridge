@@ -16,6 +16,9 @@ import {
 } from "./files.js"
 import { md, numbered, ul } from "./md.js"
 import { pollLock, readLock } from "./poll-lock.js"
+import {
+  FLUSH, HIGH, LOW, QUOTA, RESERVE, alive, decide, enqueue, expire, foldOffer, groups, left, liveMs, lostNote, mergeTexts, noticeText, quotaText, skipNote,
+} from "./quota.js"
 
 // session.idle exists in the client types but 2.0.32 never emits it; a finished run is session.execution.succeeded.
 const TYPES = new Set([
@@ -23,17 +26,13 @@ const TYPES = new Set([
   "session.text.ended", "session.tool.input.started", "session.execution.interrupted",
 ])
 const ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"])
-// Progress pushes of one conversation are at least this far apart; a run shorter than this gets one push, as before.
-const LIVE_MS = 15_000
-// ponytail: iLink reportedly lets a bot send ~10 messages per message from the user (third-party reports, not
-// documented). Progress stops at this many so the final reply and approvals still get through; the count is in the
-// state file and resets on any message from the user.
-const PROGRESS_MAX = 7
 const DEBOUNCE_MS = 5000
 // Longer text is cut here and ends with how much is left; up to that it goes out in chunks of CHUNK_CHARS.
 const MAX_CHARS = 8000
-// iLink reportedly cuts or rejects text past ~2000 characters (third-party reports, not documented).
-const CHUNK_CHARS = 1800
+// One WeChat message holds this many characters. A third-party report (hermes-agent) says iLink cuts or rejects text past
+// ~2000; a real sendmessage of 4516 characters (12.4 KB of UTF-8) came back ret=0 (probe-send-limits.js, 2026-10-30), so
+// this is 3500: verified by the API, not on the phone yet. If the phone shows a cut message, set WECHAT_NOTIFY_CHUNK=1800.
+const CHUNK_CHARS = Number(process.env.WECHAT_NOTIFY_CHUNK) || 3500
 const CHUNK_GAP_MS = 400
 // A 「撤回」 waits this long for its 「撤回 确认」.
 const UNSEND_MS = 2 * 60_000
@@ -60,7 +59,7 @@ export const HELP = md(
   section("文件", ["每轮结束后列出这轮的文件", "3 文件 1 3 → 发第 1、3 个", "3 文件 全部 → 全部发来", "文件 路径 → 发电脑上的文件", "文件提示 关 / 开 → 关 / 开"]),
   section("撤回", ["3 撤回 → 撤回 [3] 最后一条", "再发「3 撤回 确认」才执行", "不带编号就是当前对话", "也认 /unsend"]),
   section("实时推送", ["实时 关 / 实时 开 → 关 / 开", "回复过程中约 15 秒推一条", "3 实时 关 → 只关 [3]", "实时 → 看状态"]),
-  section("其他", ["编号后是 agent 和目录", "例：[3] OpenCode · ttool", "OpenCode 和 Codex 用法一样", "/ 命令 → 见下一条"]),
+  section("其他", ["编号后是 agent 和目录", "例：[3] OpenCode · ttool", "OpenCode 和 Codex 用法一样", "额度 → 看微信发送额度", "/ 命令 → 见下一条"]),
 )
 
 export function slashHelpText(t, commands) {
@@ -260,7 +259,7 @@ export function format(event, session, n, reply, live) {
     case "session.execution.succeeded":
       return session?.parentID ? null : doneText(hd, n, reply, live, ocTag(n, session, event.location?.directory))
     case "session.execution.failed":
-      return md(hd, "出错：" + short(d.error?.message || d.error?.type || "未知错误", 300))
+      return withSkip(md(hd, "出错：" + short(d.error?.message || d.error?.type || "未知错误", 300)), live, n)
     case "permission.asked": {
       const what = d.message || [d.action, ...(d.resources ?? [])].filter(Boolean).join(" ")
       return md(hd, `等你批准：${short(what, 300)}`, `回复「${n} y」批准一次，「${n} n」拒绝`)
@@ -274,8 +273,15 @@ export function format(event, session, n, reply, live) {
 // Live progress (see takeLive): `live` is { body, pushed }, the text not pushed yet and whether any of the run was.
 // A run that pushed progress ends with only what wasn't pushed, or one line when nothing is left; any other run
 // ends with its last reply, as without progress. `t`: the conversation's tag, for the one-line ending.
+// Progress left out near the end of the allowance (`live.skipped` segments) is not in the push, so the run ends with
+// its last reply, and says how many segments were skipped.
 export const doneText = (h, n, reply, live, t = `[${n}]`) =>
-  !live?.pushed ? md(h, clip(reply, n) || "完成（没有文字回复）") : live.body ? md(h, clip(live.body, n)) : `${t} 完成`
+  live?.skipped
+    ? md(h, clip(live.body || reply, n) || "完成（没有文字回复）", skipNote(live.skipped, n))
+    : !live?.pushed ? md(h, clip(reply, n) || "完成（没有文字回复）") : live.body ? md(h, clip(live.body, n)) : `${t} 完成`
+
+// A failed run's message also says how many progress segments were skipped.
+export const withSkip = (msg, live, n) => (live?.skipped ? md(msg, skipNote(live.skipped, n)) : msg)
 
 // Errors, approvals and questions carry the pending progress first (after the header paragraph), so order is kept.
 export function withPre(msg, live) {
@@ -292,8 +298,9 @@ export function liveBody(texts, tools) {
   return t && md(t, u && `（调用了 ${u}）`)
 }
 
-// Wait before the next progress push of a conversation whose last push (or first segment) was at `at`.
-export const liveDelay = (at, now = Date.now()) => Math.max(0, at + LIVE_MS - now)
+// Wait before the next progress push of a conversation whose last push (or first segment) was at `at`; `sent`: bot
+// messages used so far (see liveMs).
+export const liveDelay = (at, now = Date.now(), sent = 0) => Math.max(0, at + liveMs(sent) - now)
 
 // Whether a conversation gets progress pushes: its own 「N 实时 开/关」, else the global one, else on.
 export const liveOn = (s, key) => s.live?.[key] ?? s.live?.["*"] ?? true
@@ -319,8 +326,9 @@ const KEYWORDS = [
   ["list", /^(列表|\/?list|\/ls)$/i],
   ["help", /^(帮助|\/?help|\?|？|\/|／)$/i],
   ["dirs", /^(目录|文件夹|\/?dirs?)$/i],
+  ["quota", /^(额度|\/quota)$/i],
 ]
-const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img", "live", "unsend", "file", "files"])
+const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img", "live", "unsend", "file", "files", "quota"])
 // What 「文件 …」 treats as a path rather than chat: a separator, or an extension with a letter ("v1.2" is not one).
 const PATHISH = /[\\/]|\.\w*[a-z]\w*$/i
 const keyword = (w) => KEYWORDS.find(([, re]) => re.test(w) || re.test(w.replace(/[。.！!？?~～…]+$/, "")))?.[0]
@@ -539,21 +547,69 @@ const GEN = {}
 // instance at any time, so the map is kept across evaluations; a pending timer of a reloaded module runs its old code once.
 if (!(g.progress instanceof Map)) g.progress = new Map()
 // State lives on disk and is re-read every time: several OpenCode server processes load this plugin and share it.
-// ponytail: read-modify-write without a lock, fine for a few writes a minute; two processes numbering a new
-// session in the same instant can still lose one mapping. A file lock fixes that if it ever shows up.
 export const state = () => ({ nums: {}, ...readJson(STATE_FILE) })
-export function update(fn) {
-  const s = state()
-  fn(s)
+
+// The plugin, the daemon and the Codex hooks all write the state (send count, outbox), so a read-modify-write holds
+// DIR/state.lock (created exclusively; a lock older than LOCK_STALE_MS is a crashed holder's). It gives up after
+// LOCK_WAIT_MS and writes anyway: a stuck lock must not stop messages.
+// ponytail: two contenders that both find the same stale lock can both take it; add a guard file like poll-lock.js if it shows up.
+const LOCK_FILE = path.join(DIR, "state.lock")
+const LOCK_STALE_MS = 5000
+const LOCK_WAIT_MS = 2000
+const nap = (ms) => {
   try {
-    // Write then rename, so another process never reads a half-written file and saves defaults over it.
-    const tmp = `${STATE_FILE}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(s))
-    fs.renameSync(tmp, STATE_FILE)
-  } catch (e) {
-    warn("state save failed:", e)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch {
+    for (const end = Date.now() + ms; Date.now() < end; );
   }
-  return s
+}
+let holding = false
+function takeLock() {
+  for (const end = Date.now() + LOCK_WAIT_MS; ; nap(10)) {
+    try {
+      fs.closeSync(fs.openSync(LOCK_FILE, "wx"))
+      return true
+    } catch (e) {
+      // Windows answers EPERM / EBUSY while the holder is deleting the file.
+      if (!["EEXIST", "EPERM", "EBUSY", "EACCES"].includes(e.code)) return false
+      try {
+        if (Date.now() - fs.statSync(LOCK_FILE).mtimeMs > LOCK_STALE_MS) fs.rmSync(LOCK_FILE, { force: true })
+      } catch {}
+      if (Date.now() > end) return false
+    }
+  }
+}
+
+export function update(fn) {
+  const own = !holding && takeLock()
+  if (own) holding = true
+  try {
+    const s = state()
+    fn(s)
+    try {
+      // Write then rename, so another process never reads a half-written file and saves defaults over it.
+      const tmp = `${STATE_FILE}.${process.pid}.tmp`
+      fs.writeFileSync(tmp, JSON.stringify(s))
+      // Windows refuses to replace a file another process is reading that very moment.
+      for (let i = 0; ; i++) {
+        try {
+          fs.renameSync(tmp, STATE_FILE)
+          break
+        } catch (e) {
+          if (i >= 4) throw e
+          nap(15)
+        }
+      }
+    } catch (e) {
+      warn("state save failed:", e)
+    }
+    return s
+  } finally {
+    if (own) {
+      holding = false
+      fs.rmSync(LOCK_FILE, { force: true })
+    }
+  }
 }
 // Keys are OpenCode session ids, or `codex:<threadId>` for Codex threads; both share one numbering.
 // A number freed by removing its key from nums is handed out again; old state files may still carry an unused `next`.
@@ -715,8 +771,9 @@ function check(name, json) {
   const errcode = Number(json.errcode ?? 0)
   const status = `http=${json.http} ret=${ret} errcode=${errcode}`
   if (json.ok && !ret && !errcode) return status
-  const hint = ret === -2 ? " (context_token 过期或这条消息之后发得太多，给机器人发一条消息就恢复)" : ""
-  throw new Error(`${name} failed: ${status} ${short(json.errmsg ?? "", 120)}${hint}`)
+  const hint = ret === -2 ? " (context_token 过期，或你上一条消息之后机器人已经发满额度，给机器人发一条消息就恢复)" : ""
+  // `rejected`: iLink answered, so retrying the same request is pointless (a network failure has no such flag).
+  throw Object.assign(new Error(`${name} failed: ${status} ${short(json.errmsg ?? "", 120)}${hint}`), { rejected: true })
 }
 
 function recipient() {
@@ -728,11 +785,20 @@ function recipient() {
   return { to, contextToken }
 }
 
-// iLink answers ret=-2 ("prepare failed") for a stale context_token, a burst of sends, and reportedly once a token
-// has carried ~10 bot messages. One retry after a pause covers a burst, and picks up a token that arrived meanwhile.
-const RETRY_MS = 2000
+// iLink answers ret=-2 with "prepare failed" for a stale context_token, a burst of sends, and once a token has carried
+// ~10 bot messages (see quota.js); with "invalid arguments" for a request it rejects (two text items in one
+// sendmessage, seen 2026-10-30). Only the first is the allowance running out.
+const spent = (json) => Number(json.ret) === -2 && !/invalid arg/i.test(json.errmsg ?? "")
+// One retry after a pause covers a burst, and picks up a token that arrived meanwhile. WECHAT_NOTIFY_RETRY_MS: a test seam.
+const RETRY_MS = Number(process.env.WECHAT_NOTIFY_RETRY_MS) || 2000
+const QUEUED = "queued"
+const SKIPPED = "skipped"
+const textItems = (text) => [{ type: 1, text_item: { text } }]
+const gap = () => new Promise((r) => setTimeout(r, CHUNK_GAP_MS))
 
-async function sendItems(items) {
+// One sendmessage, with the budget already claimed. Returns its status, or null when iLink says the allowance is spent
+// (after one retry). Throws on any other failure.
+async function post(items) {
   for (let i = 0; ; i++) {
     const { to, contextToken } = recipient()
     const json = await ilink("ilink/bot/sendmessage", {
@@ -746,31 +812,142 @@ async function sendItems(items) {
         context_token: contextToken,
       },
     })
-    if (i || Number(json.ret) !== -2) {
-      const status = check("sendmessage", json)
-      // Bot messages since the user's last message; live progress pauses near the limit (see PROGRESS_MAX).
-      update((s) => (s.sent = (s.sent ?? 0) + 1))
-      return status
-    }
+    if (!spent(json)) return check("sendmessage", json)
+    if (i) return null
     warn(`sendmessage ret=-2 ${short(json.errmsg ?? "", 60)}, retrying in ${RETRY_MS / 1000} s`)
     await new Promise((r) => setTimeout(r, RETRY_MS))
   }
 }
 
-// Sends a text, split into numbered chunks one after another (see splitText). Never throws; returns a short
-// status string without secrets. A failed chunk stops the rest, so a later chunk never arrives without it.
-export async function send(text) {
-  const chunks = splitText(text)
-  try {
-    let status = ""
-    for (const [i, c] of chunks.entries()) {
-      if (i) await new Promise((r) => setTimeout(r, CHUNK_GAP_MS))
-      status = await sendItems([{ type: 1, text_item: { text: c } }])
+// --- the shared send budget (quota.js decides, the state file keeps the count and the outbox) ---
+// `sent` counts the bot messages since the user's last one, over every process that sends. A send is claimed before it
+// goes out, in one locked read-modify-write, so two processes never both take the last one.
+
+// Claims `n` sends at priority `prio`. Returns the decision; for HIGH with nothing left, `entry` ({ text } or
+// { file, as }) went into the outbox, and when `notice` is set the last send was taken for the notice (`k`: queue length).
+function claim(prio, n, entry) {
+  let d
+  update((s) => {
+    d = decide(s, prio, n)
+    if (d.act === "send") s.sent = (s.sent ?? 0) + n
+    else if (d.act === "queue") {
+      const k = enqueue(s, entry)
+      if (d.notice) ((s.noticed = true), (s.sent = (s.sent ?? 0) + 1), (d.k = k))
     }
-    return chunks.length > 1 ? `${status} ×${chunks.length}` : status
+  })
+  return d
+}
+const refund = (n) => update((s) => (s.sent = Math.max(0, (s.sent ?? 0) - n)))
+// iLink said the allowance is spent although we counted fewer: believe iLink, and keep `entry` for the next token.
+const exhaust = (entry) => update((s) => (entry && enqueue(s, entry), (s.sent = QUOTA)))
+
+// The one message that says the allowance is out, in the send claim() kept free.
+async function notice(k) {
+  try {
+    if (!(await post(textItems(noticeText(k))))) exhaust()
+  } catch (e) {
+    warn("quota notice:", e)
+    update((s) => ((s.noticed = false), (s.sent = Math.max(0, (s.sent ?? 0) - 1))))
+  }
+}
+
+// A high-priority message in one send: sent, or QUEUED in the outbox when the allowance is gone. `build` makes the items
+// (an upload for a file), only after the send is claimed.
+async function sendHigh(entry, build = async () => textItems(entry.text)) {
+  const d = claim(HIGH, 1, entry)
+  if (d.act === "queue") return (d.notice && (await notice(d.k)), QUEUED)
+  let status
+  try {
+    status = await post(await build())
+  } catch (e) {
+    refund(1)
+    throw e
+  }
+  if (status) return status
+  exhaust(entry)
+  return QUEUED
+}
+
+// A low-priority message (progress, file offer): all its chunks or none, SKIPPED when too little of the allowance is left.
+async function sendLow(chunks) {
+  if (claim(LOW, chunks.length).act !== "send") return SKIPPED
+  let status
+  for (const [i, c] of chunks.entries()) {
+    if (i) await gap()
+    try {
+      status = await post(textItems(c))
+    } catch (e) {
+      refund(chunks.length - i)
+      throw e
+    }
+    if (!status) return (exhaust(), SKIPPED)
+  }
+  return chunks.length > 1 ? `${status} ×${chunks.length}` : status
+}
+
+// Sends a text (or the chunks splitText made), one chunk after another. Never throws; returns a short status string
+// without secrets: "queued" when any part went to the outbox, "skipped" for a low-priority message that was dropped,
+// "error" on a failure. A failed chunk stops the rest, so a later chunk never arrives without it.
+export async function send(text, prio = HIGH) {
+  const chunks = Array.isArray(text) ? text : splitText(text)
+  try {
+    if (prio === LOW) return await sendLow(chunks)
+    let status = ""
+    let queued = false
+    for (const [i, c] of chunks.entries()) {
+      if (i && status !== QUEUED) await gap()
+      status = await sendHigh({ text: c })
+      queued ||= status === QUEUED
+    }
+    return queued ? QUEUED : chunks.length > 1 ? `${status} ×${chunks.length}` : status
   } catch (e) {
     warn("send:", e)
     return "error"
+  }
+}
+
+// What a queued entry sends: its text, or the uploaded file or image.
+async function deliver(grp, text = grp.text) {
+  if (text != null) return post(textItems(text))
+  const { item } = grp.as === "image" ? await uploadImage(grp.file) : await uploadFile(grp.file)
+  return post([item])
+}
+
+// After the user's message brought a fresh allowance: sends the outbox in order (texts merged into as few messages as
+// fit one), keeping RESERVE sends for what comes next. An entry leaves the outbox only once it is sent. Whoever receives
+// the user's messages calls it; the hook processes and everything else only enqueue.
+export function flushOutbox() {
+  return (g.flushing ??= doFlush()
+    .catch((e) => warn("outbox:", e))
+    .finally(() => (g.flushing = null)))
+}
+
+async function doFlush() {
+  for (;;) {
+    let s = state()
+    if (alive(s.outbox).length !== (s.outbox?.length ?? 0)) s = update((x) => expire(x))
+    const grp = groups(alive(s.outbox), CHUNK_CHARS)[0]
+    if (!grp) return void (s.lost && update((x) => delete x.lost))
+    // What was dropped (too old, or the queue was full) is told once, in front of the first text.
+    const lost = grp.text != null ? (s.lost ?? 0) : 0
+    if (claim(FLUSH, 1).act !== "send") return
+    let status
+    try {
+      status = await deliver(grp, lost ? md(lostNote(lost), grp.text) : grp.text)
+    } catch (e) {
+      refund(1)
+      warn("outbox:", e)
+      // Something iLink refuses or a file that is gone would block everything behind it; a network failure waits for the next time.
+      if (!e.rejected && e.code !== "ENOENT") return
+      status = "dropped"
+    }
+    if (!status) return exhaust()
+    update((x) => {
+      x.outbox = (x.outbox ?? []).filter((e) => !grp.ids.includes(e.id))
+      if (!x.outbox.length) delete x.outbox
+      if (lost && status !== "dropped") x.lost = Math.max(0, (x.lost ?? 0) - lost)
+      if (!x.lost) delete x.lost
+    })
   }
 }
 
@@ -783,13 +960,18 @@ async function imageProblem(file) {
 }
 
 // Upload: getuploadurl → POST the AES-128-ECB ciphertext to the CDN → send an image item with the CDN's download param.
-// Throws on failure; returns the status of each step (no secrets).
+// Throws on failure; returns the status of each step (no secrets), or "queued" when the allowance is gone (the image
+// waits in the outbox and is uploaded when it is sent).
 export async function sendImage(file) {
   const problem = await imageProblem(file)
   if (problem) throw new Error(`${path.basename(file)} ${problem}`)
-  const { item, steps } = await uploadImage(file)
-  steps.push(`sendmessage ${await sendItems([item])}`)
-  return steps.join(", ")
+  let steps = []
+  const status = await sendHigh({ file, as: "image" }, async () => {
+    const up = await uploadImage(file)
+    steps = up.steps
+    return [up.item]
+  })
+  return status === QUEUED ? status : [...steps, `sendmessage ${status}`].join(", ")
 }
 
 // null when `file` is a sendable file, else the reason.
@@ -857,13 +1039,17 @@ export async function uploadFile(file) {
   return { item: fileItem(media, path.basename(file), rawsize), steps }
 }
 
-// Sends any file as a file message. Throws on failure; returns the status of each step (no secrets).
+// Sends any file as a file message. Throws on failure; returns the status of each step (no secrets), or "queued" like sendImage.
 export async function sendFile(file) {
   const problem = await fileProblem(file)
   if (problem) throw new Error(`${path.basename(file)} ${problem}`)
-  const { item, steps } = await uploadFile(file)
-  steps.push(`sendmessage ${await sendItems([item])}`)
-  return steps.join(", ")
+  let steps = []
+  const status = await sendHigh({ file, as: "file" }, async () => {
+    const up = await uploadFile(file)
+    steps = up.steps
+    return [up.item]
+  })
+  return status === QUEUED ? status : [...steps, `sendmessage ${status}`].join(", ")
 }
 
 // Image paths mentioned in a reply (see mentionedPaths in files.js).
@@ -909,17 +1095,31 @@ export const lastReply = async (sessionID, stopAtUser = true) =>
   replyText((await oc(`/api/session/${sid(sessionID)}/message?limit=30&order=desc`)).data, stopAtUser)
 
 // Pushes go out one at a time in call order, so a progress push in flight never lands after the push that follows it.
-function push(sessionID, text) {
+function push(sessionID, text, prio = HIGH) {
   update((s) => (s.last = sessionID))
-  return (g.chain = (g.chain ?? Promise.resolve()).then(() => send(text)))
+  return (g.chain = (g.chain ?? Promise.resolve()).then(() => send(text, prio)))
 }
 
-// --- live progress: finished text segments of a running conversation, pushed at most every LIVE_MS ---
+// The final push of a finished turn: the text, then its images. The file offer (if the turn has files) rides in the
+// last chunk of the text when it fits, and otherwise follows as a low-priority message. Returns the text's status.
+// `offer`: { reply, dir, edited } as for offerFiles.
+export async function pushFinal(key, text, { images = [], ...offer } = {}) {
+  const o = await planOffer(key, offer)
+  const chunks = splitText(text)
+  const folded = o ? foldOffer(chunks, o, CHUNK_CHARS) : null
+  const status = await push(key, folded ?? chunks)
+  for (const f of images) await sendImage(f).catch((e) => warn("image:", e))
+  if (o && !folded) await push(key, o, LOW)
+  return status
+}
+
+// --- live progress: finished text segments of a running conversation, pushed at most every liveMs() ---
 // One entry per conversation key (OpenCode session id or codex:<thread>) while it runs, shared by all plugin instances:
-// { texts, tools, at, pushed, timer, info, child }. `info()` resolves to { head } or { child: true } at push time.
+// { texts, tools, at, pushed, skipped, timer, info, child }. `info()` resolves to { head } or { child: true } at push time.
+// Progress is low priority (see quota.js): near the end of the allowance a segment is dropped and counted in `skipped`.
 
 const NO_LIVE = { body: "", pushed: false }
-const PAUSE = "（实时推送先停一下：微信限制机器人连着发消息，回「实时」继续）"
+const PAUSE = "（微信限制机器人连着发消息，实时推送先停一下，完成时照常推送；你发任何一条消息就恢复）"
 
 function liveEntry(key, info) {
   let e = g.progress.get(key)
@@ -932,9 +1132,9 @@ export function addText(key, text, info) {
   const e = liveEntry(key, info)
   if (e.child) return
   e.texts.push(text)
-  // The first push waits LIVE_MS from the first segment, so a short run still ends with a single push.
+  // The first push waits liveMs() from the first segment, so a short run still ends with a single push.
   e.at ??= Date.now()
-  e.timer ??= setTimeout(() => flushLive(key, e).catch((err) => warn("live:", err)), liveDelay(e.at))
+  e.timer ??= setTimeout(() => flushLive(key, e).catch((err) => warn("live:", err)), liveDelay(e.at, Date.now(), state().sent ?? 0))
 }
 
 export function addTool(key, name, info) {
@@ -952,7 +1152,7 @@ export function takeLive(key, end, on = true) {
   clearTimeout(e.timer)
   e.timer = null
   if (end) g.progress.delete(key)
-  const r = { body: on || e.pushed ? liveBody(e.texts, e.tools) : "", pushed: e.pushed }
+  const r = { body: on || e.pushed ? liveBody(e.texts, e.tools) : "", pushed: e.pushed, ...(e.skipped && { skipped: e.skipped }) }
   Object.assign(e, { texts: [], tools: new Map() })
   if (r.body) Object.assign(e, { pushed: true, at: Date.now() })
   return r
@@ -960,14 +1160,23 @@ export function takeLive(key, end, on = true) {
 
 async function flushLive(key, e) {
   e.timer = null
-  const s = state()
-  // Off, or out of messages for now: the text waits for the next push of this run.
-  if (g.progress.get(key) !== e || !liveOn(s, key) || (s.sent ?? 0) >= PROGRESS_MAX) return
+  // Off: the text waits for the final push of this run.
+  if (g.progress.get(key) !== e || !liveOn(state(), key)) return
   const { head: h, child } = await e.info()
   if (child) return void Object.assign(e, { child: true, texts: [], tools: new Map() })
   if (g.progress.get(key) !== e) return
-  const { body } = takeLive(key)
-  if (body) await push(key, md(h, clip(body), (s.sent ?? 0) + 1 >= PROGRESS_MAX && PAUSE))
+  const body = liveBody(e.texts, e.tools)
+  if (!body) return
+  const segments = e.texts.length
+  const s = state()
+  const msg = md(h, clip(body))
+  const need = splitText(msg).length
+  const skip = () => Object.assign(e, { skipped: (e.skipped ?? 0) + segments })
+  // Too little of the allowance is left: drop it (the final push says how much), keep the sends for what matters.
+  if (decide(s, LOW, need).act !== "send") return void (skip(), Object.assign(e, { texts: [], tools: new Map() }))
+  takeLive(key)
+  const status = await push(key, left(s) - need < RESERVE + 1 ? md(msg, PAUSE) : msg, LOW)
+  if (status === SKIPPED) skip()
 }
 
 const sessionsURL = (limit, dir) =>
@@ -1072,6 +1281,7 @@ export async function run(cmd) {
   }
   if (cmd.type === "help") return [HELP, await slashHelp().catch((e) => (warn("help:", e), SLASH_HELP))]
   if (cmd.type === "list") return listSessions()
+  if (cmd.type === "quota") return quotaText(state())
   if (cmd.type === "dirs") {
     return dirsText(await listDirs())
   }
@@ -1463,11 +1673,11 @@ async function codexSend(threadId, kind, text, live, extra) {
   if (kind === "question") text = formText(questionForm(text), n, false)
   const h = codexHead(n, "", thread, { base, short })
   let msg = kind === "done" ? doneText(h, n, text, live, tagIn(state(), key, n)) : withPre(codexPushText(h, n, kind, text), live)
+  if (kind === "failed") msg = withSkip(msg, live, n)
   const { files, big } = kind === "done" ? await replyImages(text, cleanDir(thread?.cwd)) : { files: [], big: [] }
   if (big.length) msg = md(msg, `（图片太大没发：${big.join("、")}）`)
-  await push(key, msg)
-  for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
-  if (kind === "done") await offerFiles(key, { reply: text, dir: cleanDir(thread?.cwd), edited: fileChangePaths(extra?.fileChanges) })
+  if (kind === "done") await pushFinal(key, msg, { images: files, reply: text, dir: cleanDir(thread?.cwd), edited: fileChangePaths(extra?.fileChanges) })
+  else await push(key, msg)
 }
 
 // One app-server bridge per process; a hot-reloaded module stops the old one (it would still run old code).
@@ -1491,20 +1701,28 @@ export async function turnEdited(sessionID, dir) {
   return [...toolPaths(msgs, dir), ...diffPaths(diff, dir)]
 }
 
-// After a finished turn: offers the files it mentioned (`reply`) or changed (`edited`: paths, or a function returning
-// them, only called when offers are on) in one message, and keeps the offer in the state file until a newer one, 24 hours
-// or the conversation's number is gone. Nothing is sent when there is nothing to offer.
-export async function offerFiles(key, { reply, dir, edited = [] }) {
+// After a finished turn: the offer text for the files it mentioned (`reply`) or changed (`edited`: paths, or a function
+// returning them, only called when offers are on); "" when there is nothing to offer. It keeps the offer in the state
+// file until a newer one, 24 hours or the conversation's number is gone.
+async function planOffer(key, { reply, dir, edited = [] }) {
   try {
-    if (state().filesOff) return
+    if (state().filesOff) return ""
     const { files, more } = candidates({ reply, dir, edited: typeof edited === "function" ? await edited() : edited, bridgeDirs: [DIR, path.join(os.homedir(), ".cli-bridge")] })
-    if (!files.length) return
+    if (!files.length) return ""
     const t = await tag(key, dir)
     update((s) => ((s.offers ??= {})[key] = { files: files.map((f) => f.path), at: Date.now() }))
-    await push(key, offerText(t, files, more, numOf(key), dir))
+    return offerText(t, files, more, numOf(key), dir)
   } catch (e) {
     warn("file offer:", e)
+    return ""
   }
+}
+
+// The offer as a message of its own (low priority: dropped when the allowance is nearly used, the offer stays in
+// the state file for 「N 文件」). pushFinal puts it into the final reply instead.
+export async function offerFiles(key, opts) {
+  const o = await planOffer(key, opts)
+  if (o) await push(key, o, LOW)
 }
 
 // 「3 文件」 lists the saved offer of a conversation, 「3 文件 1 3」 / 「3 文件 全部」 sends from it. Without the number
@@ -1523,6 +1741,7 @@ async function fileOffer(cmd) {
   const { idx, bad } = resolveSelection(cmd.sel, offer.files.length)
   if (bad.length) return `${tg} 没有第 ${bad.join("、")} 个文件（共 ${offer.files.length} 个），发「${n} 文件」看列表`
   let sent = 0
+  let queued = 0
   const failed = []
   for (const [i, k] of idx.entries()) {
     const f = offer.files[k]
@@ -1530,13 +1749,14 @@ async function fileOffer(cmd) {
     try {
       const problem = await fileProblem(f)
       if (problem) failed.push(`${path.basename(f)}（${problem}）`)
-      else (await sendFile(f), sent++)
+      else if ((await sendFile(f)) === QUEUED) queued++
+      else sent++
     } catch (e) {
       warn("file:", e)
       failed.push(`${path.basename(f)}（${short(e?.message, 80)}）`)
     }
   }
-  return md(sent && `已发送 ${sent} 个文件`, failed.length && `没发出去：${failed.join("、")}`)
+  return md(sent && `已发送 ${sent} 个文件`, queued && `${queued} 个文件排队了（额度用完），你再发任何一句话就补发`, failed.length && `没发出去：${failed.join("、")}`)
 }
 
 // Images mentioned in a reply that can be sent, plus names of the ones over the size limit.
@@ -1573,8 +1793,8 @@ export async function inbound(msg, floor, out = send) {
   const media = inboundMedia(msg, account?.userId)
   if (text == null && !media.length) return
   // A message from the user brings a fresh context_token, and with it a fresh allowance of bot messages.
-  if (msg.context_token && (msg.context_token !== state().contextToken || state().sent)) {
-    update((s) => ((s.contextToken = msg.context_token), (s.sent = 0)))
+  if (msg.context_token && (msg.context_token !== state().contextToken || state().sent || state().noticed)) {
+    update((s) => ((s.contextToken = msg.context_token), (s.sent = 0), delete s.noticed))
   }
   // Drop backlog: without a saved cursor the first poll can return old messages, and stale commands are risky.
   const created = Number(msg.create_time_ms ?? 0)
@@ -1583,11 +1803,14 @@ export async function inbound(msg, floor, out = send) {
   if (g.handled.has(key)) return
   g.handled.add(key)
   if (g.handled.size > 200) g.handled.delete(g.handled.values().next().value)
+  // What could not be sent while the allowance was out goes first, before this message's own reply.
+  await flushOutbox()
   // A photo and its caption arrive as separate messages: media waits in g.media for the next text.
   const ack = media.length ? await bufferMedia(media) : ""
   const reply = text == null ? ack : await run(parseCommand(text)).catch((e) => `出错了：${short(e?.message, 150)}`)
-  // run() returns a string, or an array sent one message at a time (spaced out so WeChat doesn't throttle).
-  for (const [i, r] of [reply].flat().filter(Boolean).entries()) {
+  // run() returns a string, or an array: replies that fit one message are sent as one (each message costs one of the
+  // ~10 sends), the rest one at a time, spaced out so WeChat doesn't throttle.
+  for (const [i, r] of mergeTexts([reply].flat().filter(Boolean), CHUNK_CHARS).entries()) {
     if (i) await new Promise((resolve) => setTimeout(resolve, 300))
     await out(r)
   }
@@ -1739,14 +1962,11 @@ export default {
       let text = format(event, session, await assign(sessionID), reply, live)
       if (!text) return
       if (event.type !== "session.execution.succeeded") text = withPre(text, live)
-      const { files, big } = await replyImages(reply, session?.location?.directory ?? event.location?.directory)
+      const dir = session?.location?.directory ?? event.location?.directory
+      const { files, big } = await replyImages(reply, dir)
       if (big.length) text = md(text, `（图片太大没发：${big.join("、")}）`)
-      await push(sessionID, text)
-      for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
-      if (event.type === "session.execution.succeeded") {
-        const dir = session?.location?.directory ?? event.location?.directory
-        await offerFiles(sessionID, { reply, dir, edited: () => turnEdited(sessionID, dir) })
-      }
+      if (event.type === "session.execution.succeeded") await pushFinal(sessionID, text, { images: files, reply, dir, edited: () => turnEdited(sessionID, dir) })
+      else await push(sessionID, text)
     }
     void (async () => {
       try {

@@ -5,7 +5,7 @@ import { test } from "node:test"
 import {
   HELP, KEEP_MS, PAIR_MS, addText, addTool, aesKeyOf, chunkLines, clip, slashHelpText, codexPushText, dirLabel, dirsText, doneText, eventKey, extOf, format,
   historyLines, imagePaths, inboundMedia, inboundText, liveBody, liveCmd, liveDelay, liveMedia, listMessages, listText, lowestFree, liveOn, mediaAck, mergeLines,
-  modelLines, parseCommand, pickDir, prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk,
+  modelLines, withSkip, parseCommand, pickDir, prunable, pickModel, codexUnsendPlan, replyText, revertFiles, sessionIDOf, shouldSend, sleep, splitText, takeLive, unsendAsk,
   unsendPlan, withMedia, withPre,
 } from "./index.js"
 import { looseBreaks } from "./md.js"
@@ -68,7 +68,7 @@ test("splitText", () => {
   assert.equal(hard.join(""), "a" + "😀".repeat(20))
   assert.ok(hard.every((p) => !/[\ud800-\udbff]$/.test(p) && !/^[\udc00-\udfff]/.test(p)))
   // The longest push: a capped 8000-character reply is five chunks.
-  assert.equal(splitText(`[3] h\n\n${clip("z".repeat(9000), 3)}`).length, 5)
+  assert.equal(splitText(`[3] h\n\n${clip("z".repeat(9000), 3)}`, 1800).length, 5)
   // A bullet list is cut between two items, and the next chunk opens with the numbering paragraph, then the list.
   const items = Array.from({ length: 40 }, (_, i) => `- 项目 ${i} ${"z".repeat(60)}`).join("\n")
   const listed = splitText(`[3] OpenCode · 22 / 标题\n\n${items}`, 1000)
@@ -161,7 +161,7 @@ test("帮助: titled sections of one-line bullets", () => {
   assert.ok(slashHelpText("[7] OpenCode", [{ name: "init" }]).split("\n").every((l) => !l.startsWith("- ") || em(l.slice(2)) <= 18))
   // Nothing Markdown could pick up: emphasis, headings, quotes, code.
   assert.ok(!/[*_`#>]/.test(HELP) && !/[*_`#>]/.test(slashHelpText("[7] OpenCode · ttool")))
-  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend", "文件 路径", "文件提示"]) assert.ok(HELP.includes(c), c)
+  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend", "文件 路径", "文件提示", "额度"]) assert.ok(HELP.includes(c), c)
 })
 
 test("imagePaths", () => {
@@ -405,7 +405,7 @@ test("pickModel / modelLines / chunkLines", () => {
   ])
   // Too long: the header leads the first message, the footer ends the last, and a split falls between two items.
   const long = Array.from({ length: 60 }, (_, i) => `${i + 1} provider/model-${"x".repeat(60)}-${i}`)
-  const many = listMessages("头", long, "尾")
+  const many = listMessages("头", long, "尾", 1800)
   assert.ok(many.length >= 3 && many.every((m) => m.length <= 1800))
   assert.ok(many[0].startsWith("头\n\n- 1 ") && many.at(-1).endsWith("\n\n尾") && !many.slice(0, -1).some((m) => m.includes("尾")))
   assert.ok(many.slice(1).every((m) => m.startsWith("- ")))
@@ -568,4 +568,61 @@ test("debounce", () => {
   assert.equal(shouldSend("k", 1000), true)
   assert.equal(shouldSend("k", 3000), false)
   assert.equal(shouldSend("k", 7000), true)
+})
+
+test("额度 command and the other quota words", () => {
+  assert.deepEqual(parseCommand("额度"), { type: "quota" })
+  assert.deepEqual(parseCommand("/quota"), { type: "quota" })
+  assert.deepEqual(parseCommand("/QUOTA"), { type: "quota" })
+  assert.deepEqual(parseCommand(" 额度。"), { type: "quota" })
+  assert.deepEqual(parseCommand("10 额度"), { type: "quota" })
+  assert.deepEqual(parseCommand("帮助 额度"), { type: "multi", cmds: [{ type: "help" }, { type: "quota" }] })
+  assert.deepEqual(parseCommand("/quota 5"), { type: "help" }, "a malformed own slash command shows help, never reaches the AI")
+  assert.deepEqual(parseCommand("额度够不够用"), { type: "text", text: "额度够不够用" })
+  assert.deepEqual(parseCommand("3 额度不够了"), { type: "text", n: 3, text: "额度不够了" })
+  assert.ok(HELP.split("\n\n").at(-1).includes("额度 → "), "the 其他 section mentions it in one line")
+})
+
+test("live progress: the interval follows the allowance used", () => {
+  assert.equal(liveDelay(1000, 1000, 0), 15_000)
+  assert.equal(liveDelay(1000, 1000, 4), 15_000)
+  assert.equal(liveDelay(1000, 1000, 5), 60_000)
+  assert.equal(liveDelay(1000, 31_000, 5), 30_000)
+  assert.equal(liveDelay(1000, 70_000, 9), 0)
+})
+
+test("progress left out near the end of the allowance: the final push is the reply plus one note", () => {
+  const H = "[3] OpenCode · 22 / x"
+  const live = { body: "", pushed: true, skipped: 2 }
+  // Progress was pushed before, then two segments were dropped: the last reply comes back, not a bare 「完成」.
+  assert.equal(doneText(H, 3, "改好了", live), `${H}\n\n改好了\n\n（有 2 段进度没推，看桌面端或「3 历史」）`)
+  // Text gathered after the skips (the allowance came back) is what is sent.
+  assert.equal(doneText(H, 3, "改好了", { ...live, body: "后来的" }), `${H}\n\n后来的\n\n（有 2 段进度没推，看桌面端或「3 历史」）`)
+  assert.equal(doneText(H, 3, "", { body: "", pushed: false, skipped: 1 }), `${H}\n\n完成（没有文字回复）\n\n（有 1 段进度没推，看桌面端或「3 历史」）`)
+  // Without skips nothing changes.
+  assert.equal(doneText(H, 3, "改好了", { body: "", pushed: true }), "[3] 完成")
+  // takeLive reports the count only when there is one, and keeps it across a non-final take (an approval).
+  const info = async () => ({ head: H })
+  addText("sSkip", "a", info)
+  assert.deepEqual(takeLive("sSkip"), { body: "a", pushed: false })
+  addText("sSkip", "b", info)
+  const e = [...(globalThis.__wechatBridge.progress.entries())].find(([k]) => k === "sSkip")[1]
+  e.skipped = 3
+  e.texts = []
+  assert.deepEqual(takeLive("sSkip"), { body: "", pushed: true, skipped: 3 })
+  assert.deepEqual(takeLive("sSkip", true), { body: "", pushed: true, skipped: 3 })
+  assert.equal(takeLive("sSkip").skipped, undefined, "the entry is gone after the end")
+  // A failed run says it too; an ordinary message is untouched.
+  assert.equal(withSkip(`${H}\n\n出错：x`, { skipped: 2 }, 3), `${H}\n\n出错：x\n\n（有 2 段进度没推，看桌面端或「3 历史」）`)
+  assert.equal(withSkip("m", { body: "", pushed: true }, 3), "m")
+  assert.match(format({ type: "session.execution.failed", data: { error: { message: "boom" } } }, session, 3, "", { skipped: 1 }), /出错：boom\n\n（有 1 段进度没推/)
+  assert.equal(format({ type: "session.execution.failed", data: { error: { message: "boom" } } }, session, 3), "[3] OpenCode · 22 / 重构登录模块\n\n出错：boom")
+})
+
+test("default chunk size is 3500 and splitText follows it", () => {
+  const one = "字".repeat(3400)
+  assert.deepEqual(splitText(one), [one], "a message under the chunk size is one send")
+  const parts = splitText(`[3] h\n\n${clip("z".repeat(9000), 3)}`)
+  assert.equal(parts.length, 3, "a capped 8000-character reply is three sends, not five")
+  assert.ok(parts.every((p) => p.length <= 3500 + 20))
 })

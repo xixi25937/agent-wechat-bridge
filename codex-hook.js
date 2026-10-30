@@ -93,10 +93,14 @@ export async function onStop(p, m, { db } = {}) {
     big.length && `（图片太大没发：${big.join("、")}）`,
   )
   m.update((s) => remember(s, key, p.cwd, thread))
+  const offer = { reply, dir: cleanDir(p.cwd), edited: () => codexEdited(p.session_id, p.turn_id, db) }
+  // The reply, its images and the offer of the turn's files (folded into the reply when it fits, answered by whichever
+  // process receives WeChat messages). Out of sends, they wait in the shared outbox instead of being dropped.
+  if (m.pushFinal) return void console.error(`${new Date().toISOString()} Stop [${n}] ${await m.pushFinal(key, text, { images: files, ...offer })}`)
+  // An older index.js (a hot reload that kept it) has no pushFinal: the former separate messages.
   console.error(`${new Date().toISOString()} Stop [${n}] ${await m.send(text)}`)
   for (const f of files) await m.sendImage(f).catch((e) => console.error("[codex-hook] image:", m.short(e?.message, 150)))
-  // Files the turn mentioned or changed: one more message, answered by whichever process receives WeChat messages.
-  await m.offerFiles?.(key, { reply, dir: cleanDir(p.cwd), edited: () => codexEdited(p.session_id, p.turn_id, db) })
+  await m.offerFiles?.(key, offer)
 }
 
 // Who answers a WeChat 「N y」: "bridge" (a turn the plugin runs), "desktop" (the window has the thread loaded), or
@@ -122,7 +126,8 @@ export async function onPermission(p, m, { waitS = WAIT_S, mode } = {}) {
   m.update((s) => remember(s, key, p.cwd, thread))
   const summary = permissionSummary(p, m.short)
   const sent = await m.send(md(codexHead(n, p.cwd, thread, m), `等你批准：${summary}`, tail))
-  if (!listening || sent === "error") return ""
+  // Out of sends the request waits in the outbox; nobody can answer a terminal prompt that the phone sees much later.
+  if (!listening || sent === "error" || (sent === "queued" && how === "wait")) return ""
   fs.mkdirSync(m.PENDING_DIR, { recursive: true })
   const id = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`
   const req = path.join(m.PENDING_DIR, `${id}.json`)

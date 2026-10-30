@@ -10,7 +10,7 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 
 ## Features
 
-- **Push**: the final reply of each turn, live progress (merged, at most one message per 15 s), and errors arrive as `[3] OpenCode · project / title` followed by the text. Images mentioned in a reply are sent too.
+- **Push**: the final reply of each turn, live progress (merged, at most one message per 15 s, one per 60 s once half the send quota is used), and errors arrive as `[3] OpenCode · project / title` followed by the text. Images mentioned in a reply are sent too.
 - **Approve**: permission requests arrive with the action to run. Reply `3 y` or `3 n`. For Codex desktop you can answer on the PC or in WeChat, whichever comes first.
 - **Answer questions**: the agent's question tool shows the options in WeChat. Answer with an option number, an option's text or free text, all at once or one by one.
 - **Control**: `3 your message` continues conversation 3 (OpenCode or Codex, shared numbering), `3` shows its last reply, and `3 历史` reads back recent messages. Also `/model`, `/stop`, `/compact`, undo, and starting a new conversation in a folder you pick.
@@ -71,9 +71,9 @@ An offer is kept in the state file for 24 hours or until the next one for that c
 
 - Needs Node.js 20.3 or newer, and OpenCode 2.x (V2 plugin API) if you use OpenCode. Reading Codex session titles needs Node 22.5 or newer.
 - Developed and used on Windows. Other platforms are untested (the macOS and Linux autostart entries are unit-tested only).
-- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `文件`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/file`, `/files`, `/help`), and `/model`, `/stop`, `/compact` work as written.
+- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `文件`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/file`, `/files`, `/help`, `/quota`), and `/model`, `3 /stop`, `/compact` work as written.
 - Only messages from the WeChat account that logged in the bot are handled. Anyone who controls that account, or can read `~/.cli-bridge`, can run commands and approve permissions through your agents. Keep the phone and those files safe.
-- WeChat limits bots (from third-party implementations, not official documentation): about 10 bot messages after each message you send, and a `context_token` that expires after about 24 hours. Sending the bot any message resets both.
+- WeChat limits bots (from third-party implementations, not official documentation): about 10 bot messages after each message you send (`ret=-2 prepare failed` after that), and a `context_token` that expires after about 24 hours. Sending the bot any message resets both. The bridge keeps one shared count of the 10 in the state file (plugin, daemon and Codex hooks all add to it) and reserves the last 3 sends for approvals, questions, errors, final replies and command replies: live progress and file offers are skipped when fewer than 4 remain. The file offer rides in the last chunk of the final reply when it fits, command replies produced together go out as one message, and live progress slows from every 15 s to every 60 s once 5 are used. What cannot be sent once the 10 are gone (text, images, files) waits in an outbox in the state file (20 items, 24 hours), one send is kept for the notice `额度用完了：还有 k 条没发，回任意一句话就补发`, and your next message flushes the outbox in order before it is handled. `额度` (or `/quota`) replies `已用 x/10，队列里 k 条`. One text message is cut into chunks of 3500 characters: a real 4516-character `sendmessage` returned `ret=0` (verified by the API, not on the phone yet); if your phone shows a cut message, set `WECHAT_NOTIFY_CHUNK=1800`. Two text items in one `sendmessage` are rejected (`ret=-2 invalid arguments`), so merging only joins texts into one item.
 - WeChat commands are executed by whichever process holds the poll lock: the OpenCode background service, or the daemon. Without OpenCode running, the daemon still handles Codex; replies about OpenCode conversations say OpenCode isn't running. Do not run cli-chat-bridge's `wechat-opencode` daemon at the same time; both would fight over the same bot's messages.
 - Controlling the Codex desktop window uses its undocumented `codex-ipc` pipe, checked against desktop version 26.1023. A desktop upgrade can break it; terminal and background-run conversations are unaffected.
 - `opencode --standalone`: pushes work, other features are unverified.
@@ -227,11 +227,21 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 
 **编号的分配和回收**：新对话拿最小的空闲编号（OpenCode 和 Codex 共用）。对话被推送、被你按编号操作或出现在「列表」「目录 N」里就算用过一次（时间记在状态文件的 `used`）。24 小时没用，或对话已删除（OpenCode 会话 404）/ 归档（Codex）时，编号回收给别的对话，已有编号不重排。当前对话、最近推送的、有待回答问题或待批准请求的、正在运行的不回收。每 10 分钟最多检查一次，在分配新编号前和发「列表」时；用已回收的编号发指令会回复「没有 [N]（编号会在对话 24 小时没用后回收），发「列表」查看」。
 
-**长文字**：超过 1800 字的推送和回复（包括 `3`、`3 历史`）分成几条，优先在空行处断开，没有就在换行处断开（不会断在缩进的行前面，免得下一条以嵌套列表项或代码块开头），标上「(1/3)」「[3] (2/3)」，一条接一条、间隔 0.4 秒发出。超过 8000 字的部分不发，末尾注明「…（还有 N 字，发「3 历史 1」或看桌面端）」。
+**长文字**：超过 3500 字的推送和回复（包括 `3`、`3 历史`）分成几条，优先在空行处断开，没有就在换行处断开（不会断在缩进的行前面，免得下一条以嵌套列表项或代码块开头），标上「(1/3)」「[3] (2/3)」，一条接一条、间隔 0.4 秒发出。超过 8000 字的部分不发，末尾注明「…（还有 N 字，发「3 历史 1」或看桌面端）」。
 
 **实时推送开关**：`实时 关` / `实时 开`（也认 `/live off` / `/live on`）切换所有对话，`3 实时 关` 只切换 [3]，`实时` / `3 实时` 看状态。存在状态文件的 `live` 里，默认开。关掉后回复完成时照常推最终回复。
 
-**微信的发送限制**（都不是官方文档，来自第三方实现，未证实）：机器人在用户每发一条消息之后大约只能发 10 条，超过后 `sendmessage` 返回 `ret=-2`；单条文字大约 2000 字以上会被截断或拒绝。所以插件：发送遇到 `ret=-2` 隔 2 秒重试一次，还失败就写日志；自上次你发消息以来已经发了 7 条时暂停实时推送（最后一条实时推送会注明），回复完成、出错、权限照常推送；你给机器人发任何一条消息就恢复。
+**微信的发送限制**（不是官方文档，来自第三方实现 [weilink v0.4.0](https://github.com/Oaklight/weilink/releases/tag/v0.4.0) 和我们自己的日志）：机器人在用户每发一条消息（一个 `context_token`）之后大约只能发 10 条，超过后 `sendmessage` 返回 `ret=-2`（`prepare failed`），要等你再发一条消息。
+
+单条文字的长度：第三方说约 2000 字以上会被截断或拒绝；我们真发过一条 4516 字（UTF-8 12.4 KB）的文字（`probe-send-limits.js`，开发用，不随包发布），接口返回 `ret=0`，所以分段长度是 3500 字：**接口验证过，手机上还没看过**。如果手机上看到被截断，设环境变量 `WECHAT_NOTIFY_CHUNK=1800` 改回去。同一次 `sendmessage` 放两个文字项会被拒绝（`ret=-2`，`invalid arguments`），所以合并只会把几段文字合成一个文字项。
+
+插件、后台程序和 Codex hook 共用状态文件里的 `sent`，每次发送前加锁（`state.lock`）登记，你发任何一条消息就清零：
+
+- **留 3 条**：审批、提问、出错、最终回复、命令回复可以用到倒数第 2 条；实时进度和文件清单只在还剩 4 条以上时发，否则跳过。跳过过的话，这一轮最后那条推送末尾会说一次「（有 k 段进度没推，看桌面端或「N 历史」）」。
+- **省条数**：文件清单放得下的话并进最终回复的最后一段，不单独发；一次产生的几条命令回复合成一条；实时推送 15 秒一条，用掉 5 条后改成 60 秒一条。
+- **发件箱**：额度用完后发不出的消息（文字、图片、文件）排进状态文件的 `outbox`，最多 20 条、保留 24 小时，满了丢最旧的。最后一条额度留给提示「额度用完了：还有 k 条没发，回任意一句话就补发」。你下一次发消息时，先按顺序补发（连续的文字合成一条，补发时同样给后面留 3 条），再处理这条消息；丢掉的条数在补发时说一句。Codex hook 进程也是排队，不丢。
+- **`额度`**（也认 `/quota`）：回「已用 x/10，队列里 k 条」。
+- 发送遇到 `ret=-2` 隔 2 秒重试一次，还失败就当作额度用完。
 
 ## 在微信里回复
 
@@ -259,6 +269,7 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 | `/compact` | 压缩对话上下文 |
 | `/review 内容` 等 | OpenCode 自己的命令（`init`、`review`、技能命令等，按对话所在文件夹列出）。不认识的 `/xxx` 回「不认识的命令」，不会当成文字发给 AI |
 | `帮助` | 显示用法（分成「发消息」「看对话」「批准和回答」等几节，一条命令一行） |
+| `额度` / `/quota` | 回「已用 x/10，队列里 k 条」：这条消息之后机器人已经发了几条，发件箱里还有几条没发（见「微信的发送限制」） |
 
 ### 回答问题
 
@@ -378,7 +389,7 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 
 - **安全**：只处理机器人登录账号本人（`account.json` 里的 `userId`）发来的消息，其他人发的一律忽略。但能用这个微信号、或能拿到 `~/.cli-bridge` 里凭据的人，就能让 OpenCode 执行命令、批准权限。保管好手机和这些文件。
 - 不要同时运行 cli-chat-bridge 的 `wechat-opencode` 守护进程。两边会抢同一个机器人的消息。
-- 微信的 context_token 大约 24 小时后过期。很久没给机器人发消息时推送会失败（日志里出现 `ret=-2`）。随便给机器人发一条消息就会刷新。
+- 微信的 context_token 大约 24 小时后过期。很久没给机器人发消息时推送会失败（日志里出现 `ret=-2`），推送会先排进发件箱，你随便给机器人发一条消息就会刷新并补发。
 - 接收微信消息的是拿到 `~/.cli-bridge/poll.lock` 的那个程序：OpenCode 桌面端后台服务，或者后台程序 `daemon.js`。其他 `opencode serve` 进程只推送；设置 `WECHAT_NOTIFY_POLL=1` 后它们也会参与抢锁，`WECHAT_NOTIFY_POLL=0` 则从不接收。不管怎么设，同一时间只有一个程序在收。
 - 插件自己的状态（编号、对话所在目录、收消息游标、最新的 context_token、文件清单 `offers` 和文件提示开关 `filesOff`）存在 `~/.cli-bridge/opencode-wechat-notify.json`，OpenCode 和 Codex 共用（Codex 对话的键是 `codex:<线程 id>`）。可以用环境变量 `WECHAT_NOTIFY_DIR` 换目录。
 - `opencode --standalone` 的对话会推送，但微信里的 `N 内容`、`N y` 等命令由后台服务执行。后台服务能读到这个对话（数据库共用），可私有服务里等待中的批准请求它大概率管不到。要在微信里操作就别加 `--standalone`。
