@@ -7,6 +7,8 @@ import {
   BUSY, bridgeMarker, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
   desktopOwns, desktopSend,
 } from "./codex.js"
+// Namespace import: a hot reload can pair this file with an older codex.js that lacks codexHistory / warm.
+import * as codexMod from "./codex.js"
 import { desktopReply, readQuestion } from "./codex-question.js"
 // Namespace import: a hot reload can pair this file with an older codex-question.js that lacks asyncAnswer.
 import * as asyncQuestion from "./codex-question.js"
@@ -59,7 +61,7 @@ export const HELP = md(
   section("文件", ["每轮结束后列出这轮的文件", "3 文件 1 3 → 发第 1、3 个", "3 文件 全部 → 全部发来", "文件 路径 → 发电脑上的文件", "文件提示 关 / 开 → 关 / 开"]),
   section("撤回", ["3 撤回 → 撤回 [3] 最后一条", "再发「3 撤回 确认」才执行", "不带编号就是当前对话", "也认 /unsend"]),
   section("实时推送", ["实时 关 / 实时 开 → 关 / 开", "回复过程中约 15 秒推一条", "3 实时 关 → 只关 [3]", "实时 → 看状态"]),
-  section("暂停服务", ["/stop → 暂停推送和微信命令", "/start → 恢复", "暂停时只认 /start 帮助 额度", "3 /stop → 只停 [3] 的回复"]),
+  section("暂停服务", ["/stop → 暂停推送和微信命令", "也关掉 Codex 后台程序", "/start → 恢复并重新打开", "暂停时只认 /start 帮助 额度", "3 /stop → 只停 [3] 的回复"]),
   section("其他", ["编号后是 agent 和目录", "例：[3] OpenCode · ttool", "OpenCode 和 Codex 用法一样", "额度 → 看微信发送额度", "/ 命令 → 见下一条"]),
 )
 
@@ -330,6 +332,9 @@ const KEYWORDS = [
   ["quota", /^(额度|\/quota)$/i],
 ]
 export const PAUSED_TEXT = "已暂停：不再推送，也不执行微信命令。发 /start 恢复"
+// The same when the Codex background program was running: "closed" (stopped now) or "later" (a reply of ours is still running).
+export const pausedText = (codex) =>
+  codex ? `已暂停：不再推送，也不执行微信命令，Codex 后台程序${codex === "later" ? "等正在跑的回复结束后关闭" : "也关闭"}。发 /start 恢复` : PAUSED_TEXT
 // What a paused bridge still hears: 「/start」, 「帮助」, 「额度」 (and 「/stop」 again, to confirm).
 const HEARD_PAUSED = new Set(["resume", "pause", "help", "quota"])
 export const heardWhilePaused = (cmd) => !!cmd && (cmd.type === "multi" ? cmd.cmds.every(heardWhilePaused) : HEARD_PAUSED.has(cmd.type))
@@ -1304,10 +1309,11 @@ export async function run(cmd) {
   if (cmd.type === "help") return [HELP, await slashHelp().catch((e) => (warn("help:", e), SLASH_HELP))]
   if (cmd.type === "list") return listSessions()
   if (cmd.type === "quota") return quotaText(state()) + (paused() ? "（已暂停）" : "")
-  if (cmd.type === "pause") return (update((s) => (s.paused = true)), PAUSED_TEXT)
+  if (cmd.type === "pause") return (update((s) => (s.paused = true)), pausedText(coolBridge()))
   if (cmd.type === "resume") {
     const was = paused()
     update((s) => delete s.paused)
+    warmBridge()
     const k = alive(state().outbox).length
     return was ? `已恢复${k ? `，队列里 ${k} 条，接着补发` : ""}` : "没有暂停，一直在运行"
   }
@@ -1636,13 +1642,24 @@ async function approveCodex(threadId, n, tg, allow) {
   return `${tg} 没有待批准的请求`
 }
 
+// The newest turns of a Codex thread, newest first. From the history db the desktop keeps (read-only, no app-server, so
+// no 3 to 9 s start) when it has caught up with the thread's rollout file; from app-server when it hasn't, can't be
+// read, or our own turn is running in the thread (app-server has what the db has not been given yet).
+export async function codexTurns(threadId, limit) {
+  if (!bridge().running(threadId)) {
+    const turns = await codexMod.codexHistory?.(threadId, limit)
+    if (turns) return turns
+  }
+  return bridge().turns(threadId, limit)
+}
+
 async function runCodex(cmd, threadId, n, tg) {
   const head = async () => codexHead(n, "", await codexThread(threadId), { base, short })
   if (cmd.type === "show") {
-    const reply = replyText(codexMsgs(await bridge().turns(threadId, 3)), false)
+    const reply = replyText(codexMsgs(await codexTurns(threadId, 3)), false)
     return md(await head(), clip(reply, n) || "（还没有回复）")
   }
-  if (cmd.type === "history") return historyLines(codexMsgs(await bridge().turns(threadId, cmd.count + 2)), n, cmd.count, tg)
+  if (cmd.type === "history") return historyLines(codexMsgs(await codexTurns(threadId, cmd.count + 2)), n, cmd.count, tg)
   const t = cmd.text
   if (cmd.n != null && (YES.test(t) || NO.test(t))) return approveCodex(threadId, n, tg, YES.test(t))
   // A question: held by our own app-server, or shown in the desktop window (the hook left a record).
@@ -1716,10 +1733,32 @@ function bridge() {
     g.bridge = createBridge({
       markerDir: PENDING_DIR,
       push: codexPush,
+      log: warn,
+      // WECHAT_NOTIFY_CODEX_CMD: a test seam, the app-server command as a JSON array, like ["node", "fake-app-server.js"].
+      ...(process.env.WECHAT_NOTIFY_CODEX_CMD && { bin: () => JSON.parse(process.env.WECHAT_NOTIFY_CODEX_CMD) }),
     })
     g.bridge.gen = GEN
   }
   return g.bridge
+}
+
+// The process that polls WeChat keeps the Codex app-server up while the bridge isn't paused, so the first message to a
+// Codex thread doesn't wait for it to start (3 to 9 s here). Any other process starts it on demand and lets it idle out.
+// `?.` below: a hot reload may keep an older codex.js, which has no warm().
+function warmBridge() {
+  if (!g.poller || paused()) return
+  g.warmed = true
+  bridge().warm?.(true)
+}
+
+// Back to on demand (paused, or the poll lock is lost): "closed" when a running server is stopped, "later" when a reply of
+// ours is still running and the server stops after it, else "".
+function coolBridge() {
+  if (!g.warmed) return ""
+  g.warmed = false
+  const b = g.bridge
+  const up = b?.up?.()
+  return b?.warm?.(false) ? "later" : up ? "closed" : ""
 }
 
 // OpenCode: files the finished turn of `sessionID` wrote or changed, from its tool calls and (where OpenCode keeps
@@ -1815,7 +1854,67 @@ async function bufferMedia(items) {
   return mediaAck(liveMedia(g.media), id && (await tag(id)), failed)
 }
 
-// Handles one polled message. `out` sends each reply (exported with it so a check can run without WeChat).
+// Runs the jobs of WeChat messages side by side, but in order where order matters. `submit(plan)` is called once per
+// message, in arrival order, and `plan()` runs when every global job before it has finished; it returns null (nothing to
+// do) or { lane, run }. Jobs of one lane (a conversation, or "·quick") run one after another, lanes run concurrently.
+// Lane null is a global job: it first waits for every job started so far (at most waitMs, so one stuck job can't make
+// the bridge deaf), runs alone, and the next message is planned only after it. Resolves when the job has run.
+export function scheduler(waitMs = 30_000) {
+  let routing = Promise.resolve()
+  const tails = new Map()
+  const live = new Set()
+  const submit = (plan) =>
+    new Promise((resolve, reject) => {
+      routing = routing.then(async () => {
+        let job
+        try {
+          job = plan()
+        } catch (e) {
+          return reject(e)
+        }
+        if (!job) return resolve()
+        const { lane, run: fn } = job
+        if (lane == null) {
+          await new Promise((go) => {
+            const t = setTimeout(go, waitMs)
+            Promise.all([...live]).then(() => (clearTimeout(t), go()))
+          })
+        }
+        const p = (lane == null ? Promise.resolve() : (tails.get(lane) ?? Promise.resolve())).then(fn)
+        const end = p.then(() => {}, () => {})
+        live.add(end)
+        if (lane != null) tails.set(lane, end)
+        end.then(() => (live.delete(end), tails.get(lane) === end && tails.delete(lane)))
+        p.then(resolve, reject)
+        if (lane == null) await end
+      })
+    })
+  return { submit }
+}
+const sched = (g.sched ??= scheduler())
+
+// 帮助 / 列表 / 额度 have a lane of their own, so they answer at once whatever a conversation is busy with.
+const QUICK = new Set(["help", "list", "quota"])
+const MISC = new Set(["image", "file", "filehint", "live"])
+
+// Lane of a message's command (see scheduler): null for the ones that change what comes after them (pause, resume,
+// 新对话 which becomes the target, anything with media, and text while buffered media waits for it). Picking the lane
+// also makes a numbered message the target, so the unnumbered ones behind it follow it even before it has run.
+export function laneOf(cmd, hasMedia = false) {
+  if (hasMedia || !cmd || ["pause", "resume", "new"].includes(cmd.type)) return null
+  if (cmd.type === "multi") return cmd.cmds.every((c) => QUICK.has(c.type)) ? "·quick" : "·dir"
+  if (QUICK.has(cmd.type) || (cmd.type === "text" && !cmd.text)) return "·quick"
+  if (cmd.type === "dirs" || cmd.type === "cd") return "·dir"
+  if (MISC.has(cmd.type)) return "·misc"
+  if ((cmd.type === "text" || cmd.type === "slash") && liveMedia(g.media).length) return null
+  const key = cmd.n == null ? targetID() : sessionOf(cmd.n)
+  if (!key) return "·misc"
+  if (cmd.n != null && state().target !== key) update((s) => (s.target = key))
+  return key
+}
+
+// Handles one polled message. `out` sends each reply (exported with it so a check can run without WeChat). Returns when
+// the message has been handled; the caller needn't wait for that before it passes the next message.
 export async function inbound(msg, floor, out = (t) => send(t, REPLY)) {
   const account = readJson(path.join(DIR, "account.json"))
   const text = inboundText(msg, account?.userId)
@@ -1832,12 +1931,20 @@ export async function inbound(msg, floor, out = (t) => send(t, REPLY)) {
   if (g.handled.has(key)) return
   g.handled.add(key)
   if (g.handled.size > 200) g.handled.delete(g.handled.values().next().value)
-  let cmd = text == null ? null : parseCommand(text)
-  const wasPaused = paused()
-  // 「开始」 is a command only while paused; otherwise it is a message for the agent like any other.
-  if (cmd?.soft && !wasPaused) cmd = { type: "text", text: text.trim() }
-  // Paused: only /start, 帮助 and 额度 are heard. Nothing else runs, and media is not even saved.
-  if (wasPaused && !heardWhilePaused(cmd)) return
+  const parsed = text == null ? null : parseCommand(text)
+  return sched.submit(() => {
+    // Planned after every earlier global job (a 「/stop」 before this message has taken effect by now).
+    let cmd = parsed
+    const wasPaused = paused()
+    // 「开始」 is a command only while paused; otherwise it is a message for the agent like any other.
+    if (cmd?.soft && !wasPaused) cmd = { type: "text", text: text.trim() }
+    // Paused: only /start, 帮助 and 额度 are heard. Nothing else runs, and media is not even saved.
+    if (wasPaused && !heardWhilePaused(cmd)) return null
+    return { lane: laneOf(cmd, media.length > 0), run: () => handle(cmd, text, media, wasPaused, out) }
+  })
+}
+
+async function handle(cmd, text, media, wasPaused, out) {
   // What could not be sent while the allowance was out goes first, before this message's own reply.
   await flushOutbox()
   // A photo and its caption arrive as separate messages: media waits in g.media for the next text.
@@ -1861,18 +1968,42 @@ export const sleep = (ms, signal) =>
     signal.addEventListener("abort", done, { once: true })
   })
 
-async function poll(signal) {
+// Wait after the `fails`-th failed poll in a row: 2 s, 4 s, ... up to 30 s. The cap is short on purpose: after a sleep or a
+// network change the first polls fail, and a longer wait would leave the phone unanswered for minutes.
+export const pollDelay = (fails) => Math.min(30_000, 2000 * 2 ** fails)
+
+// Calls onWake(ms since the last tick) when a timer of this process fires much later than due, which means the machine
+// slept: a 30 s interval that comes more than 2 minutes after the one before. `now` is injectable.
+export function wakeWatch(onWake, { now = Date.now, every = 30_000, gap = 120_000 } = {}) {
+  let last = now()
+  const tick = () => {
+    const t = now()
+    const slept = t - last
+    last = t
+    if (slept > gap) onWake(slept)
+  }
+  const timer = setInterval(tick, every)
+  timer.unref?.()
+  return Object.assign(() => clearInterval(timer), { tick })
+}
+
+// `ctl.kick()`: abort the poll in flight (or the wait after a failed one) and poll again at once, with the failures forgotten.
+// `delay`: the wait after a failure, pollDelay unless a test says otherwise.
+export async function poll(signal, ctl = {}, delay = pollDelay) {
   const startedAt = Date.now()
   const floor = state().buf ? () => Date.now() - 10 * 60_000 : () => startedAt
   let fails = 0
+  let kicked = new AbortController()
+  ctl.kick = () => {
+    fails = 0
+    kicked.abort()
+  }
   while (!signal.aborted) {
+    kicked = new AbortController()
+    const here = AbortSignal.any([signal, kicked.signal])
     const t0 = Date.now()
     try {
-      const r = await ilink(
-        "ilink/bot/getupdates",
-        { get_updates_buf: state().buf ?? "" },
-        AbortSignal.any([signal, AbortSignal.timeout(45_000)]),
-      )
+      const r = await ilink("ilink/bot/getupdates", { get_updates_buf: state().buf ?? "" }, AbortSignal.any([here, AbortSignal.timeout(45_000)]))
       if (Number(r.errcode) === -14) {
         update((s) => (s.buf = ""))
       }
@@ -1881,15 +2012,16 @@ async function poll(signal) {
       if (r.get_updates_buf && r.get_updates_buf !== state().buf) {
         update((s) => (s.buf = r.get_updates_buf))
       }
-      for (const m of r.msgs ?? []) await inbound(m, floor).catch((e) => warn("inbound:", e))
+      // Not awaited: a slow message must not hold up the ones behind it (inbound keeps each conversation in order).
+      for (const m of r.msgs ?? []) inbound(m, floor).catch((e) => warn("inbound:", e))
       fails = 0
       // A long poll that returns at once (proxy, outage, a cursor that never advances) would otherwise spin.
-      if (Date.now() - t0 < 1000) await sleep(1000, signal)
+      if (Date.now() - t0 < 1000) await sleep(1000, here)
     } catch (e) {
       if (signal.aborted) break
-      if (e?.name === "TimeoutError" || e?.name === "AbortError") continue
+      if (kicked.signal.aborted || e?.name === "TimeoutError" || e?.name === "AbortError") continue
       warn("poll:", e)
-      await sleep(Math.min(300_000, 2000 * 2 ** fails++), signal)
+      await sleep(delay(fails++), here)
     }
   }
 }
@@ -1899,18 +2031,40 @@ async function poll(signal) {
 const POLL_ENV = process.env.WECHAT_NOTIFY_POLL
 const POLLS = POLL_ENV === "1" || (POLL_ENV !== "0" && process.argv.includes("--service"))
 
-function stopPoller() {
+function abortPoller() {
   g.poller?.abort()
   g.poller = null
+  g.wake?.()
+  g.wake = null
+}
+
+// Not polling any more (the lock is lost, or we quit): the Codex app-server goes back to on demand.
+function stopPoller() {
+  abortPoller()
+  coolBridge()
+}
+
+// wakeWatch options, for a test to inject a clock (see runDaemon).
+let wakeOpts = {}
+
+// The machine woke from sleep: renew the lock beat at once (so nobody takes the lock for its old beat), poll again at
+// once instead of waiting for the dead connection, and bring the Codex app-server back if it is gone.
+function onWake(slept) {
+  warn(`wake: the computer was asleep for about ${Math.round(slept / 1000)} s; renewing the lock, polling again`)
+  g.lock?.wake?.()
+  g.poller?.kick?.()
+  g.bridge?.revive?.()
 }
 
 function startPoller() {
   update((s) => (s.pollerPid = process.pid))
-  stopPoller()
+  abortPoller()
   const c = new AbortController()
   c.gen = GEN
   g.poller = c
-  poll(c.signal).catch((e) => warn("poller stopped:", e))
+  g.wake = wakeWatch(onWake, wakeOpts)
+  poll(c.signal, c).catch((e) => warn("poller stopped:", e))
+  warmBridge()
 }
 
 function stopLock(keep) {
@@ -1921,7 +2075,9 @@ function stopLock(keep) {
 // Standalone mode (daemon.js): the same WeChat poller and commands without OpenCode, so Codex-only users can reply too.
 // OpenCode conversations still work through its HTTP API whenever an OpenCode service runs; Codex pushes come from
 // codex-hook.js. The poll lock decides between this and an OpenCode plugin that may run at the same time.
-export function runDaemon({ log = (m) => console.log(`${new Date().toLocaleString()} ${m}`) } = {}) {
+// `lock` and `wake`: options of pollLock and wakeWatch, for a test to speed up the timers or inject a clock.
+export function runDaemon({ log = (m) => console.log(`${new Date().toLocaleString()} ${m}`), lock = {}, wake = {} } = {}) {
+  wakeOpts = wake
   const keepAlive = setInterval(() => {}, 60_000) // the lock's timers are unref'd
   // For `setup --uninstall-daemon` to find and stop us.
   const pidFile = path.join(DIR, "daemon.pid")
@@ -1932,13 +2088,16 @@ export function runDaemon({ log = (m) => console.log(`${new Date().toLocaleStrin
       if (fs.readFileSync(pidFile, "utf8") === String(process.pid)) fs.rmSync(pidFile)
     } catch {}
   })
-  const quit = () => {
+  // quit(false) stops everything without ending the process (a test); a signal ends it.
+  const quit = (exit) => {
     clearInterval(keepAlive)
+    process.removeListener("SIGINT", quit)
+    process.removeListener("SIGTERM", quit)
     stopLock()
     stopPoller()
     g.bridge?.stop()
     g.bridge = null
-    process.exit(0)
+    if (exit !== false) process.exit(0)
   }
   // Ours before the lock starts, so it doesn't install its own signal handlers.
   process.once("SIGINT", quit)
@@ -1946,6 +2105,7 @@ export function runDaemon({ log = (m) => console.log(`${new Date().toLocaleStrin
   stopLock(true)
   stopPoller()
   g.lock = pollLock(DIR, {
+    ...lock,
     onHeld: () => (log("polling WeChat"), startPoller()),
     onLost: () => (log("another process took over WeChat polling; standing by"), stopPoller()),
   })

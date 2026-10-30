@@ -28,6 +28,12 @@ test("canTake decides on pid, host and heartbeat", () => {
 })
 
 const nap = (ms) => new Promise((r) => setTimeout(r, ms))
+// A read can land between a heartbeat's truncate and its write (an empty file reads as pid 0): read again.
+const holder = async (dir) => {
+  let l
+  for (let i = 0; i < 20 && !l?.pid; i++) (i && (await nap(25)), (l = readLock(dir)))
+  return l
+}
 
 test("a retry that fires late (the machine slept) does not take a live holder's lock for its old beat", async () => {
   const dir = tmp()
@@ -164,14 +170,14 @@ for (const ignorePid of [false, true]) {
       await new Promise((r) => setTimeout(r, 1500))
       assert.equal(kids.filter((k) => k.held).length, 1, "exactly one holder")
       const first = kids.find((k) => k.held)
-      assert.equal(readLock(dir).pid, first.pid)
+      assert.equal((await holder(dir)).pid, first.pid)
       first.kill("SIGKILL")
       first.held = false
       assert.ok(await until(() => kids.some((k) => k.held), 10_000), "another process takes over")
       await new Promise((r) => setTimeout(r, 500))
       const second = kids.filter((k) => k.held)
       assert.equal(second.length, 1)
-      assert.equal(readLock(dir).pid, second[0].pid)
+      assert.equal((await holder(dir)).pid, second[0].pid)
     } finally {
       kids.forEach((k) => k.kill("SIGKILL"))
       await new Promise((r) => setTimeout(r, 200))

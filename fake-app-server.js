@@ -42,6 +42,13 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       const threadId = p.threadId
       // "echo" replies with the input and model it got; "slow" runs until interrupted.
       if (threadId === "slow") return
+      // "later" finishes by itself after FAKE_TURN_MS (400 by default).
+      if (threadId === "later") {
+        return setTimeout(() => {
+          out({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: "好了" } } })
+          out({ method: "turn/completed", params: { threadId, turn: { id: "turn1", status: "completed", items: [] } } })
+        }, Number(process.env.FAKE_TURN_MS ?? 400))
+      }
       if (threadId === "echo") {
         out({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: JSON.stringify({ input: p.input, model: p.model }) } } })
         return out({ method: "turn/completed", params: { threadId, turn: { id: "turn1", status: "completed", items: [] } } })

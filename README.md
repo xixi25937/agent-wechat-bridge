@@ -14,7 +14,8 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 - **Approve**: permission requests arrive with the action to run. Reply `3 y` or `3 n`. For Codex desktop you can answer on the PC or in WeChat, whichever comes first.
 - **Answer questions**: the agent's question tool shows the options in WeChat. Answer with an option number, an option's text or free text, all at once or one by one.
 - **Control**: `3 your message` continues conversation 3 (OpenCode or Codex, shared numbering), `3` shows its last reply, and `3 历史` reads back recent messages. Also `/model`, `3 /stop` (stop conversation 3's running reply), `/compact`, undo, and starting a new conversation in a folder you pick.
-- **Pause**: `/stop` (no number) pauses the whole bridge: no pushes from the plugin, the daemon or the Codex hooks, no WeChat commands, and Codex permission requests are left to the PC. `/start` resumes. See [Pause and resume](#pause-and-resume).
+- **Pause**: `/stop` (no number) pauses the whole bridge: no pushes from the plugin, the daemon or the Codex hooks, no WeChat commands, Codex permission requests are left to the PC, and the Codex background program (the bridge's own `codex app-server`) is closed. `/start` resumes and opens it again. See [Pause and resume](#pause-and-resume).
+- **Fast after sleep**: while the bridge runs, the process that receives your messages keeps the Codex background program up, so the first message to a Codex conversation no longer waits for it to start (3 to 9 s here). `帮助`, `列表` and `额度` answer at once even while a Codex message is still starting, and after the PC wakes from sleep the bridge reconnects immediately. See [Codex background program](#codex-background-program).
 - **Send images and files** from WeChat into a conversation.
 - **Files on request**: after each turn the bot lists the files the agent mentioned or changed (images still send themselves; likely secrets such as `.env` or `*.pem` are never listed). Nothing is sent until you pick: `3 文件 1 3` sends the 1st and 3rd of conversation 3, `3 文件 全部` sends all, `文件 path` sends any file on the PC. `文件提示 关` turns the lists off. Details in [文件](#文件).
 
@@ -42,13 +43,24 @@ Send `/stop` (also `停止服务`) without a number to pause the bridge; it answ
 - Nothing is pushed by any process (plugin, daemon, Codex hooks), and nothing is queued: pushes are dropped. Live progress stops too.
 - WeChat commands are ignored. Only `/start` (also `开始`, `启动服务`), `帮助`, `额度` and another `/stop` are answered. Images and files you send are not saved.
 - The Codex `PermissionRequest` hook returns no decision at once instead of waiting for WeChat, so approvals stay on the computer.
+- The Codex background program is closed (see below). The reply says so: `已暂停：不再推送，也不执行微信命令，Codex 后台程序也关闭。发 /start 恢复`. If a Codex reply that WeChat started is still running, it finishes first and the program closes after it (`…Codex 后台程序等正在跑的回复结束后关闭…`); it is not killed mid-reply. Nothing is pushed for that reply.
 - The poller keeps running, so `/start` arrives.
 
-`/start` answers `已恢复` (plus `队列里 k 条，接着补发` if the outbox holds anything from before the pause, which is then sent). It answers `没有暂停，一直在运行` when nothing was paused. `开始` is a command only while paused; otherwise it goes to the agent like any other text. The flag is the `paused` key in the state file, so it survives restarts.
+`/start` opens the Codex background program again and answers `已恢复` (plus `队列里 k 条，接着补发` if the outbox holds anything from before the pause, which is then sent). It answers `没有暂停，一直在运行` when nothing was paused. `开始` is a command only while paused; otherwise it goes to the agent like any other text. The flag is the `paused` key in the state file, so it survives restarts.
 
 The bridge runs by default. To start quiet, send `/stop` once after connecting the bot, and `/start` when you want it.
 
 Changed in 0.4.0: `/stop` without a number used to stop the target conversation's running reply. That is now `3 /stop` (with the number); without it `/stop` pauses the bridge.
+
+### Codex background program
+
+Messages to a Codex conversation that is not open in the desktop window run in a `codex app-server` the bridge starts itself. Starting it took 3 to 9 s on the machine this was measured on (spawn plus `initialize`; resuming a thread was 0.2 s typically and 1 s at most on top of that, and a first message after a sleep took up to 22 s end to end), so it used to be started by the first message and stopped after 10 idle minutes. Now:
+
+- The process that holds the poll lock (the OpenCode desktop service or the daemon) starts it when it gets the lock, on `/start` and after the PC wakes from sleep, and keeps it running: no idle stop. If it exits or crashes it is started again after 5 s, then 30 s, then every 5 min (the waits start over once it has stayed up for a minute). A machine without `codex` is not retried.
+- `/stop` closes it (after a running reply of the bridge's own, see above); losing the lock to another process closes it too. Any other process still starts one on demand and stops it after 10 idle minutes, as before.
+- After the PC wakes (a 30 s timer that fires more than 2 minutes late), the bridge gives up the long poll that died with the sleep and polls again at once, renews the lock heartbeat, and starts the Codex program if it is gone. Poll failures are retried after 2 s, 4 s, … at most 30 s. A second process does not take the lock just because the holder's heartbeat is old right after a sleep.
+- Messages are handled side by side: one conversation keeps its order, different conversations do not wait for each other, and `帮助`, `列表`, `额度` answer at once. `/stop`, `/start`, `新对话` and messages with images or files wait for everything before them and hold back the ones after them.
+- `3` and `3 历史 k` for a Codex conversation read `~/.codex/thread_history_1.sqlite` (read-only) when it has caught up with the conversation's rollout file, so they need no app-server. Otherwise (older conversations whose rollout is compressed or was rewritten, a turn being written, or a reply of the bridge running in that conversation) they ask app-server, as before.
 
 ## Quick start
 
@@ -205,13 +217,15 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 和 OpenCode 一样的命令，对标着 `Codex ·` 的编号都能用：
 
 - `N 内容`：继续这个 Codex 对话。对话在桌面窗口里打开着时，消息发到桌面窗口（窗口里能看到，回复照常由 Stop hook 推送）。没打开时，插件在后台用桌面端自带的 `codex.exe app-server` 运行这一轮，回复、批准请求、提问和出错都由插件推送；桌面端之后重新打开这个对话能看到这一轮。对话正在终端里运行时回「该对话正在电脑上打开，请稍后或在电脑上操作」。
-- `N`、`N 历史 k`：最后一条回复、最近 k 条消息（通过 app-server 读，不会改动对话）。
+- `N`、`N 历史 k`：最后一条回复、最近 k 条消息（只读，不会改动对话）。优先读 `~/.codex/thread_history_1.sqlite`（桌面端维护的记录，只读打开）：它的进度和这个对话的 rollout 文件末尾对得上时才用，不需要 app-server。对不上（较老的对话 rollout 被压缩或重写过、这一轮还在写、插件正在后台跑这个对话）或读不了时，回到 app-server 读，和以前一样。
 - `列表`：OpenCode 和 Codex 对话按最近更新混排，Codex 的标 `Codex ·`。
 - `目录`：先列 OpenCode 的文件夹，再列 Codex 用过的文件夹（标 `Codex ·`）。`目录 Codex · 名字` 或 `目录 codex 名字` 只在 Codex 文件夹里找。选中 Codex 文件夹后 `新对话 内容` 开 Codex 新对话（必须带内容），模型等设置用 `~/.codex/config.toml` 的默认值。
 - 后台运行的对话也有实时推送（app-server 的 `item/completed` 里的 `agentMessage`，工具来自 `item/started`），规则和 OpenCode 一样。桌面窗口和终端里的对话只有 Stop hook，所以只推最终回复。
 - `N 撤回`：见「在微信里回复」下的「撤回」。
 - 后台运行的对话提问时（`request_user_input`），推送问题；回答方式同「回答问题」（一次回完或一条一个）。桌面窗口里的提问由 `PreToolUse` hook 推送（见上面「提问」），也能在微信里回答；终端里的提问只能在终端回答。
-- 插件的 app-server 按需启动（第一次大约 5 到 10 秒），空闲 10 分钟、插件热重载或 OpenCode 退出时关掉，不留进程。它和桌面端用同一个 `~/.codex`（同样的登录、配置、对话记录）。
+- 插件的 app-server（下面叫「Codex 后台程序」）启动一次要 3 到 9 秒（实测，在这台电脑上是启动进程加 `initialize` 这一步；恢复一个对话另外通常 0.2 秒、最多 1 秒；睡眠醒来后的第一条消息从收到到开始跑最多到过 22 秒）。所以接收微信消息的那个进程（拿到轮询锁的 OpenCode 桌面服务或 daemon）在拿到锁、发 `/start`、电脑睡眠醒来之后马上把它启动，并一直开着，不会空闲退出；它退出或崩溃时 5 秒后重启，再失败 30 秒，之后每 5 分钟一次（连续开了 1 分钟以上就重新从 5 秒算）。找不到 `codex` 程序时不重试。发 `/stop` 关掉它（插件自己正在跑的一轮会先跑完再关，不会中途杀掉），发 `/start` 重新打开；轮询锁被别的进程拿走时也会关。没拿到锁的进程仍是按需启动，空闲 10 分钟关掉；插件热重载或进程退出时也关，不留进程。它和桌面端用同一个 `~/.codex`（同样的登录、配置、对话记录）。
+- 睡眠醒来：每 30 秒的定时器晚了 2 分钟以上就当作电脑睡过。醒来后立刻放弃睡眠时断掉的长轮询重新轮询、马上刷新锁的心跳、检查 Codex 后台程序还在不在（不在就立刻启动）。轮询失败后等 2 秒、4 秒……最多 30 秒再试（以前最多 5 分钟）。刚醒来时锁里的心跳是旧的，另一个进程也不会因此抢走锁（它自己的定时器也晚了，要再等一轮才信这个旧心跳）。
+- 消息并发处理：同一个对话里的消息按顺序处理，不同对话互不等待，`帮助`、`列表`、`额度` 马上回答，不会等在一条正在启动的 Codex 消息后面。`/stop`、`/start`、`新对话` 和带图片/文件的消息要等前面的都处理完，后面的也等它处理完。
 
 ## 推送
 
@@ -282,8 +296,8 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 | 发图片 / 文件 | 先存起来（见下面「从微信发图片和文件」），下一条文字带上它们一起发 |
 | `/model` | 列出可用模型并编号（`- 1 服务商/模型`），标出当前对话在用的那个。`/model 3`、`/model 名字片段` 切换（匹配到多个会让你选） |
 | `3 /stop` | 停止 [3] 正在运行的回复。必须带编号：不带编号的 `/stop` 是下面的暂停服务（0.4.0 起，以前不带编号是停当前对话） |
-| `/stop` / `停止服务` | 暂停整个服务：不再推送，也不执行微信命令，只认 `/start`、`帮助`、`额度`（见「暂停和恢复」） |
-| `/start` / `开始` / `启动服务` | 恢复服务。`开始` 只在暂停时算命令，运行中和别的文字一样发给对话 |
+| `/stop` / `停止服务` | 暂停整个服务：不再推送，也不执行微信命令，只认 `/start`、`帮助`、`额度`，Codex 后台程序也关闭（见「暂停和恢复」） |
+| `/start` / `开始` / `启动服务` | 恢复服务，Codex 后台程序重新打开。`开始` 只在暂停时算命令，运行中和别的文字一样发给对话 |
 | `/compact` | 压缩对话上下文 |
 | `/review 内容` 等 | OpenCode 自己的命令（`init`、`review`、技能命令等，按对话所在文件夹列出）。不认识的 `/xxx` 回「不认识的命令」，不会当成文字发给 AI |
 | `帮助` | 显示用法（分成「发消息」「看对话」「批准和回答」等几节，一条命令一行） |
@@ -358,14 +372,14 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 
 ### 暂停和恢复
 
-不带编号的 `/stop`（也认 `停止服务`）暂停整个服务，回「已暂停：不再推送，也不执行微信命令。发 /start 恢复」。暂停期间：
+不带编号的 `/stop`（也认 `停止服务`）暂停整个服务，回「已暂停：不再推送，也不执行微信命令。发 /start 恢复」；Codex 后台程序正开着时，回「已暂停：不再推送，也不执行微信命令，Codex 后台程序也关闭。发 /start 恢复」，同时关掉它。如果插件从微信发起的一轮 Codex 回复还在跑，回「……Codex 后台程序等正在跑的回复结束后关闭……」：这一轮跑完再关，不会中途杀掉，跑完的回复也不推送。暂停期间：
 
 - 插件、后台程序和 Codex hook 都不推送，推送直接丢掉，不进发件箱；实时进度也停。
 - 微信命令一律不执行，只回应 `/start`（也认 `开始`、`启动服务`）、`帮助`、`额度` 和再发一次的 `/stop`；发来的图片和文件也不保存。
 - Codex 的 `PermissionRequest` hook 立刻返回「没有决定」，不等微信，权限在电脑上批。
 - 接收微信消息的进程照常运行，所以 `/start` 收得到。
 
-`/start` 回「已恢复」；发件箱里有暂停之前就排着的消息时再加「，队列里 k 条，接着补发」，随后补发。没暂停时发 `/start` 回「没有暂停，一直在运行」。`开始` 只在暂停时算恢复命令，运行中它和别的文字一样发给对话。状态存在状态文件的 `paused` 里，重启后还在。
+`/start` 重新打开 Codex 后台程序（启动要几秒，不影响回复），回「已恢复」；发件箱里有暂停之前就排着的消息时再加「，队列里 k 条，接着补发」，随后补发。没暂停时发 `/start` 回「没有暂停，一直在运行」。`开始` 只在暂停时算恢复命令，运行中它和别的文字一样发给对话。状态存在状态文件的 `paused` 里，重启后还在。
 
 默认是运行的（和以前一样）。想「连上微信后先不推送，要用再开」：连上机器人之后发一次 `/stop`，需要时发 `/start`。
 
@@ -432,7 +446,7 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 ## 测试
 
 ```sh
-npm test            # 消息排版（每条拼出来的消息没有单个换行，只有空行和 `- ` 列表）、命令解析（含斜杠命令、实时、撤回）、实时进度合并与去重、长文字分段、撤回目标、回答问题（一次回完、一条一个、跳过、忽略、选项匹配）、图片配对、文件头识别、密钥格式、文件清单（候选文件的收集和过滤、疑似密钥、清单文字、`文件` 命令解析、选择、过期、`file_item` 消息，以及对着本机假 iLink 的上传和发送端到端）、格式化、去重、Codex 批准握手、桌面管道（假管道）、桌面提问（等待、回答、提交后回读）、app-server 桥（假 app-server）、`setup` 的 JSONC 和 hooks 合并（含假 HOME 端到端）等自检，不联网
+npm test            # 消息排版（每条拼出来的消息没有单个换行，只有空行和 `- ` 列表）、命令解析（含斜杠命令、实时、撤回）、实时进度合并与去重、长文字分段、撤回目标、回答问题（一次回完、一条一个、跳过、忽略、选项匹配）、图片配对、文件头识别、密钥格式、文件清单（候选文件的收集和过滤、疑似密钥、清单文字、`文件` 命令解析、选择、过期、`file_item` 消息，以及对着本机假 iLink 的上传和发送端到端）、格式化、去重、Codex 批准握手、桌面管道（假管道）、桌面提问（等待、回答、提交后回读）、app-server 桥（假 app-server）、app-server 常开（启动、不空闲退出、`/stop` 等当前轮、崩溃后退避重启、丢锁后关闭）、消息并发和顺序、对话记录库读取（和 app-server 的 `turns` 对比）、睡眠醒来（假时钟）、轮询退避上限、`setup` 的 JSONC 和 hooks 合并（含假 HOME 端到端）等自检，不联网
 npm run send-test   # 真实发送一条测试消息到微信
 ```
 

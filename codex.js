@@ -9,7 +9,8 @@ import readline from "node:readline"
 import { formAction, questionForm } from "./form.js"
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
-export const PIPE = "\\\\.\\pipe\\codex-ipc"
+// WECHAT_NOTIFY_PIPE: a test seam, so a test never talks to the real desktop.
+export const PIPE = process.env.WECHAT_NOTIFY_PIPE || "\\\\.\\pipe\\codex-ipc"
 const IDLE_MS = 10 * 60_000
 // A kept-up app-server that dies is started again after these waits (the last one repeats), and it has to stay up STABLE_MS
 // for the waits to begin again at the first. One that doesn't answer `initialize` within INIT_MS is killed.
@@ -569,6 +570,7 @@ export function createBridge({
       fails = 0
       keepUp()
     },
+    up: () => !!server && !server.dead && !server.closing,
     stop() {
       keep = release = false
       clearTimeout(retry)
