@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { bridgeMarker, cleanDir, codexHead, desktopOwns } from "./codex.js"
 import { asyncText, dropQuestion, noteQuestion, openAsks, readQuestion, waitQuestion } from "./codex-question.js"
+import { codexEdited } from "./files.js"
 import { formText, questionForm } from "./form.js"
 import { md } from "./md.js"
 
@@ -94,6 +95,8 @@ export async function onStop(p, m, { db } = {}) {
   m.update((s) => remember(s, key, p.cwd, thread))
   console.error(`${new Date().toISOString()} Stop [${n}] ${await m.send(text)}`)
   for (const f of files) await m.sendImage(f).catch((e) => console.error("[codex-hook] image:", m.short(e?.message, 150)))
+  // Files the turn mentioned or changed: one more message, answered by whichever process receives WeChat messages.
+  await m.offerFiles?.(key, { reply, dir: cleanDir(p.cwd), edited: () => codexEdited(p.session_id, p.turn_id, db) })
 }
 
 // Who answers a WeChat 「N y」: "bridge" (a turn the plugin runs), "desktop" (the window has the thread loaded), or
