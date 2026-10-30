@@ -21,6 +21,67 @@ test("canTake decides on pid, host and heartbeat", () => {
   assert.equal(canTake({ pid: 11, host: "h", beat: 40_000 }, { ...me, alive: live }), false, "exactly 60 s is still fresh")
   assert.equal(canTake({ pid: 11, host: "other", beat: 99_000 }, { ...me, alive: dead }), false, "other host: pid means nothing")
   assert.equal(canTake({ pid: 11, host: "other", beat: 1 }, { ...me, alive: dead }), true, "other host, stale")
+  const woke = { ...me, trustStale: false }
+  assert.equal(canTake({ pid: 11, host: "h", beat: 1 }, { ...woke, alive: live }), false, "just woke: an old beat of a live pid is not enough")
+  assert.equal(canTake({ pid: 11, host: "h", beat: 1 }, { ...woke, alive: dead }), true, "just woke, holder pid gone")
+  assert.equal(canTake({ pid: 11, host: "other", beat: 1 }, { ...woke, alive: dead }), false, "just woke, other host")
+})
+
+const nap = (ms) => new Promise((r) => setTimeout(r, ms))
+
+test("a retry that fires late (the machine slept) does not take a live holder's lock for its old beat", async () => {
+  const dir = tmp()
+  const holder = { pid: 4242, host: os.hostname() }
+  const put = (age) => fs.writeFileSync(lockFile(dir), JSON.stringify({ ...holder, beat: Date.now() - age }))
+  const contender = (ev) => pollLock(dir, { standbyMs: 40, staleMs: 1000, lateMs: 60, alive: () => true, onHeld: () => ev.push("held") })
+  const sleep = () => {
+    put(5000) // the holder's beat went old while everything slept
+    for (const end = Date.now() + 250; Date.now() < end; ); // our retry was due in 40 ms and fires 250 ms late
+  }
+  try {
+    // The holder renews as soon as it wakes: never taken.
+    const a = []
+    const l = contender(a)
+    put(0)
+    l.start()
+    sleep()
+    await nap(10)
+    put(0)
+    await nap(200)
+    assert.deepEqual(a, [], "alive and beating")
+    l.stop()
+    // Nobody renews (a hung holder): taken, one round later.
+    const b = []
+    const l2 = contender(b)
+    put(0)
+    l2.start()
+    sleep()
+    await nap(10)
+    assert.deepEqual(b, [], "the late retry doesn't judge the old beat")
+    for (let i = 0; i < 100 && !b.length; i++) await nap(10)
+    assert.deepEqual(b, ["held"], "the next retry does")
+    l2.stop()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("wake() renews the beat at once, and reports a lock that is gone", () => {
+  const dir = tmp()
+  try {
+    const ev = []
+    const l = pollLock(dir, { beatMs: 60_000, onLost: () => ev.push("lost") })
+    l.start()
+    fs.writeFileSync(lockFile(dir), JSON.stringify({ pid: process.pid, host: os.hostname(), beat: Date.now() - 600_000 }))
+    l.wake()
+    assert.ok(Date.now() - readLock(dir).beat < 5000, "renewed")
+    fs.writeFileSync(lockFile(dir), JSON.stringify({ pid: process.pid + 1, host: "elsewhere", beat: Date.now() }))
+    l.wake()
+    assert.deepEqual(ev, ["lost"])
+    l.stop()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("acquire, beat, release", () => {

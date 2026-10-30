@@ -6,6 +6,8 @@ import path from "node:path"
 export const BEAT_MS = 15_000
 export const STALE_MS = 60_000
 export const STANDBY_MS = 30_000
+// A timer that fires this much later than it was due means the process was suspended (the machine slept).
+export const LATE_MS = 10_000
 // An empty or half-written lock (creator between open and write) counts as held until its mtime is this old.
 const GUARD_STALE_MS = 10_000
 
@@ -19,10 +21,12 @@ export const pidAlive = (pid) => {
 }
 
 // Pure decision. lock = parsed poll.lock, null when missing. The pid check only means something on the same host.
-export function canTake(lock, { pid = process.pid, host = os.hostname(), now = Date.now(), staleMs = STALE_MS, alive = pidAlive } = {}) {
+// trustStale false: an old beat doesn't count (the caller was suspended itself, so the holder was too and has not had
+// its turn to renew); a holder whose pid is gone on this host can still be taken over.
+export function canTake(lock, { pid = process.pid, host = os.hostname(), now = Date.now(), staleMs = STALE_MS, alive = pidAlive, trustStale = true } = {}) {
   if (!lock) return true
   if (lock.pid === pid && lock.host === host) return true
-  if (!(now - lock.beat <= staleMs)) return true
+  if (trustStale && !(now - lock.beat <= staleMs)) return true
   return lock.host === host && !alive(lock.pid)
 }
 
@@ -111,30 +115,42 @@ export function release(dir, o = {}) {
 
 // Tries to hold the lock; while someone else does it retries every standbyMs, and while it holds it beats every beatMs.
 // onHeld / onLost run on each change. stop() releases. Timers are unref'd, so this never keeps a process alive.
-export function pollLock(dir, { onHeld, onLost, beatMs = BEAT_MS, staleMs = STALE_MS, standbyMs = STANDBY_MS, alive } = {}) {
+// A retry that comes more than lateMs after it was due doesn't take a lock for its old beat alone (see canTake).
+// wake() renews the beat now: call it when the machine woke up.
+export function pollLock(dir, { onHeld, onLost, beatMs = BEAT_MS, staleMs = STALE_MS, standbyMs = STANDBY_MS, alive, lateMs = LATE_MS } = {}) {
   const o = { staleMs, alive }
   let held = false
   let timer
   let stopped = false
+  let lastTick = 0
+  let period = 0
   const bye = () => release(dir, o)
   const sigs = ["SIGINT", "SIGTERM"].map((sig) => {
     // Re-raise only when nobody else handles the signal; otherwise their exit fires "exit" below.
     const fn = () => (bye(), process.removeListener(sig, fn), process.kill(process.pid, sig))
     return [sig, fn]
   })
-  const tick = () => {
+  const check = () => {
     if (held && !beat(dir, o)) {
       held = false
       onLost?.()
     }
-    if (!held && acquire(dir, o)) {
+  }
+  const tick = () => {
+    const t = Date.now()
+    const trustStale = !lastTick || t - lastTick <= period + lateMs
+    lastTick = t
+    check()
+    if (!held && acquire(dir, { ...o, trustStale })) {
       held = true
       onHeld?.()
     }
-    if (!stopped) (timer = setTimeout(tick, held ? beatMs : standbyMs)).unref()
+    period = held ? beatMs : standbyMs
+    if (!stopped) (timer = setTimeout(tick, period)).unref()
   }
   return {
     held: () => held,
+    wake: check,
     start() {
       process.on("exit", bye)
       for (const [sig, fn] of sigs) if (!process.listenerCount(sig)) process.on(sig, fn)

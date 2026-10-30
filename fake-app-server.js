@@ -1,5 +1,14 @@
 // Stand-in for `codex app-server` in codex.test.js: one turn asks a question, then an approval, then completes.
+import fs from "node:fs"
 import readline from "node:readline"
+
+// Lifecycle tests: FAKE_PID_FILE gets one line per start, FAKE_FAIL_STARTS makes the first n starts exit at once,
+// FAKE_INIT_MS delays the answer to `initialize`.
+if (process.env.FAKE_PID_FILE) {
+  fs.appendFileSync(process.env.FAKE_PID_FILE, `${process.pid}\n`)
+  const starts = fs.readFileSync(process.env.FAKE_PID_FILE, "utf8").trim().split("\n").length
+  if (starts <= Number(process.env.FAKE_FAIL_STARTS ?? 0)) process.exit(1)
+}
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n")
 const waiting = new Map()
@@ -13,7 +22,7 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
   const p = m.params ?? {}
   switch (m.method) {
     case "initialize":
-      return ok({ userAgent: "fake" })
+      return void setTimeout(() => ok({ userAgent: "fake" }), Number(process.env.FAKE_INIT_MS ?? 0))
     case "thread/resume":
       return p.threadId === "busy" ? out({ id: m.id, error: { code: -32600, message: "thread busy already has a live local writer" } }) : ok({ thread: { id: p.threadId } })
     case "thread/start":

@@ -11,6 +11,11 @@ import { formAction, questionForm } from "./form.js"
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")
 export const PIPE = "\\\\.\\pipe\\codex-ipc"
 const IDLE_MS = 10 * 60_000
+// A kept-up app-server that dies is started again after these waits (the last one repeats), and it has to stay up STABLE_MS
+// for the waits to begin again at the first. One that doesn't answer `initialize` within INIT_MS is killed.
+const RESTART_MS = [5_000, 30_000, 5 * 60_000]
+const STABLE_MS = 60_000
+const INIT_MS = 90_000
 export const BUSY = "该对话正在电脑上打开，请稍后或在电脑上操作"
 // The desktop drops messages whose version differs from its own table (app.asar of Codex desktop 26.1023).
 const VERSIONS = { initialize: 0, "thread-follower-start-turn": 2, "thread-follower-interrupt-turn": 4 }
@@ -236,6 +241,7 @@ function appServer([cmd, ...args], onMessage) {
   const fail = (e) => {
     if (s.dead) return
     s.dead = true
+    s.missing = e?.code === "ENOENT"
     for (const w of waits.values()) w.reject(e)
     waits.clear()
     onMessage({ method: "bridge/exited" })
@@ -304,9 +310,19 @@ export function approvalSummary(req) {
 // push(threadId, kind, text) with kind "approval" | "question" | "done" | "failed" | "info", plus "text" (a finished
 // agent message), "tool" (a tool item's name) and "end" (an interrupted turn) for live progress: hooks may be
 // untrusted for this app-server, and codex-hook.js skips threads with a bridge marker so nothing is pushed twice.
-export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-server"] }) {
+//
+// The app-server starts on the first use and stops after idleMs without one, or it is kept up (`warm(true)`, for the
+// process that receives the WeChat messages): then it starts at once, never idles out, and is started again after a crash.
+// Timings are options for the tests; `log(text)` hears about restarts.
+export function createBridge({
+  push, markerDir, bin = () => [codexBin(), "app-server"], log = () => {}, idleMs = IDLE_MS, restartMs = RESTART_MS, stableMs = STABLE_MS, initMs = INIT_MS,
+}) {
   let server = null
   let idle = null
+  let keep = false // kept up
+  let release = false // no longer kept up while a turn of ours runs: stop when the last one ends
+  let retry = null // timer of the next restart
+  let fails = 0 // restarts in a row
   const active = new Map() // threadId → held server requests, while a turn we started runs
   const turnIds = new Map() // threadId → id of the running turn we started
   const compacting = new Set()
@@ -325,14 +341,46 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
   }
   const touch = () => {
     clearTimeout(idle)
+    if (keep) return
     // ponytail: a turn stuck on an unanswered approval keeps app-server alive until answered or the plugin unloads.
-    idle = setTimeout(() => (active.size ? touch() : b.stop()), IDLE_MS)
+    idle = setTimeout(() => (active.size ? touch() : b.stop()), idleMs)
     idle.unref?.()
+  }
+  const halt = () => {
+    clearTimeout(idle)
+    ;[...active.keys()].forEach(clearActive)
+    server?.stop()
+    server = null
+  }
+  // After a turn: a release that was waiting for it happens now, otherwise the idle timer starts over.
+  const settle = () => (release && !active.size ? ((release = false), halt()) : touch())
+  // The kept-up server is gone: start it again after the next wait. A missing codex program is not retried.
+  const restart = (s) => {
+    if (!keep || retry) return
+    if (s?.missing) return void (s.reported || ((s.reported = true), log("找不到 codex 程序，不保持 Codex 后台程序运行")))
+    if (s?.upAt && Date.now() - s.upAt >= stableMs) fails = 0
+    const wait = restartMs[Math.min(fails++, restartMs.length - 1)]
+    log(`Codex app-server 退出了，${wait / 1000} 秒后重新启动`)
+    retry = setTimeout(() => ((retry = null), keepUp()), wait)
+    retry.unref?.()
+  }
+  const keepUp = () => {
+    if (!keep) return
+    const t0 = Date.now()
+    const was = server
+    // A failed start schedules its own restart.
+    ensure().then((s) => s !== was && log(`Codex 后台程序已就绪（${((Date.now() - t0) / 1000).toFixed(1)} 秒）`), () => {})
   }
   const edits = new Map() // threadId → completed fileChange items of the running turn
   const last = new Map() // threadId → newest agent message text of the running turn
-  const onMessage = (m) => {
-    if (m.method === "bridge/exited") return [...active.keys()].forEach(clearActive)
+  // `from`: the server the message came from. One we stopped ourselves exits later, when its turns are already dropped.
+  const onMessage = (m, from) => {
+    if (m.method === "bridge/exited") {
+      if (from !== server) return
+      clearTimeout(idle)
+      ;[...active.keys()].forEach(clearActive)
+      return restart(from)
+    }
     const p = m.params ?? {}
     const held = active.get(p.threadId)
     if (m.id != null) {
@@ -360,13 +408,36 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       else if (p.turn?.status === "completed") push(p.threadId, compacted ? "info" : "done", compacted ? "上下文已压缩" : reply, ...(fileChanges.length && !compacted ? [{ fileChanges }] : []))
       else push(p.threadId, "end", "")
       server?.call("thread/unsubscribe", { threadId: p.threadId }).catch(() => {})
-      touch()
+      settle()
+    }
+  }
+  // Waits for the server to answer `initialize`; one that never does is stopped.
+  const started = async (s) => {
+    if (s.up) return
+    let t
+    const late = new Promise((_, reject) => (t = setTimeout(() => reject(new Error("Codex app-server 启动超时")), initMs)))
+    try {
+      await Promise.race([s.ready, late])
+      s.up = true
+      s.upAt = Date.now()
+    } catch (e) {
+      if (!s.dead) {
+        s.stop()
+        if (server === s) server = null
+      }
+      restart(s)
+      throw e
+    } finally {
+      clearTimeout(t)
     }
   }
   const ensure = async () => {
-    if (!server || server.dead || server.closing) server = appServer(bin(), onMessage)
+    if (!server || server.dead || server.closing) {
+      const s = appServer(bin(), (m) => onMessage(m, s))
+      server = s
+    }
     const s = server
-    await s.ready
+    await started(s)
     touch()
     return s
   }
@@ -477,11 +548,32 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       answer(threadId, q, questionResult(a.submit))
       return `已回答 ${tag}`
     },
+    // true: kept up from now on (started at once). false: back to starting on demand, and stopping now, or when the
+    // turns of ours that are running end; returns whether it waits for them.
+    warm(on) {
+      clearTimeout(retry)
+      retry = null
+      fails = 0
+      release = false
+      keep = !!on
+      if (on) return void keepUp()
+      if (active.size) return (release = true)
+      halt()
+      return false
+    },
+    // After the machine slept: starts a kept-up server that is gone right away, not after the restart wait.
+    revive() {
+      if (!keep || (server && !server.dead && !server.closing)) return
+      clearTimeout(retry)
+      retry = null
+      fails = 0
+      keepUp()
+    },
     stop() {
-      clearTimeout(idle)
-      ;[...active.keys()].forEach(clearActive)
-      server?.stop()
-      server = null
+      keep = release = false
+      clearTimeout(retry)
+      retry = null
+      halt()
     },
   }
   return b
@@ -534,6 +626,44 @@ const TOOL = {
   webSearch: () => "web_search",
   imageGeneration: () => "生成图片",
   collabAgentToolCall: () => "子代理",
+}
+
+const HISTORY = path.join(CODEX_HOME, "thread_history_1.sqlite")
+
+// The newest `limit` turns of a thread from the desktop's history db, newest first, shaped like thread/turns/list
+// ({ id, status, items }) so codexMsgs takes either. Read-only, no app-server. null unless the db is known to be
+// complete: its projection has to end exactly where the rollout file `rollout` ends. A turn still being written, a
+// rollout compressed or rewritten since (older threads: the db then lacks turns or items), or a thread the db doesn't
+// have all leave it null, and the caller asks app-server instead.
+export async function dbTurns(threadId, limit, { db = HISTORY, rollout } = {}) {
+  try {
+    const size = rollout ? fs.statSync(rollout, { throwIfNoEntry: false })?.size : undefined
+    if (size == null) return null
+    const { DatabaseSync } = await import("node:sqlite")
+    const conn = new DatabaseSync(db, { readOnly: true })
+    try {
+      const at = conn.prepare("select next_rollout_byte_offset as o from thread_history_projection_state where thread_id = ?").get(threadId)
+      if (at?.o !== size) return null
+      const turns = conn.prepare("select turn_id as id, status from thread_turns where thread_id = ? order by rollout_ordinal desc limit ?").all(threadId, limit)
+      if (!turns.length) return null
+      const rows = conn
+        .prepare(`select turn_id, item_json from thread_items where thread_id = ? and turn_id in (${turns.map(() => "?").join(",")}) order by rollout_ordinal`)
+        .all(threadId, ...turns.map((t) => t.id))
+      const items = new Map(turns.map((t) => [t.id, []]))
+      for (const r of rows) items.get(r.turn_id).push(JSON.parse(r.item_json))
+      return turns.map((t) => ({ id: t.id, status: t.status, items: items.get(t.id) }))
+    } finally {
+      conn.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+// dbTurns for a thread of the state db: its rollout file tells whether the history db has caught up.
+export async function codexHistory(threadId, limit) {
+  const rollout = cleanDir((await query("select rollout_path from threads where id = ?", threadId))[0]?.rollout_path)
+  return dbTurns(threadId, limit, { rollout })
 }
 
 // Codex turns (newest first) as the OpenCode-shaped messages index.js formats, newest first.

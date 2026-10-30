@@ -5,10 +5,11 @@ import path from "node:path"
 import { test } from "node:test"
 import { fileURLToPath } from "node:url"
 import {
-  approvalSummary, bridgeMarker, codexMsgs, createBridge, decisionRequest, desktopApprove, desktopCompact, desktopInterrupt, desktopOwns, desktopSend, frame,
-  pendingApprovals, questionResult, serverResponse, startTurnParams, unframe,
+  approvalSummary, bridgeMarker, codexMsgs, createBridge, dbTurns, decisionRequest, desktopApprove, desktopCompact, desktopInterrupt, desktopOwns, desktopSend,
+  frame, pendingApprovals, questionResult, serverResponse, startTurnParams, unframe,
 } from "./codex.js"
 import { fakeDesktop } from "./fake-desktop.js"
+import { agent, fakeHistory, sqlite, user } from "./fake-history.js"
 
 test("frame / unframe", () => {
   const a = frame({ type: "request", method: "initialize", params: { t: "中文" } })
@@ -168,5 +169,224 @@ test("bridge: resume, held approval, question, completion, stop", async () => {
     b.stop()
   }
   assert.ok(!fs.existsSync(bridgeMarker(dir, "new-thread")))
+  fs.rmSync(dir, { recursive: true })
+})
+
+// --- the kept-up app-server (warm) ---
+
+const FAKE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-app-server.js")
+const nap = (ms) => new Promise((r) => setTimeout(r, ms))
+async function wait(f, ms = 5000) {
+  for (const end = Date.now() + ms; !f() && Date.now() < end; ) await nap(5)
+  assert.ok(f(), "timed out")
+}
+const alive = (pid) => {
+  try {
+    return process.kill(pid, 0), true
+  } catch {
+    return false
+  }
+}
+
+// A bridge on the fake app-server. starts() lists the pid of every server it started, logs what it reported.
+function warmBridge(opts = {}, env = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-warm-"))
+  const pids = path.join(dir, "pids")
+  Object.assign(process.env, { FAKE_PID_FILE: pids, FAKE_FAIL_STARTS: "0", FAKE_INIT_MS: "0", ...env })
+  const logs = []
+  const b = createBridge({ push: () => {}, markerDir: dir, bin: () => [process.execPath, FAKE], log: (t) => logs.push(t), ...opts })
+  const starts = () => (fs.existsSync(pids) ? fs.readFileSync(pids, "utf8").trim().split("\n").filter(Boolean).map(Number) : [])
+  const ready = () => logs.filter((l) => /已就绪/.test(l)).length
+  const waits = () => logs.filter((l) => /重新启动/.test(l)).map((l) => Number(l.match(/，([\d.]+) 秒/)[1]))
+  const done = () => {
+    b.stop()
+    for (const k of ["FAKE_PID_FILE", "FAKE_FAIL_STARTS", "FAKE_INIT_MS"]) delete process.env[k]
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+  return { b, logs, starts, ready, waits, done }
+}
+
+test("warm bridge: starts at once and never idles out; a bridge started on demand does", async () => {
+  const w = warmBridge({ idleMs: 40 })
+  try {
+    w.b.warm(true)
+    await wait(() => w.ready() === 1)
+    const [pid] = w.starts()
+    await nap(300) // several idle periods
+    assert.ok(alive(pid))
+    await w.b.send("echo", "hi")
+    await wait(() => !w.b.running("echo"))
+    assert.deepEqual(w.starts(), [pid], "the send used the running server")
+    assert.equal(w.b.warm(false), false, "no turn of ours runs: it stops now")
+    await wait(() => !alive(pid))
+  } finally {
+    w.done()
+  }
+  const c = warmBridge({ idleMs: 40, restartMs: [10] })
+  try {
+    await c.b.models()
+    const [pid] = c.starts()
+    await wait(() => !alive(pid))
+    // A server nobody keeps up is not started again after it dies.
+    await c.b.models()
+    process.kill(c.starts()[1])
+    await nap(100)
+    assert.equal(c.starts().length, 2)
+  } finally {
+    c.done()
+  }
+})
+
+test("warm bridge: stopping waits for a running turn of ours, and a new warm(true) cancels the wait", async () => {
+  const w = warmBridge()
+  try {
+    w.b.warm(true)
+    await wait(() => w.ready() === 1)
+    const [pid] = w.starts()
+    await w.b.send("slow", "数到 300")
+    assert.equal(w.b.warm(false), true, "the turn is still running")
+    await nap(150)
+    assert.ok(alive(pid), "not killed mid-turn")
+    assert.equal(await w.b.interrupt("slow"), true)
+    await wait(() => !alive(pid))
+    assert.equal(w.b.running("slow"), false)
+    // Kept up again, a stop that waits for a turn is called off by the next warm(true).
+    w.b.warm(true)
+    await wait(() => w.starts().length === 2 && w.ready() === 2)
+    await w.b.send("slow", "again")
+    assert.equal(w.b.warm(false), true)
+    w.b.warm(true)
+    assert.equal(await w.b.interrupt("slow"), true)
+    await wait(() => !w.b.running("slow"))
+    await nap(150)
+    assert.ok(alive(w.starts()[1]))
+    assert.equal(w.starts().length, 2)
+  } finally {
+    w.done()
+  }
+})
+
+test("warm bridge: restarts after a crash with growing waits, and starts over once it stayed up", async () => {
+  const w = warmBridge({ restartMs: [40, 80, 160], stableMs: 300 })
+  try {
+    w.b.warm(true)
+    for (let i = 1; i <= 4; i++) {
+      await wait(() => w.ready() === i)
+      process.kill(w.starts()[i - 1])
+      if (i === 1) {
+        await nap(15)
+        assert.equal(w.starts().length, 1, "no restart before the wait is over")
+      }
+      await wait(() => w.starts().length === i + 1)
+    }
+    assert.deepEqual(w.waits(), [0.04, 0.08, 0.16, 0.16], "the last wait repeats")
+    await wait(() => w.ready() === 5)
+    await nap(350)
+    process.kill(w.starts()[4])
+    await wait(() => w.starts().length === 6)
+    assert.equal(w.waits().at(-1), 0.04, "a server that stayed up has the first wait again")
+  } finally {
+    w.done()
+  }
+})
+
+test("warm bridge: a server that dies at launch is retried with waits, then works", async () => {
+  const w = warmBridge({ restartMs: [30, 60, 120] }, { FAKE_FAIL_STARTS: "2" })
+  try {
+    w.b.warm(true)
+    await wait(() => w.starts().length === 3 && w.ready() === 1)
+    assert.deepEqual(w.waits(), [0.03, 0.06])
+    assert.deepEqual((await w.b.models()).map((m) => m.model), ["m1"])
+    assert.equal(w.starts().length, 3)
+  } finally {
+    w.done()
+  }
+})
+
+test("warm bridge: a missing codex program is reported once and not retried", async () => {
+  const logs = []
+  const b = createBridge({ push() {}, bin: () => ["wx-no-such-program-xyz"], log: (t) => logs.push(t), restartMs: [10] })
+  try {
+    b.warm(true)
+    await wait(() => logs.length)
+    await nap(150)
+    assert.equal(logs.length, 1)
+    assert.match(logs[0], /找不到 codex/)
+  } finally {
+    b.stop()
+  }
+})
+
+test("warm bridge: a server that never answers initialize is stopped and started again", async () => {
+  const w = warmBridge({ initMs: 80, restartMs: [30] }, { FAKE_INIT_MS: "1500" })
+  try {
+    w.b.warm(true)
+    await wait(() => w.starts().length === 2)
+    await wait(() => !alive(w.starts()[0]))
+    await assert.rejects(w.b.models(), /启动超时/)
+  } finally {
+    w.done()
+  }
+})
+
+test("warm bridge: revive starts a lost server at once, but only for a kept-up bridge", async () => {
+  const w = warmBridge({ restartMs: [10_000] })
+  try {
+    w.b.warm(true)
+    await wait(() => w.ready() === 1)
+    w.b.revive()
+    await nap(50)
+    assert.equal(w.starts().length, 1, "a running server is left alone")
+    process.kill(w.starts()[0])
+    await wait(() => w.waits().length === 1)
+    w.b.revive()
+    await wait(() => w.starts().length === 2 && w.ready() === 2)
+    w.b.warm(false)
+    await wait(() => !alive(w.starts()[1]))
+    w.b.revive()
+    await nap(100)
+    assert.equal(w.starts().length, 2, "not kept up: nothing to bring back")
+  } finally {
+    w.done()
+  }
+})
+
+test("dbTurns: the newest turns from the history db, as thread/turns/list shapes them", { skip: !sqlite }, async () => {
+  const cmd = { type: "commandExecution", id: "c1", command: "ls" }
+  const think = { type: "reasoning", id: "r1" }
+  const db = fakeHistory(
+    [
+      ["t1", 1, user("u1", "第一问"), "turn1"],
+      ["t1", 2, agent("a1", "第一答"), "turn1"],
+      ["t1", 3, user("u2", "第二问"), "turn2"],
+      ["t1", 4, cmd, "turn2"],
+      ["t1", 5, think, "turn2"],
+      ["t1", 6, agent("a2", "第二答"), "turn2"],
+      ["t2", 1, user("x", "别的对话"), "turnx"],
+    ],
+    { status: { turn2: "inProgress" } },
+  )
+  const dir = path.dirname(db)
+  const rollout = path.join(dir, "rollout.jsonl")
+  fs.writeFileSync(rollout, "x".repeat(1000))
+  const app = [
+    { id: "turn2", status: "inProgress", items: [user("u2", "第二问"), cmd, think, agent("a2", "第二答")] },
+    { id: "turn1", status: "completed", items: [user("u1", "第一问"), agent("a1", "第一答")] },
+  ]
+  const turns = await dbTurns("t1", 2, { db, rollout })
+  assert.deepEqual(turns, app)
+  assert.deepEqual(codexMsgs(turns), codexMsgs(app))
+  assert.deepEqual((await dbTurns("t1", 1, { db, rollout })).map((t) => t.id), ["turn2"])
+  assert.deepEqual((await dbTurns("t2", 5, { db, rollout })).map((t) => t.id), ["turnx"])
+  // Only a db that ends where the rollout file ends is trusted.
+  fs.writeFileSync(rollout, "x".repeat(1001))
+  assert.equal(await dbTurns("t1", 2, { db, rollout }), null, "the rollout grew: a turn is still being written")
+  fs.writeFileSync(rollout, "x".repeat(999))
+  assert.equal(await dbTurns("t1", 2, { db, rollout }), null, "the rollout was rewritten")
+  fs.writeFileSync(rollout, "x".repeat(1000))
+  assert.equal(await dbTurns("t1", 2, { db, rollout: path.join(dir, "gone.jsonl") }), null, "no rollout file (compressed)")
+  assert.equal(await dbTurns("t1", 2, { db }), null, "no rollout given")
+  assert.equal(await dbTurns("nope", 2, { db, rollout }), null)
+  assert.equal(await dbTurns("t1", 2, { db: path.join(dir, "no.sqlite"), rollout }), null)
   fs.rmSync(dir, { recursive: true })
 })
