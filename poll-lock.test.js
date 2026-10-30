@@ -181,7 +181,10 @@ test("three processes: exactly one holds the lock, and another takes over when i
     for (let i = 0; i < 60 && holders().length !== 1; i++) await wait(100)
     assert.equal(holders().length, 1, "taken over")
     assert.notEqual(holders()[0], first)
-    assert.equal(readLock(dir).pid, holders()[0].pid)
+    // A heartbeat rewrites the file in place, so a read can land on it empty (pid 0); read again.
+    let l = readLock(dir)
+    for (let i = 0; i < 20 && !l?.pid; i++) (await wait(50), (l = readLock(dir)))
+    assert.equal(l.pid, holders()[0].pid)
   } finally {
     for (const k of kids) k.kill("SIGKILL")
     await wait(200)
