@@ -319,6 +319,7 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
   const clearActive = (threadId) => {
     active.delete(threadId)
     turnIds.delete(threadId)
+    edits.delete(threadId)
     compacting.delete(threadId)
     if (markerDir) fs.rmSync(bridgeMarker(markerDir, threadId), { force: true })
   }
@@ -328,6 +329,7 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
     idle = setTimeout(() => (active.size ? touch() : b.stop()), IDLE_MS)
     idle.unref?.()
   }
+  const edits = new Map() // threadId → completed fileChange items of the running turn
   const last = new Map() // threadId → newest agent message text of the running turn
   const onMessage = (m) => {
     if (m.method === "bridge/exited") return [...active.keys()].forEach(clearActive)
@@ -345,15 +347,17 @@ export function createBridge({ push, markerDir, bin = () => [codexBin(), "app-se
       last.set(p.threadId, p.item.text)
       push(p.threadId, "text", p.item.text)
     }
+    if (m.method === "item/completed" && held && p.item?.type === "fileChange") edits.set(p.threadId, [...(edits.get(p.threadId) ?? []), p.item])
     if (m.method === "item/started" && held && TOOL[p.item?.type]) push(p.threadId, "tool", TOOL[p.item.type](p.item))
     if (m.method === "serverRequest/resolved" && held) active.set(p.threadId, held.filter((r) => r.id !== p.requestId))
     if (m.method === "turn/completed" && held) {
       const compacted = compacting.has(p.threadId)
+      const fileChanges = edits.get(p.threadId) ?? []
       clearActive(p.threadId)
       const reply = last.get(p.threadId) ?? ""
       last.delete(p.threadId)
       if (p.turn?.status === "failed") push(p.threadId, "failed", p.turn.error?.message ?? "未知错误")
-      else if (p.turn?.status === "completed") push(p.threadId, compacted ? "info" : "done", compacted ? "上下文已压缩" : reply)
+      else if (p.turn?.status === "completed") push(p.threadId, compacted ? "info" : "done", compacted ? "上下文已压缩" : reply, ...(fileChanges.length && !compacted ? [{ fileChanges }] : []))
       else push(p.threadId, "end", "")
       server?.call("thread/unsubscribe", { threadId: p.threadId }).catch(() => {})
       touch()

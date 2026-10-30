@@ -37,6 +37,12 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
         out({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: JSON.stringify({ input: p.input, model: p.model }) } } })
         return out({ method: "turn/completed", params: { threadId, turn: { id: "turn1", status: "completed", items: [] } } })
       }
+      if (threadId === "edit") {
+        const item = { type: "fileChange", id: "f1", status: "completed", changes: [{ path: "C:\\p\\a.py", kind: { type: "add" }, diff: "x" }] }
+        out({ method: "item/completed", params: { threadId, item } })
+        out({ method: "item/completed", params: { threadId, item: { type: "agentMessage", text: "写好了 a.py" } } })
+        return out({ method: "turn/completed", params: { threadId, turn: { id: "turn1", status: "completed", items: [] } } })
+      }
       const questions = [
         { id: "q", header: "选项", question: "选哪个？", isOther: false, options: [{ label: "A", description: "" }, { label: "B", description: "" }] },
         { id: "pw", header: "密码", question: "", isOther: false, isSecret: true, options: null },
