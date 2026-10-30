@@ -95,6 +95,8 @@ export const base = (dir) => (dir ? dir.split(/[\\/]/).filter(Boolean).pop() : "
 const toArr = (r) => (Array.isArray(r) ? r : (r?.data ?? []))
 // console.warn from a plugin never reaches opencode.log, so failures also go to a file the user can read.
 const warn = (...a) => {
+  // OpenCode being closed is expected when the daemon runs alone; the reply already says so.
+  if (a.some((x) => x?.down)) return
   const line = a.map((x) => short(x?.message ?? x, 200)).join(" ")
   console.warn(TAG, line)
   try {
