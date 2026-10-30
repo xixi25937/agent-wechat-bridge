@@ -15,6 +15,7 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 - **Answer questions**: the agent's question tool shows the options in WeChat. Answer with an option number, an option's text or free text, all at once or one by one.
 - **Control**: `3 your message` continues conversation 3 (OpenCode or Codex, shared numbering), `3` shows its last reply, and `3 历史` reads back recent messages. Also `/model`, `/stop`, `/compact`, undo, and starting a new conversation in a folder you pick.
 - **Send images and files** from WeChat into a conversation.
+- **Files on request**: after each turn the bot lists the files the agent mentioned or changed (images still send themselves; likely secrets such as `.env` or `*.pem` are never listed). Nothing is sent until you pick: `3 文件 1 3` sends the 1st and 3rd of conversation 3, `3 文件 全部` sends all, `文件 path` sends any file on the PC. `文件提示 关` turns the lists off. Details in [文件](#文件).
 
 | | Push replies | Approve | Send messages, history | Answer questions |
 | --- | --- | --- | --- | --- |
@@ -22,6 +23,16 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 | OpenCode terminal (`opencode`, `opencode run`) | ✓ | ✓ | ✓ | ✓ |
 | Codex desktop | ✓ | ✓ | ✓ | ✓ (needs the `PreToolUse` hook) |
 | Codex terminal (`codex`) | ✓ | ✓ (WeChat gets 60 s) | ✓ (if the terminal isn't running that conversation) | ✗ (answer in the terminal) |
+
+### Files on request
+
+Images mentioned in a reply are sent automatically. Other files (pdf, py, docx, zip, …) are offered, not sent: after a turn finishes you get one extra message listing the files the agent mentioned in its reply or created/changed during the turn (at most 10, likely secrets like `.env`, `*.pem`, `id_rsa*`, `.git/`, `node_modules/` and `~/.cli-bridge` are never listed). Reply to pick:
+
+- `3 文件 1 3` (or `1,3`) sends files 1 and 3 of conversation 3; `3 文件 全部` sends all; `3 文件` shows the list again. Without the number it is the current conversation.
+- `文件 path` or `/file path` sends any file by path (relative to the folder picked with `目录`). No secret filter, but the 50 MB limit applies.
+- `文件提示 关` / `文件提示 开` (or `/files off` / `/files on`) turns the offers off or on. Default on.
+
+An offer is kept in the state file for 24 hours or until the next one for that conversation. The same works for OpenCode (tool calls and `GET /api/session/{id}/diff`) and Codex (`fileChange` items). Files go out as iLink `file_item` messages (upload `media_type` 3). Details in [文件](#文件).
 
 ## Quick start
 
@@ -60,7 +71,7 @@ The full documentation is in Chinese: [中文说明](#中文说明).
 
 - Needs Node.js 20.3 or newer, and OpenCode 2.x (V2 plugin API) if you use OpenCode. Reading Codex session titles needs Node 22.5 or newer.
 - Developed and used on Windows. Other platforms are untested (the macOS and Linux autostart entries are unit-tested only).
-- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/help`), and `/model`, `/stop`, `/compact` work as written.
+- WeChat-side commands and the plugin's replies are in Chinese (`列表`, `目录`, `新对话`, `撤回`, `文件`, `帮助`). Several have slash aliases (`/list`, `/new`, `/history`, `/img`, `/live`, `/unsend`, `/file`, `/files`, `/help`), and `/model`, `/stop`, `/compact` work as written.
 - Only messages from the WeChat account that logged in the bot are handled. Anyone who controls that account, or can read `~/.cli-bridge`, can run commands and approve permissions through your agents. Keep the phone and those files safe.
 - WeChat limits bots (from third-party implementations, not official documentation): about 10 bot messages after each message you send, and a `context_token` that expires after about 24 hours. Sending the bot any message resets both.
 - WeChat commands are executed by whichever process holds the poll lock: the OpenCode background service, or the daemon. Without OpenCode running, the daemon still handles Codex; replies about OpenCode conversations say OpenCode isn't running. Do not run cli-chat-bridge's `wechat-opencode` daemon at the same time; both would fight over the same bot's messages.
@@ -83,7 +94,7 @@ License: MIT. Tests: `npm test` (no network, nothing is sent to WeChat).
 | Codex 桌面端 | ✓ | ✓（电脑和微信都能批） | ✓ | ✓（电脑和微信都能答，要多一个 hook，见下） |
 | Codex 终端（`codex`） | ✓ | ✓（微信只等 60 秒，见下） | ✓（终端没在跑这个对话时） | ✗（终端里的提问只能在终端回答） |
 
-OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚本（`codex-hook.js`）加 Codex 模块（`codex.js`、桌面提问 `codex-question.js`），两边共用编号和微信登录。
+OpenCode 部分是 V2 服务端插件（`index.js`），Codex 部分是 hook 脚本（`codex-hook.js`）加 Codex 模块（`codex.js`、桌面提问 `codex-question.js`），两边共用编号和微信登录，也共用文件清单（`files.js`）。
 
 **谁来接收你在微信里发的消息：**
 
@@ -239,6 +250,9 @@ npx agent-wechat-bridge setup        # 在源码目录里也可以：node setup.
 | `目录 2` / `目录 读书笔记` | 选中文件夹，并列出它最近的对话 |
 | `新对话 内容` | 在选中的文件夹里新建对话并发出内容（不带内容就只新建，接着直接发即可）。模型沿用该文件夹最近一次对话的模型 |
 | `图 路径` / `/img 路径` | 把电脑上的图片发到微信。相对路径按「目录」选中的文件夹算；必须以图片扩展名结尾，所以「图片怎么发」照常发给对话 |
+| `3 文件 1 3` / `3 文件 全部` / `3 文件` | 从 [3] 这一轮的文件清单里发送第 1、3 个 / 全部，或重新列出清单（见下面「文件」）。不带编号就是当前对话 |
+| `文件 路径` / `/file 路径` | 把电脑上任意文件发到微信（相对路径按「目录」选中的文件夹算，最大 50 MB）。「文件 路径」要像路径（有扩展名或斜杠），所以「文件夹里有什么」「5 文件名改一下」照常发给对话 |
+| `文件提示 关` / `文件提示 开` | 关 / 开每轮结束后的文件清单，也认 `/files off` / `/files on`，默认开 |
 | 发图片 / 文件 | 先存起来（见下面「从微信发图片和文件」），下一条文字带上它们一起发 |
 | `/model` | 列出可用模型并编号（`- 1 服务商/模型`），标出当前对话在用的那个。`/model 3`、`/model 名字片段` 切换（匹配到多个会让你选） |
 | `/stop` | 停止对话正在运行的回复 |
@@ -319,6 +333,33 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 - 只发 png / jpg / jpeg / gif / webp 普通文件，http/https 链接不管。去重，每条回复最多 4 张；超过 10 MB 的不发，在文字末尾注明「图片太大没发」。
 - 上传走 iLink 协议：AES-128-ECB 加密 → `getuploadurl` → 上传到微信 CDN → `sendmessage` 发图片消息。失败只在日志里写一行 `[wechat-notify]` 警告，文字推送不受影响。
 
+## 文件
+
+图片以外的文件不会自动发，免得聊天里堆满文件：每轮结束后插件列出这一轮的文件，由你选要收哪几个，不回复就不发。
+
+回复完成推送（和图片）之后多发一条，没有候选文件就不发：
+
+```
+[3] Codex · proj 这一轮的文件：
+
+- 1 report.pdf（1.2 MB）
+- 2 main.py（3 KB）
+- …还有 2 个
+
+回复「3 文件 1 3」发送选中的，「3 文件 全部」全发，不回复就不发
+```
+
+- **候选文件**，回复里提到的排前面，其次是这一轮改过或新建的：
+  - 回复里提到的路径，写法同图片（绝对路径、`file:///`、相对路径、反引号、markdown 链接），任意扩展名。
+  - OpenCode：这一轮的 edit / write / patch 工具调用，加上 `GET /api/session/{id}/diff`（在 git 仓库里还能看到命令生成的文件；不是 git 仓库时 OpenCode 没有快照，diff 为空，只靠工具调用）。
+  - Codex：这一轮的 `fileChange` 项。终端和桌面窗口里的对话由 Stop hook 读 `~/.codex/thread_history_1.sqlite`（按 hook 给的 `turn_id`，库里找不到这一轮就取最后一条用户消息之后的）；插件后台跑的对话直接用 app-server 的 `item/completed`。删除的文件不算，移动的算新位置。Codex 用命令生成的文件没有 `fileChange` 记录，只有回复里提到时才会列出。
+- **过滤**：只列存在、非空、不超过 50 MB 的普通文件；不要目录和图片（png/jpg/jpeg/gif/webp 仍照旧自动发）；不列疑似密钥的：`.env*`、`*.pem`、`*.key`、`*.pfx`、`*.p12`、`id_rsa*`（`id_ed25519*` 等同理）、`auth.json`、`account.json`、`.netrc`、`.npmrc`、`~/.cli-bridge` 里的任何文件（包括 `WECHAT_NOTIFY_DIR`），以及 `.git/`、`node_modules/`、`.ssh/` 下的文件。去重，最多列 10 个，多出来的写「…还有 k 个」（想要就用 `文件 路径`）。同名的文件显示相对于对话文件夹的路径。
+- **选择**：`3 文件 1 3`（也认 `1,3`）发第 1、3 个，`3 文件 全部` 全发。一个一个发出，最后回「已发送 2 个文件」。编号不存在时回「没有第 7 个文件（共 3 个）」，一个都不发；文件已经被删了会写在回复里，其余照发。`3 文件` 重新列出清单。不带编号（`文件 1 3`、`文件 全部`、`文件`）就是当前对话。每个文件占一条机器人消息，和别的消息一样受「用户每发一条消息之后大约只能发 10 条」的限制。
+- **清单的保存**：存在状态文件的 `offers[对话]`（`{files, at}`），同一个对话新的清单替换旧的（新一轮没有文件时旧的保留），24 小时后过期，对话编号回收时一起删。Codex 的清单由 Stop hook 进程生成，由拿着 `poll.lock` 的那个程序（插件或后台程序）回答，所以都走状态文件（写入和其他数据一样先写临时文件再改名）。
+- **按路径发**：`文件 路径` 或 `/file 路径`，相对路径按「目录」选中的文件夹算。这是你明确要的，所以不过滤疑似密钥，但同样限制 50 MB。`文件` 后面不像路径（没有扩展名也没有斜杠）的，比如「文件 太大了怎么办」，照常发给对话；`/file` 后面什么都当路径。
+- **开关**：`文件提示 关` / `文件提示 开`（`/files off` / `/files on`；`文件提示` 看状态），对所有对话生效，存在状态文件的 `filesOff`，默认开。关掉后每轮结束不再查文件也不发清单，`文件 路径` 照常用。
+- **协议**：和图片同一套上传：AES-128-ECB 加密，`getuploadurl`（文件的 `media_type` 是 3，图片是 1），POST 到 CDN，再 `sendmessage` 发 `type: 4` 的 `file_item`：`file_name`、`len`（原文件大小，字符串）、`media`（`encrypt_query_param`、`aes_key` 即 16 字节密钥的 hex 再 base64、`encrypt_type: 1`）。50 MB 上限是第三方实现 cli-chat-bridge 的默认值；iLink 自己的上限没有文档。上传遇到 CDN 5xx 或断线会重试两次。
+
 ## 从微信发图片和文件
 
 微信里图片和文字是分开的两条消息，所以插件先把图片存起来，等下一条文字：
@@ -339,7 +380,7 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 - 不要同时运行 cli-chat-bridge 的 `wechat-opencode` 守护进程。两边会抢同一个机器人的消息。
 - 微信的 context_token 大约 24 小时后过期。很久没给机器人发消息时推送会失败（日志里出现 `ret=-2`）。随便给机器人发一条消息就会刷新。
 - 接收微信消息的是拿到 `~/.cli-bridge/poll.lock` 的那个程序：OpenCode 桌面端后台服务，或者后台程序 `daemon.js`。其他 `opencode serve` 进程只推送；设置 `WECHAT_NOTIFY_POLL=1` 后它们也会参与抢锁，`WECHAT_NOTIFY_POLL=0` 则从不接收。不管怎么设，同一时间只有一个程序在收。
-- 插件自己的状态（编号、对话所在目录、收消息游标、最新的 context_token）存在 `~/.cli-bridge/opencode-wechat-notify.json`，OpenCode 和 Codex 共用（Codex 对话的键是 `codex:<线程 id>`）。可以用环境变量 `WECHAT_NOTIFY_DIR` 换目录。
+- 插件自己的状态（编号、对话所在目录、收消息游标、最新的 context_token、文件清单 `offers` 和文件提示开关 `filesOff`）存在 `~/.cli-bridge/opencode-wechat-notify.json`，OpenCode 和 Codex 共用（Codex 对话的键是 `codex:<线程 id>`）。可以用环境变量 `WECHAT_NOTIFY_DIR` 换目录。
 - `opencode --standalone` 的对话会推送，但微信里的 `N 内容`、`N y` 等命令由后台服务执行。后台服务能读到这个对话（数据库共用），可私有服务里等待中的批准请求它大概率管不到。要在微信里操作就别加 `--standalone`。
 - 桌面端的 `\\.\pipe\codex-ipc` 是 Codex 桌面端内部用的接口，没有公开文档，参数是从桌面端 26.1023 版本里读出来的（回答提问用的 `thread-follower-submit-user-input`、窗口状态里的提问 `item/tool/requestUserInput` 也是；`PreToolUse` 对 `request_user_input` 会触发，这一点用 codex-cli 0.165.0 的 `codex exec` 实测过，窗口里真实提问的形状只对照过桌面端源码）。桌面端升级后如果微信发消息、批准或回答提问对桌面窗口不起作用，回复里会带出错原因，在电脑上操作即可（终端和后台运行的对话不受影响）。
 - 凭据缺失、发送失败或 OpenCode 接口出错时，只在 `~/.cli-bridge/wechat-notify.log` 里写一行警告（插件的控制台输出到不了 `opencode.log`），不影响 OpenCode。
@@ -347,7 +388,7 @@ Codex 对话（标着 `Codex ·`）同样支持上面这些命令，细节见「
 ## 测试
 
 ```sh
-npm test            # 消息排版（每条拼出来的消息没有单个换行，只有空行和 `- ` 列表）、命令解析（含斜杠命令、实时、撤回）、实时进度合并与去重、长文字分段、撤回目标、回答问题（一次回完、一条一个、跳过、忽略、选项匹配）、图片配对、文件头识别、密钥格式、格式化、去重、Codex 批准握手、桌面管道（假管道）、桌面提问（等待、回答、提交后回读）、app-server 桥（假 app-server）、`setup` 的 JSONC 和 hooks 合并（含假 HOME 端到端）等自检，不联网
+npm test            # 消息排版（每条拼出来的消息没有单个换行，只有空行和 `- ` 列表）、命令解析（含斜杠命令、实时、撤回）、实时进度合并与去重、长文字分段、撤回目标、回答问题（一次回完、一条一个、跳过、忽略、选项匹配）、图片配对、文件头识别、密钥格式、文件清单（候选文件的收集和过滤、疑似密钥、清单文字、`文件` 命令解析、选择、过期、`file_item` 消息，以及对着本机假 iLink 的上传和发送端到端）、格式化、去重、Codex 批准握手、桌面管道（假管道）、桌面提问（等待、回答、提交后回读）、app-server 桥（假 app-server）、`setup` 的 JSONC 和 hooks 合并（含假 HOME 端到端）等自检，不联网
 npm run send-test   # 真实发送一条测试消息到微信
 ```
 

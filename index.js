@@ -2,7 +2,7 @@ import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { pathToFileURL } from "node:url"
 import {
   BUSY, bridgeMarker, cleanDir, codexDirs, codexHead, codexMsgs, codexThread, codexThreads, createBridge, desktopApprove, desktopCompact, desktopInterrupt,
   desktopOwns, desktopSend,
@@ -11,6 +11,9 @@ import { desktopReply, readQuestion } from "./codex-question.js"
 // Namespace import: a hot reload can pair this file with an older codex-question.js that lacks asyncAnswer.
 import * as asyncQuestion from "./codex-question.js"
 import { NO, YES, formAction, formText, questionForm } from "./form.js"
+import {
+  FILE_MAX_BYTES, IMG, candidates, diffPaths, fileChangePaths, fileItem, liveOffer, mentionedPaths, offerText, parseSelection, resolveSelection, toPath, toolPaths,
+} from "./files.js"
 import { md, numbered, ul } from "./md.js"
 import { pollLock, readLock } from "./poll-lock.js"
 
@@ -54,6 +57,7 @@ export const HELP = md(
   section("批准和回答", ["3 y / 3 n → 批准 / 拒绝", "3 答案 → 回答 [3] 的提问", "几个问题可一行一个回完", "「-」跳过，「3 忽略」不答"]),
   section("文件夹和新对话", ["目录 → 列出文件夹", "目录 2 → 选第 2 个并列出对话", "新对话 内容 → 在选中的文件夹新建", "标着 Codex 的文件夹开 Codex 对话"]),
   section("图片", ["图 路径 → 把电脑上的图发来", "相对路径按选中的文件夹算", "发图片/文件 → 先存着", "下一条文字带上它们一起发", "不用说明就回「发」或「3 图」", "10 分钟内有效"]),
+  section("文件", ["每轮结束后列出这轮的文件", "3 文件 1 3 → 发第 1、3 个", "3 文件 全部 → 全部发来", "文件 路径 → 发电脑上的文件", "文件提示 关 / 开 → 关 / 开"]),
   section("撤回", ["3 撤回 → 撤回 [3] 最后一条", "再发「3 撤回 确认」才执行", "不带编号就是当前对话", "也认 /unsend"]),
   section("实时推送", ["实时 关 / 实时 开 → 关 / 开", "回复过程中约 15 秒推一条", "3 实时 关 → 只关 [3]", "实时 → 看状态"]),
   section("其他", ["编号后是 agent 和目录", "例：[3] OpenCode · ttool", "OpenCode 和 Codex 用法一样", "/ 命令 → 见下一条"]),
@@ -77,11 +81,11 @@ async function slashHelp() {
   const loc = `location[directory]=${encodeURIComponent(session?.location?.directory ?? "")}`
   return slashHelpText(t, toArr(await oc(`/api/command?${loc}`)))
 }
-const IMG = /\.(png|jpe?g|gif|webp)$/i
 const MAX_IMAGES = 4
 const IMAGE_MAX_BYTES = 10 * 1024 * 1024
 const TOO_BIG = "太大（超过 10 MB）"
-const CDN = "https://novac2c.cdn.weixin.qq.com/c2c"
+// WECHAT_NOTIFY_CDN: a test seam (a fake CDN); the real one never changes.
+const CDN = process.env.WECHAT_NOTIFY_CDN || "https://novac2c.cdn.weixin.qq.com/c2c"
 const INBOUND_MAX_BYTES = 20 * 1024 * 1024
 // Images and files from WeChat wait this long for the text they belong to.
 export const PAIR_MS = 10 * 60_000
@@ -316,7 +320,9 @@ const KEYWORDS = [
   ["help", /^(帮助|\/?help|\?|？|\/|／)$/i],
   ["dirs", /^(目录|文件夹|\/?dirs?)$/i],
 ]
-const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img", "live", "unsend"])
+const OWN_SLASH = new Set(["list", "ls", "help", "dir", "dirs", "cd", "new", "history", "img", "live", "unsend", "file", "files"])
+// What 「文件 …」 treats as a path rather than chat: a separator, or an extension with a letter ("v1.2" is not one).
+const PATHISH = /[\\/]|\.\w*[a-z]\w*$/i
 const keyword = (w) => KEYWORDS.find(([, re]) => re.test(w) || re.test(w.replace(/[。.！!？?~～…]+$/, "")))?.[0]
 
 export function parseCommand(text) {
@@ -338,6 +344,21 @@ export function parseCommand(text) {
   // Before the "3 内容" rule, so "3 历史" is never sent to the session as a prompt.
   m = t.match(/^(?:(\d{1,4})\s*)?(?:历史|\/history)(?:\s*(\d{1,4}))?$/i)
   if (m) return { type: "history", ...(m[1] && { n: Number(m[1]) }), count: Math.min(20, Math.max(1, Number(m[2] ?? 5))) }
+  // 「文件提示 关」「/files off」. "文件提示怎么改" stays a normal message.
+  m = t.match(/^(?:文件提示|\/files)(?:\s*(开|关|on|off))?$/i)
+  if (m) return { type: "filehint", ...(m[1] && { on: /^(开|on)$/i.test(m[1]) }) }
+  // 「3 文件 1 3」「3 文件 全部」「3 文件」, without the number for the current conversation; 「文件 路径」/「/file 路径」
+  // sends a path. "文件夹里有什么" and "5 文件名改一下" have no space after 文件, "5 文件 帮我看看" is not a selection,
+  // and 「文件 太大了」 has no extension: all normal messages.
+  m = t.match(/^(?:(\d{1,4})\s*)?(文件|\/file)(?:\s+([\s\S]+))?$/i)
+  if (m) {
+    const arg = m[3]?.trim()
+    const sel = arg && parseSelection(arg)
+    const n = m[1] && { n: Number(m[1]) }
+    if (!arg || sel) return { type: "files", ...n, ...(sel && { sel }) }
+    const file = arg.replace(/^[`"'“「]+|[`"'”」]+$/g, "")
+    if (m[2][0] === "/" || (!m[1] && PATHISH.test(file))) return { type: "file", path: file }
+  }
   // Needs an image extension, so "图 好看吗" stays a normal message.
   m = t.match(/^(?:图|\/img)[\s:：]+(.+)$/i)
   const img = m?.[1].trim().replace(/^[`"'“「]+|[`"'”」]+$/g, "")
@@ -654,8 +675,10 @@ async function pruneNow() {
       delete s.used[k]
       delete s.live?.[k]
       delete s.info?.[k]
+      delete s.offers?.[k]
       if (k.startsWith(CODEX)) delete s.codexModels?.[k.slice(CODEX.length)]
     }
+    for (const k of Object.keys(s.offers ?? {})) if (!liveOffer(s.offers[k], now)) delete s.offers[k]
   })
 }
 
@@ -769,8 +792,17 @@ export async function sendImage(file) {
   return steps.join(", ")
 }
 
-// Upload only: the image item sendmessage would carry, and the step statuses.
-export async function uploadImage(file) {
+// null when `file` is a sendable file, else the reason.
+async function fileProblem(file) {
+  const st = await fs.promises.stat(file).catch(() => null)
+  if (!st?.isFile()) return "文件不存在"
+  if (!st.size) return "是空文件"
+  return st.size > FILE_MAX_BYTES ? `太大（超过 ${FILE_MAX_BYTES / 1024 ** 2} MB）` : null
+}
+
+// Upload: getuploadurl (`mediaType` 1 image, 3 file) → POST the AES-128-ECB ciphertext to the CDN. Returns the media
+// reference sendmessage needs, the plain and encrypted sizes, and the step statuses (no secrets).
+async function upload(file, mediaType) {
   const { to } = recipient()
   const buf = await fs.promises.readFile(file)
   const key = crypto.randomBytes(16)
@@ -779,7 +811,7 @@ export async function uploadImage(file) {
   const filekey = crypto.randomBytes(16).toString("hex")
   const r = await ilink("ilink/bot/getuploadurl", {
     filekey,
-    media_type: 1, // image
+    media_type: mediaType,
     to_user_id: to,
     rawsize: buf.length,
     rawfilemd5: crypto.createHash("md5").update(buf).digest("hex"),
@@ -790,49 +822,52 @@ export async function uploadImage(file) {
   const steps = [`getuploadurl ${check("getuploadurl", r)}`]
   if (!r.upload_param) throw new Error("getuploadurl returned no upload_param")
   const q = `encrypted_query_param=${encodeURIComponent(r.upload_param)}&filekey=${filekey}`
-  // ponytail: no retry on CDN 5xx; add one if uploads flake.
-  const res = await fetch(`${CDN}/upload?${q}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: data,
-    signal: AbortSignal.timeout(60_000),
-  })
+  // A big file is worth a retry on a CDN 5xx or a dropped connection; a 4xx is final.
+  let res
+  for (let i = 1; ; i++) {
+    try {
+      res = await fetch(`${CDN}/upload?${q}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: data,
+        signal: AbortSignal.timeout(60_000 + Math.ceil(data.length / 1e6) * 2000),
+      })
+      if (res.status < 500 || i >= 3) break
+    } catch (e) {
+      if (i >= 3) throw e
+    }
+  }
   const param = res.headers.get("x-encrypted-param")
   if (res.status !== 200 || !param)
     throw new Error(`cdn upload failed: http=${res.status} ${short(res.headers.get("x-error-message") ?? "", 120)}`)
   steps.push(`cdn http=${res.status}`)
   const media = { encrypt_query_param: param, aes_key: Buffer.from(key.toString("hex")).toString("base64"), encrypt_type: 1 }
-  return { item: { type: 2, image_item: { media, mid_size: data.length } }, steps }
+  return { media, rawsize: buf.length, size: data.length, steps }
 }
 
-// Absolute path for a path or file:/// URL as written; null for other URLs, or a relative path without a base.
-function toPath(p, baseDir) {
-  if (/^file:/i.test(p)) {
-    try {
-      return fileURLToPath(p)
-    } catch {
-      return null
-    }
-  }
-  if (/^[a-z][\w+.-]+:/i.test(p)) return null
-  return path.isAbsolute(p) ? path.resolve(p) : baseDir ? path.resolve(baseDir, p) : null
+// Upload only: the image item sendmessage would carry, and the step statuses.
+export async function uploadImage(file) {
+  const { media, size, steps } = await upload(file, 1)
+  return { item: { type: 2, image_item: { media, mid_size: size } }, steps }
 }
 
-// Image paths mentioned in a reply: `code spans`, markdown link targets, and bare words. Paths with spaces need
-// backticks or a markdown link.
-export function imagePaths(text, baseDir) {
-  const out = new Set()
-  const re = /`([^`\n]+)`|\]\(\s*<?([^)>\n]+?)>?\s*\)|([^\s`"'<>|*?()[\]，。；：！？、「」（）]+)/g
-  for (const m of String(text ?? "").matchAll(re)) {
-    let raw = (m[1] ?? m[2] ?? m[3]).trim().replace(/[.,;:!]+$/, "")
-    // "截图在C:\x.png": text glued before a drive letter or file: URL.
-    raw = raw.slice(Math.max(0, raw.search(/(?<![a-z])([a-z]:[\\/]|file:)/i)))
-    const p = IMG.test(raw) && toPath(raw, baseDir)
-    if (p) out.add(p)
-    if (out.size >= MAX_IMAGES) break
-  }
-  return [...out]
+// Upload only: the file item (type 4) sendmessage would carry, and the step statuses.
+export async function uploadFile(file) {
+  const { media, rawsize, steps } = await upload(file, 3)
+  return { item: fileItem(media, path.basename(file), rawsize), steps }
 }
+
+// Sends any file as a file message. Throws on failure; returns the status of each step (no secrets).
+export async function sendFile(file) {
+  const problem = await fileProblem(file)
+  if (problem) throw new Error(`${path.basename(file)} ${problem}`)
+  const { item, steps } = await uploadFile(file)
+  steps.push(`sendmessage ${await sendItems([item])}`)
+  return steps.join(", ")
+}
+
+// Image paths mentioned in a reply (see mentionedPaths in files.js).
+export const imagePaths = (text, baseDir) => mentionedPaths(text, baseDir, (raw) => IMG.test(raw), MAX_IMAGES)
 
 // Local OpenCode HTTP API, for what the plugin context doesn't expose in 2.0.32 (session list/active, forms, messages).
 async function oc(pathname, body, method = body ? "POST" : "GET") {
@@ -870,7 +905,7 @@ const prompt = (sessionID, text, images = []) =>
     text,
     ...(images.length && { files: images.map((p) => ({ uri: pathToFileURL(p).href, name: path.basename(p) })) }),
   })
-const lastReply = async (sessionID, stopAtUser = true) =>
+export const lastReply = async (sessionID, stopAtUser = true) =>
   replyText((await oc(`/api/session/${sid(sessionID)}/message?limit=30&order=desc`)).data, stopAtUser)
 
 // Pushes go out one at a time in call order, so a progress push in flight never lands after the push that follows it.
@@ -1053,6 +1088,20 @@ export async function run(cmd) {
     await sendImage(file)
     return [] // the image itself is the confirmation
   }
+  if (cmd.type === "file") {
+    // Explicit, so the secret filter doesn't apply; the size limit does.
+    const file = toPath(cmd.path, dirPath(state().dir))
+    if (!file) return /^[a-z][\w+.-]+:/i.test(cmd.path) && !/^file:/i.test(cmd.path) ? "只能发电脑上的文件" : "相对路径要先发「目录」选文件夹"
+    await sendFile(file)
+    return []
+  }
+  if (cmd.type === "filehint") {
+    if (cmd.on != null) update((s) => (s.filesOff = !cmd.on))
+    const on = !state().filesOff
+    if (cmd.on == null) return md(`文件提示：${on ? "开" : "关"}`, "「文件提示 关」/「文件提示 开」切换")
+    return on ? "文件提示已打开：每轮结束后会列出这一轮的文件，由你选要不要发" : "文件提示已关闭，需要文件时发「文件 路径」"
+  }
+  if (cmd.type === "files") return fileOffer(cmd)
   if (cmd.type === "text" && !cmd.text) return HELP
   if (cmd.type === "live") {
     const key = cmd.n == null ? "*" : sessionOf(cmd.n)
@@ -1392,7 +1441,7 @@ export function codexPushText(head, n, kind, text) {
 }
 
 // Called synchronously in the order the app-server reports, so progress bookkeeping keeps that order.
-function codexPush(threadId, kind, text) {
+function codexPush(threadId, kind, text, extra) {
   const key = CODEX + threadId
   const info = async () => {
     const thread = await codexThread(threadId)
@@ -1402,10 +1451,11 @@ function codexPush(threadId, kind, text) {
   if (kind === "text") return addText(key, text, info)
   if (kind === "tool") return addTool(key, text, info)
   const live = takeLive(key, kind !== "approval" && kind !== "question", liveOn(state(), key))
-  if (kind !== "end") return codexSend(threadId, kind, text, live).catch((e) => warn("codex push:", e))
+  if (kind !== "end") return codexSend(threadId, kind, text, live, extra).catch((e) => warn("codex push:", e))
 }
 
-async function codexSend(threadId, kind, text, live) {
+// `extra`: { fileChanges } of a finished turn, from codex.js (only when the turn changed files).
+async function codexSend(threadId, kind, text, live, extra) {
   const key = CODEX + threadId
   const n = await assign(key)
   const thread = await codexThread(threadId)
@@ -1417,6 +1467,7 @@ async function codexSend(threadId, kind, text, live) {
   if (big.length) msg = md(msg, `（图片太大没发：${big.join("、")}）`)
   await push(key, msg)
   for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
+  if (kind === "done") await offerFiles(key, { reply: text, dir: cleanDir(thread?.cwd), edited: fileChangePaths(extra?.fileChanges) })
 }
 
 // One app-server bridge per process; a hot-reloaded module stops the old one (it would still run old code).
@@ -1430,6 +1481,62 @@ function bridge() {
     g.bridge.gen = GEN
   }
   return g.bridge
+}
+
+// OpenCode: files the finished turn of `sessionID` wrote or changed, from its tool calls and (where OpenCode keeps
+// snapshots, i.e. a git repo) the session diff, which also sees files a shell command wrote.
+export async function turnEdited(sessionID, dir) {
+  const msgs = (await oc(`/api/session/${sid(sessionID)}/message?limit=100&order=desc`)).data
+  const diff = await oc(`/api/session/${sid(sessionID)}/diff`).then(toArr, () => [])
+  return [...toolPaths(msgs, dir), ...diffPaths(diff, dir)]
+}
+
+// After a finished turn: offers the files it mentioned (`reply`) or changed (`edited`: paths, or a function returning
+// them, only called when offers are on) in one message, and keeps the offer in the state file until a newer one, 24 hours
+// or the conversation's number is gone. Nothing is sent when there is nothing to offer.
+export async function offerFiles(key, { reply, dir, edited = [] }) {
+  try {
+    if (state().filesOff) return
+    const { files, more } = candidates({ reply, dir, edited: typeof edited === "function" ? await edited() : edited, bridgeDirs: [DIR, path.join(os.homedir(), ".cli-bridge")] })
+    if (!files.length) return
+    const t = await tag(key, dir)
+    update((s) => ((s.offers ??= {})[key] = { files: files.map((f) => f.path), at: Date.now() }))
+    await push(key, offerText(t, files, more, numOf(key), dir))
+  } catch (e) {
+    warn("file offer:", e)
+  }
+}
+
+// 「3 文件」 lists the saved offer of a conversation, 「3 文件 1 3」 / 「3 文件 全部」 sends from it. Without the number
+// it is the current target conversation.
+async function fileOffer(cmd) {
+  const key = cmd.n == null ? targetID() : sessionOf(cmd.n)
+  if (!key) return cmd.n == null ? "先发「列表」选一个对话" : noNum(cmd.n)
+  const n = numOf(key)
+  const tg = await tag(key)
+  const offer = liveOffer(state().offers?.[key])
+  if (!offer) return `${tg} 没有可选的文件（每轮结束后才会列出，24 小时内有效）；要发电脑上的文件，发「文件 路径」`
+  if (!cmd.sel) {
+    const files = offer.files.map((p) => ({ path: p, size: fs.statSync(p, { throwIfNoEntry: false })?.size ?? null }))
+    return offerText(tg, files, 0, n, state().info?.[key]?.dir)
+  }
+  const { idx, bad } = resolveSelection(cmd.sel, offer.files.length)
+  if (bad.length) return `${tg} 没有第 ${bad.join("、")} 个文件（共 ${offer.files.length} 个），发「${n} 文件」看列表`
+  let sent = 0
+  const failed = []
+  for (const [i, k] of idx.entries()) {
+    const f = offer.files[k]
+    if (i) await new Promise((r) => setTimeout(r, 300))
+    try {
+      const problem = await fileProblem(f)
+      if (problem) failed.push(`${path.basename(f)}（${problem}）`)
+      else (await sendFile(f), sent++)
+    } catch (e) {
+      warn("file:", e)
+      failed.push(`${path.basename(f)}（${short(e?.message, 80)}）`)
+    }
+  }
+  return md(sent && `已发送 ${sent} 个文件`, failed.length && `没发出去：${failed.join("、")}`)
 }
 
 // Images mentioned in a reply that can be sent, plus names of the ones over the size limit.
@@ -1636,6 +1743,10 @@ export default {
       if (big.length) text = md(text, `（图片太大没发：${big.join("、")}）`)
       await push(sessionID, text)
       for (const f of files) await sendImage(f).catch((e) => warn("image:", e))
+      if (event.type === "session.execution.succeeded") {
+        const dir = session?.location?.directory ?? event.location?.directory
+        await offerFiles(sessionID, { reply, dir, edited: () => turnEdited(sessionID, dir) })
+      }
     }
     void (async () => {
       try {

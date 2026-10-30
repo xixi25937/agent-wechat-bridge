@@ -157,11 +157,11 @@ test("帮助: titled sections of one-line bullets", () => {
     if (i % 2) assert.ok(b.split("\n").every((l) => l.startsWith("- ") && em(l.slice(2)) <= 18), b)
     else assert.match(b, /^【[^】]+】$/)
   })
-  assert.deepEqual(blocks.filter((_, i) => i % 2 === 0).map((t) => t.slice(1, -1)), ["发消息", "看对话", "批准和回答", "文件夹和新对话", "图片", "撤回", "实时推送", "其他"])
+  assert.deepEqual(blocks.filter((_, i) => i % 2 === 0).map((t) => t.slice(1, -1)), ["发消息", "看对话", "批准和回答", "文件夹和新对话", "图片", "文件", "撤回", "实时推送", "其他"])
   assert.ok(slashHelpText("[7] OpenCode", [{ name: "init" }]).split("\n").every((l) => !l.startsWith("- ") || em(l.slice(2)) <= 18))
   // Nothing Markdown could pick up: emphasis, headings, quotes, code.
   assert.ok(!/[*_`#>]/.test(HELP) && !/[*_`#>]/.test(slashHelpText("[7] OpenCode · ttool")))
-  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend"]) assert.ok(HELP.includes(c), c)
+  for (const c of ["列表", "目录", "新对话", "图 路径", "历史", "实时", "3 y / 3 n", "撤回", "/unsend", "文件 路径", "文件提示"]) assert.ok(HELP.includes(c), c)
 })
 
 test("imagePaths", () => {
